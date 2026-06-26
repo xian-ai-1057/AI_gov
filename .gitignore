@@ -22,7 +22,9 @@ data/milvus/
 models/
 
 # 來源原始檔（內部銀行治理文件，僅本機留存，不入庫）
+# 含 worktree 開發時連到主 repo 的 symlink（無 trailing slash 才能一併忽略）
 data/original/
+data/original
 
 # 提交者上傳的審查資料（含敏感內容，禁止入庫）
 uploads/
