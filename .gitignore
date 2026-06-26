@@ -1,0 +1,35 @@
+# 舊版封存（重建前的完整內容，僅本機留存，不入庫）
+_Archive/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 環境設定（含內部端點金鑰，禁止入庫）
+.env
+
+# 向量庫本地資料與模型快取
+data/milvus/
+.cache/
+models/
+
+# 來源原始檔（內部銀行治理文件，僅本機留存，不入庫）
+data/original/
+
+# 提交者上傳的審查資料（含敏感內容，禁止入庫）
+uploads/
+output/
+
+# 作業系統
+.DS_Store
+
+# 備份壓縮檔（非原始碼）
+*.zip
