@@ -22,7 +22,8 @@ def review_f02(path: str | Path, cfg: dict | None = None) -> ReviewReport:
             severity=Severity.INFO,
             code="F02.OK",
             title="規則檢查未發現問題",
-            message="F02 通過所有規則式檢查（單複選、系列完整、計分一致、續填）。仍須人工覆核實質內容。",
+            message=("F02 通過所有規則式檢查（缺漏、單複選、系列與一般題完整、計分比對、續填）。"
+                     "仍須人工覆核實質內容。"),
         ))
 
     return ReviewReport(form_type="F02", subject=form.subject, findings=findings)

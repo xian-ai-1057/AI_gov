@@ -17,9 +17,10 @@ htmlcov/
 .env
 
 # 向量庫本地資料與模型快取
+# 注意：models/ 必須錨定在 repo root（前置 /），否則會誤排除 src/govcheck/models/ 核心套件
 data/milvus/
 .cache/
-models/
+/models/
 
 # 來源原始檔（內部銀行治理文件，僅本機留存，不入庫）
 # 含 worktree 開發時連到主 repo 的 symlink（無 trailing slash 才能一併忽略）

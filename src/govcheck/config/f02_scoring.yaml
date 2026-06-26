@@ -35,10 +35,6 @@ groups:
   - D-04
   - M-01
   - M-02
-conditional:
-  M-02:
-    depends_on: M-01
-    expect: Y
 uplift_factors:
   factor1:
     row: 42

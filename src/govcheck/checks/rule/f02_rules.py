@@ -19,9 +19,9 @@ def run_all(form: F02Form, cfg: dict | None = None) -> list[Finding]:
     cfg = cfg or load_config()
     findings: list[Finding] = []
     findings += check_series_completeness(form, cfg)
+    findings += check_general_completeness(form, cfg)
     findings += check_single_choice(form, cfg)
     findings += check_multi_choice(form, cfg)
-    findings += check_conditional(form, cfg)
     findings += check_score_consistency(form, cfg)
     findings += check_followup_sheets(form, cfg)
     return findings
@@ -50,6 +50,26 @@ def check_series_completeness(form: F02Form, cfg: dict) -> list[Finding]:
                 actual=f"未填 {len(missing)} 項",
             ))
     return findings
+
+
+def check_general_completeness(form: F02Form, cfg: dict) -> list[Finding]:
+    """一般題（UC-01/02/03/07、D-03/04、M-01/02）每題都須有 Y/N，不可留空。
+
+    這些題未納入單/複選群組，但屬必填；留空除了漏填，對反向計分題（答 N 計分）
+    還會讓重算分數被低估，故一律標記。
+    """
+    missing = [qid for qid in cfg["groups"]["general"] if form.answers.get(qid) is None]
+    if not missing:
+        return []
+    return [Finding(
+        severity=Severity.ERROR,
+        code="F02.GENERAL_INCOMPLETE",
+        title="一般題有未填",
+        message=f"一般題應每題皆填 Y 或 N，未填：{', '.join(missing)}。留空會導致風險分數被低估。",
+        location="一般題",
+        expected="每題皆 Y/N",
+        actual=f"未填 {len(missing)} 題",
+    )]
 
 
 def check_single_choice(form: F02Form, cfg: dict) -> list[Finding]:
@@ -96,42 +116,30 @@ def check_multi_choice(form: F02Form, cfg: dict) -> list[Finding]:
     return findings
 
 
-def check_conditional(form: F02Form, cfg: dict) -> list[Finding]:
-    """條件式依賴：如 M-02 僅在 M-01=Y 時才有意義。"""
-    findings = []
-    for qid, rule in cfg.get("conditional", {}).items():
-        dep, expect = rule["depends_on"], rule["expect"]
-        dep_ans = form.answers.get(dep)
-        this_ans = form.answers.get(qid)
-        if dep_ans == expect and this_ans is None:
-            findings.append(Finding(
-                severity=Severity.WARN,
-                code="F02.CONDITIONAL",
-                title=f"{qid} 依賴 {dep} 但未填",
-                message=f"{dep}={expect} 時，{qid} 應一併填寫，目前為空。",
-                location=qid,
-                expected=f"{dep}={expect} 時須填 {qid}",
-                actual="未填",
-            ))
-        elif dep_ans is not None and dep_ans != expect and this_ans is not None:
-            findings.append(Finding(
-                severity=Severity.WARN,
-                code="F02.CONDITIONAL",
-                title=f"{qid} 與前題 {dep} 不一致",
-                message=f"{dep}={dep_ans}（非 {expect}）時，{qid} 通常無需填寫，但目前填了 {this_ans}。",
-                location=qid,
-                expected=f"{dep}≠{expect} 時 {qid} 留空",
-                actual=f"{qid}={this_ans}",
-            ))
-    return findings
-
-
 def check_score_consistency(form: F02Form, cfg: dict) -> list[Finding]:
-    """重算四域百分比與分級，與檔內快取值比對。"""
+    """重算四域百分比與分級，與檔內快取值比對。
+
+    若檔內無快取分級（如非 Excel 工具產生、未經試算的檔），無法比對，發 WARN
+    提醒人工確認，避免靜默通過而誤以為「計分一致」。
+    """
     findings = []
     result = recompute(form, cfg)
 
     cached = form.cached
+    # 無快取分級 → 無法驗證，提醒人工
+    if not cached.grade:
+        findings.append(Finding(
+            severity=Severity.WARN,
+            code="F02.CACHE_MISSING",
+            title="無法比對檔內計分（缺快取值）",
+            message=(f"檔內未提供 Excel 已算好的分級/分數（可能由非 Excel 工具產生或未試算），"
+                     f"無法與重算比對。重算結果為「{result.grade}」(分數 {result.overall:.1f})，請人工確認。"),
+            location="分級",
+            expected="檔內含 Excel 快取分級",
+            actual="無快取",
+        ))
+        return findings
+
     # 分級比對
     if cached.grade and cached.grade != result.grade:
         findings.append(Finding(

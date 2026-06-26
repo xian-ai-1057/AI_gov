@@ -105,7 +105,6 @@ def main() -> None:
             "multi_choice": MULTI_CHOICE,
             "general": GENERAL,
         },
-        "conditional": {"M-02": {"depends_on": "M-01", "expect": "Y"}},
         "uplift_factors": uplift,
         "questions": {k: {"score_on": v["score_on"], "scores": v["scores"]}
                       for k, v in questions.items()},

@@ -45,12 +45,13 @@ def make(tmp_path, name, **kwargs):
 
 # ---------- 正例：合規基線無 error ----------
 def test_baseline_passes(tmp_path):
-    f = make(tmp_path, "baseline")
+    # 模擬正常 Excel 存檔（含快取分級「低」），避免無快取的 CACHE_MISSING 提醒
+    f = make(tmp_path, "baseline", cached_grade="低")
     found = codes(f)
-    errors = {c for c in found if not c.endswith(".OK")}
-    # 基線不應有任何規則性錯誤（允許 INFO 的 F02.OK）
+    other = {c for c in found if not c.endswith(".OK")}
+    # 基線不應有任何 error/warn（只允許 INFO 的 F02.OK）
     assert "F02.OK" in found
-    assert errors == set()
+    assert other == set()
 
 
 # ---------- 單選唯一性 ----------
@@ -96,18 +97,27 @@ def test_series_complete_positive(tmp_path):
     assert "F02.SERIES_INCOMPLETE" not in codes(f)
 
 
-# ---------- 條件式依賴 ----------
-def test_conditional_missing_negative(tmp_path):
-    # M-01=Y 但 M-02 留空
+# ---------- 一般題完整性 ----------
+def test_general_incomplete_negative(tmp_path):
+    # 留空一般題 M-02 → 應報缺漏（M-02 為必填、反向計分，留空會低估風險）
     partial = {k: v for k, v in BASELINE.items() if k != "M-02"}
-    partial["M-01"] = "Y"
-    f = build_f02_fixture(tmp_path / "cond.xlsm", answers=partial)
-    assert "F02.CONDITIONAL" in codes(f)
+    f = build_f02_fixture(tmp_path / "gen_gap.xlsm", answers=partial)
+    assert "F02.GENERAL_INCOMPLETE" in codes(f)
 
 
-def test_conditional_positive(tmp_path):
-    f = make(tmp_path, "cond_ok")  # baseline M-01=Y, M-02=Y
-    assert "F02.CONDITIONAL" not in codes(f)
+def test_general_complete_positive(tmp_path):
+    f = make(tmp_path, "gen_ok")  # baseline 一般題皆已填
+    assert "F02.GENERAL_INCOMPLETE" not in codes(f)
+
+
+def test_reverse_scored_m01_m02_no_false_positive(tmp_path):
+    # 回歸：M-01=N 且 M-02=N 是合法常見組合（服務外購、模型亦非自建），
+    # 不應產生任何條件式誤判；舊 F02.CONDITIONAL 規則已移除
+    answers = {**BASELINE, "M-01": "N", "M-02": "N"}
+    f = build_f02_fixture(tmp_path / "rev_ok.xlsm", answers=answers, cached_grade="低")
+    found = codes(f)
+    assert "F02.CONDITIONAL" not in found
+    assert "F02.GENERAL_INCOMPLETE" not in found
 
 
 # ---------- 計分比對 ----------

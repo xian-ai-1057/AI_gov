@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -30,15 +31,19 @@ if uploaded is None:
     st.info("請上傳 F02 檔案以開始初步審查。")
     st.stop()
 
-with tempfile.NamedTemporaryFile(suffix=Path(uploaded.name).suffix, delete=False) as tmp:
-    tmp.write(uploaded.getbuffer())
-    tmp_path = tmp.name
-
+# 暫存上傳檔供解析；用後即刪，避免提案者敏感資料殘留在本機（資料全程地端、最小足跡）。
+tmp_path: str | None = None
 try:
+    with tempfile.NamedTemporaryFile(suffix=Path(uploaded.name).suffix, delete=False) as tmp:
+        tmp.write(uploaded.getbuffer())
+        tmp_path = tmp.name
     report = review_f02(tmp_path)
 except Exception as exc:  # noqa: BLE001 - 介面層需把解析錯誤友善呈現
     st.error(f"解析或審查失敗：{exc}")
     st.stop()
+finally:
+    if tmp_path and os.path.exists(tmp_path):
+        os.unlink(tmp_path)
 
 # 摘要
 c1, c2, c3 = st.columns(3)
