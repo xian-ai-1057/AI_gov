@@ -1,0 +1,82 @@
+# 送件包審查設定（缺件 / F01 必填 / 跨表一致性）。
+# 手動維護：刻意與自動產生的 f02_scoring.yaml 分開，不會被 extract_f02_scoring.py 覆蓋。
+# 座標皆依官方範本實地勘查（openpyxl）；附屬表表頭列各異，務必對齊。
+
+f01:
+  main_sheet: AI系統業務與利害關係人
+  data_start_row: 4              # Row2 標籤、Row3 說明、Row4+ 資料
+  columns:                      # 欄字母 → 語意鍵（parser 用）
+    A: filing_unit
+    B: filer
+    C: filing_date
+    D: project_name
+    E: ai_usage
+    F: affected_system_name
+    G: affected_system_code
+    H: system_owner
+    I: ap_owner
+    J: ai_app_type
+    K: business_goal
+    L: tech_type
+  required_columns:             # 依附件四填寫說明：A~I 必填
+    - {col: A, label: 填表單位}
+    - {col: B, label: 填表人}
+    - {col: C, label: 填表日期}
+    - {col: D, label: 專案/服務名稱}
+    - {col: E, label: AI系統運用}
+    - {col: F, label: 影響系統名稱}
+    - {col: G, label: 影響系統代碼}
+    - {col: H, label: System Owner}
+    - {col: I, label: AP Owner}
+  sub_sheets:                   # 對應專案/服務名稱欄（表頭列各異，data_start_row 已跳過表頭+說明列）
+    - {sheet: 資料, corr_col: AB, data_start_row: 4}
+    - {sheet: 模型, corr_col: R, data_start_row: 4}
+    - {sheet: 平台, corr_col: I, data_start_row: 3}
+  placeholder_markers:          # 視同空白的範本佔位字串（子字串比對；務必夠精確以免誤殺合法名稱）
+    - 對應前頁填寫               # 範本 資料!AB4 / 模型!R4 內建「xxx小幫手(對應前頁填寫)」
+    - 無需填寫
+
+f03:
+  sheet: 檢核表
+  owner_cell: B1                # A1 標籤="系統擁有者"，值在 B1
+  placeholder_values:           # 視同空白的範本佔位值（精確比對，正規化後相等才算）
+    - XXX
+
+documents:
+  core:                         # F01/F03 一律必備 → 缺則 ERROR
+    - {role: f01, code: DOC.MISSING_F01, label: F01 AI系統資訊表, severity: error}
+    - {role: f03, code: DOC.MISSING_F03, label: F03 上線檢核表, severity: error}
+  f02_rule:                     # F02 中/高風險必備、低風險可免 → 缺則 WARN（可改 error）
+    code: DOC.MISSING_F02
+    label: F02 AI風險評鑑
+    severity: warn
+  conditional:                  # 中/高風險條件式佐證；佐證檔名關鍵字比對；未命中 → WARN
+    - code: DOC.MISSING_R06
+      label: R06 可解釋性說明
+      when: {risk_in: [中, 高]}
+      keywords: [可解釋, 解釋性, R06]
+    - code: DOC.MISSING_R07
+      label: R07 公平性測試報告/人為監督說明
+      when: {risk_in: [中, 高]}
+      keywords: [公平性, 人為監督, R07]
+    - code: DOC.MISSING_R05
+      label: R05 受委託機構技術文件（如涉及委外）
+      when: {risk_in: [中, 高]}
+      keywords: [委外, 委託, R05]
+
+cross_consistency:
+  comparisons:                  # 字串正規化比對屬啟發式 → 一律 WARN
+    - code: CROSS.OWNER_MISMATCH
+      severity: warn
+      label: System Owner（F01.H ↔ F03 系統擁有者）
+      left: {form: f01, field: system_owner}
+      right: {form: f03, field: system_owner}
+    - code: CROSS.UNIT_MISMATCH
+      severity: warn
+      label: 填表單位（F01.A ↔ F02 風險處理計畫表）
+      left: {form: f01, field: filing_unit}
+      right: {form: f02, field: filing_unit}
+  f01_internal:
+    code: CROSS.F01_INTERNAL_NAME
+    severity: warn
+    label: 主表專案名稱 ↔ 附屬表對應欄

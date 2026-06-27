@@ -45,3 +45,5 @@ class F02Form(BaseModel):
     residual_filled: bool = False
     residual_max_score: float | None = None  # 剩餘風險評鑑分數欄的最大值
     treatment_filled: bool = False
+    # 風險處理計畫表填表單位（N2），供跨表單位一致性比對；中/高風險未填則 None
+    filing_unit: str | None = None

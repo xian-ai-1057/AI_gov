@@ -27,6 +27,7 @@ OVERALL_CELL = "I2"
 GRADE_CELL = "I4"
 UPLIFT_ROWS = {"factor1": 42, "factor2": 43, "factor3": 44}
 RESIDUAL_SCORE_COL = "剩餘風險 評鑑分數"
+FILING_UNIT_CELL = "N2"  # 風險處理計畫表填表單位（N1 為標籤「*填表單位」，值在 N2）
 
 
 def parse_f02(path: str | Path, cfg: dict | None = None) -> F02Form:
@@ -60,7 +61,7 @@ def parse_f02(path: str | Path, cfg: dict | None = None) -> F02Form:
     )
 
     residual_filled, residual_max = _read_residual(path)
-    treatment_filled = _sheet_has_data(wb, TREATMENT_SHEET)
+    treatment_filled, filing_unit = _read_treatment(wb)
     wb.close()
 
     return F02Form(
@@ -70,6 +71,7 @@ def parse_f02(path: str | Path, cfg: dict | None = None) -> F02Form:
         residual_filled=residual_filled,
         residual_max_score=residual_max,
         treatment_filled=treatment_filled,
+        filing_unit=filing_unit,
     )
 
 
@@ -90,15 +92,23 @@ def _read_residual(path: Path) -> tuple[bool, float | None]:
     return True, max_score
 
 
-def _sheet_has_data(wb, sheet_name: str) -> bool:
-    """表頭以下是否有任何非空資料列。"""
-    ws = wb[sheet_name]
+def _read_treatment(wb) -> tuple[bool, str | None]:
+    """單次掃描風險處理計畫表：表頭以下是否有資料列 + 填表單位（N2）。
+
+    與舊 _sheet_has_data 相同：跳過表頭（第 1 列），第 2 列起任一非空即視為有資料；
+    N2 位於第 2 列第 14 欄（N），於同一輪取出，避免重複開檔/掃描。
+    """
+    ws = wb[TREATMENT_SHEET]
+    has_data = False
+    filing_unit = None
     for i, row in enumerate(ws.iter_rows(values_only=True)):
         if i == 0:
             continue  # 跳過表頭
+        if i == 1 and len(row) >= 14:
+            filing_unit = _clean(row[13])  # N 欄（0-indexed 13）
         if any(v is not None and str(v).strip() for v in row):
-            return True
-    return False
+            has_data = True
+    return has_data, filing_unit
 
 
 def _norm_answer(v) -> str | None:

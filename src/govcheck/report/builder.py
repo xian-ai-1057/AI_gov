@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from govcheck.models import ReviewReport, Severity
 
-_ICON = {Severity.ERROR: "🔴", Severity.WARN: "🟡", Severity.INFO: "🟢"}
-_LABEL = {Severity.ERROR: "錯誤", Severity.WARN: "提醒", Severity.INFO: "通過"}
+# severity → 圖示 / 中文標籤的單一事實來源；report 與 UI 共用，避免兩處字樣不一致。
+ICON = {Severity.ERROR: "🔴", Severity.WARN: "🟡", Severity.INFO: "🟢"}
+LABEL = {Severity.ERROR: "錯誤", Severity.WARN: "提醒", Severity.INFO: "通過"}
+_ICON = ICON
+_LABEL = LABEL
 
 
 def to_markdown(report: ReviewReport) -> str:
