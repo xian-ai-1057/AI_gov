@@ -329,6 +329,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "python-docx" },
     { name = "pyyaml" },
+    { name = "requests" },
     { name = "streamlit" },
 ]
 
@@ -347,6 +348,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3" },
     { name = "python-docx", specifier = ">=1.1" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "requests", specifier = ">=2.32" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.7" },
     { name = "streamlit", specifier = ">=1.40" },
 ]

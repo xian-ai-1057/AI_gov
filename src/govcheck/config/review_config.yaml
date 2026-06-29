@@ -41,6 +41,20 @@ f03:
   owner_cell: B1                # A1 標籤="系統擁有者"，值在 B1
   placeholder_values:           # 視同空白的範本佔位值（精確比對，正規化後相等才算）
     - XXX
+  checklist:                    # 完整檢核項版面（座標實地勘查；資料列 5~24，列26為備註）
+    data_start_row: 5
+    item_id_col: A              # 項次（資料列辨識依據）
+    item_id_pattern: '^\d+-\d+' # 形如 1-1 / 4-5；不符者（空列、備註列）跳過
+    lifecycle_col: B            # 生命週期（合併儲存格 B5:B10 等，往下沿用群組值）
+    topic_col: C                # 管理議題
+    item_desc_col: D            # 檢查項目
+    role_col: E                 # 執行單位/角色
+    check_cols:                 # 是否完成檢核（F/G/H 擇一打勾）→ 標籤
+      是: F
+      否: G
+      不適用: H
+    evidence_proposal_col: I    # 前項佐證說明(提案規劃階段)
+    evidence_golive_col: J      # 前項佐證說明(上線階段;列出與提案差異)
 
 documents:
   core:                         # F01/F03 一律必備 → 缺則 ERROR

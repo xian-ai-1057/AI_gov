@@ -20,6 +20,7 @@ from govcheck.classify import (
     classify_fileobj,
     route_classifications,
 )
+from govcheck.llm.config import load_llm_config
 from govcheck.models import Severity
 from govcheck.report.builder import ICON, LABEL, to_markdown
 from govcheck.review.engine import review_routed
@@ -29,6 +30,20 @@ st.set_page_config(page_title="AI 治理審查小幫手", page_icon="🛡️", l
 st.title("🛡️ AI 治理審查小幫手")
 st.caption("批次上傳自動分類 · 送件包初步審查（缺件 + F01 必填 + F02 規則 + 跨表一致性）")
 st.warning("⚠️ 本工具產出為 **AI 初判草稿**，需治理人員與三遵人工覆核；最終判定權不在 AI。資料全程地端不外送。")
+
+# ── 側欄：F03 佐證 LLM 判讀（預設關；端點不可用時自動降級，不影響規則檢查）──────────
+with st.sidebar:
+    st.header("🤖 LLM 佐證審查（F03）")
+    _llm_cfg = load_llm_config()
+    use_llm = st.toggle(
+        "啟用 LLM 佐證審查",
+        value=bool(_llm_cfg["enabled"]),
+        help="對 F03『提案規劃階段』與『上線階段』兩段佐證做差異比較，並標示草率/不明確的說明。預設關閉。",
+    )
+    if use_llm:
+        st.caption(f"端點：`{_llm_cfg['base_url']}`")
+        st.caption(f"模型：`{_llm_cfg['model'] or '（未設定，請設 GOVCHECK_LLM_MODEL）'}`")
+        st.caption("資料僅送至上述設定端點，不外送公有雲。端點不可連線時自動略過，不影響規則檢查。")
 
 # 可指派的判定（UNKNOWN 不可手動指派；以「忽略此檔」表示排除）
 _IGNORE = "忽略此檔"
@@ -96,7 +111,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
     try:
         files, supporting, class_findings = route_classifications(confirmed)
-        report = review_routed(files, supporting, class_findings)
+        report = review_routed(files, supporting, class_findings, enable_llm=use_llm)
     except Exception as exc:  # noqa: BLE001 - 介面層需把解析錯誤友善呈現
         st.error(f"解析或審查失敗：{exc}")
         st.stop()
