@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from govcheck.checks.rule import cross_consistency, f01_rules, f02_rules, missing_docs
+from govcheck.classify.classifier import FileClassification, classify_files, route_classifications
 from govcheck.models import FilePresence, Finding, ReviewReport, Severity, Submission
 from govcheck.parsers.f01_parser import parse_f01
 from govcheck.parsers.f02_parser import parse_f02
@@ -58,13 +59,56 @@ def review_submission(
 
     findings.sort(key=_severity_order)
     if not findings:
-        findings.append(Finding(
-            severity=Severity.INFO,
-            code="SUBMISSION.OK",
-            title="送件包規則檢查未發現問題",
-            message="核心文件齊備、F01 必填完整、F02 規則通過、跨表一致。仍須人工覆核實質內容。",
-        ))
+        findings.append(_submission_ok())
     return ReviewReport(form_type="送件包", subject=sub.subject, findings=findings)
+
+
+def review_routed(
+    files: dict[str, str | Path],
+    supporting: list[str] | None = None,
+    class_findings: list[Finding] | None = None,
+    cfg: dict | None = None,
+) -> ReviewReport:
+    """已分類路由後的審查：跑既有 review_submission，再併入分類 Findings。
+
+    review_submission 行為不變；此處於其上薄薄一層，把分類產生的 Findings
+    （CLASSIFY.SUMMARY / 重複 / 無法辨識）併入，重排後僅在整體無 ERROR/WARN 時補 OK。
+    """
+    review_cfg = cfg or load_review_config()
+    report = review_submission(files, supporting=supporting, cfg=review_cfg)
+
+    merged = [f for f in report.findings if f.code != "SUBMISSION.OK"]
+    merged = list(class_findings or []) + merged
+    merged.sort(key=_severity_order)
+    if not any(f.severity in (Severity.ERROR, Severity.WARN) for f in merged):
+        merged.append(_submission_ok())
+    return report.model_copy(update={"findings": merged})
+
+
+def review_files(
+    paths: list[str | Path],
+    cfg: dict | None = None,
+) -> tuple[ReviewReport, list[FileClassification]]:
+    """批次檔案自動分類 → 路由 → 審查。
+
+    回傳 (報告, 分類結果)：分類結果是介面顯示用 metadata（檔名→判定），
+    刻意不塞進 ReviewReport，以免污染跨階段契約。
+    """
+    review_cfg = cfg or load_review_config()
+    results = classify_files(paths, review_cfg)
+    files, supporting, class_findings = route_classifications(results)
+    report = review_routed(files, supporting, class_findings, review_cfg)
+    return report, results
+
+
+def _submission_ok() -> Finding:
+    """送件包規則檢查全數通過的 INFO Finding（review_submission 與 review_routed 共用）。"""
+    return Finding(
+        severity=Severity.INFO,
+        code="SUBMISSION.OK",
+        title="送件包規則檢查未發現問題",
+        message="核心文件齊備、F01 必填完整、F02 規則通過、跨表一致。仍須人工覆核實質內容。",
+    )
 
 
 def _build_submission(
