@@ -30,8 +30,26 @@
     filter: "all",
     open: {},           // finding id -> bool
     reviewing: false,
+    progress: null,     // { label, pct, detail } — SSE 串流的階段進度
     error: null,
   };
+
+  // 進度條階段權重：把後端 (stage, done/total) 事件換算成 0–100% 的單調進度。
+  // LLM 判讀是總等待時間大宗，分到最大的尾段；未啟用 LLM 時規則完成後直接由 done 收 100%。
+  const PROGRESS_BANDS = {
+    upload: [0, 10],
+    parse:  [10, 35],
+    rules:  [35, 70],
+    llm:    [70, 98],
+  };
+
+  function progressPct(ev) {
+    const band = PROGRESS_BANDS[ev.stage];
+    if (!band) return null;
+    const total = ev.total > 0 ? ev.total : 1;
+    const frac = Math.max(0, Math.min(1, (ev.done || 0) / total));
+    return Math.round(band[0] + (band[1] - band[0]) * frac);
+  }
 
   const app = document.getElementById("app");
   const fileInput = document.getElementById("file-input");
@@ -136,6 +154,7 @@
   async function startReview() {
     state.error = null;
     state.reviewing = true;
+    state.progress = null;
     render();
     const fd = new FormData();
     state.files.forEach((f) => fd.append("files", f, f.name));
@@ -145,19 +164,69 @@
       state.kinds[f.index] != null ? state.kinds[f.index] : f.kind);
     fd.append("kinds", JSON.stringify(confirmed));
     try {
-      const data = await postForm("/api/review", fd);
-      state.review = data;
-      // 錯誤項預設展開（對應設計 componentDidMount）
-      const open = {};
-      data.findings.forEach((f) => { if (f.severity === "error") open[f.id] = true; });
-      state.open = open;
-      state.filter = "all";
-      state.reviewing = false;
-      state.step = 3;
+      // SSE 串流：邊審查邊推進度，最後一筆事件帶完整報告。
+      const res = await fetch("/api/review/stream", { method: "POST", body: fd });
+      if (!res.ok || !res.body) {
+        let detail = `伺服器錯誤（${res.status}）`;
+        try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (_) { /* ignore */ }
+        throw new Error(detail);
+      }
+      await consumeReviewStream(res.body);  // 收到 done 事件時套用報告並跳第 3 步
     } catch (e) {
       state.error = e.message;
       state.reviewing = false;
+      state.progress = null;
+      render();
     }
+  }
+
+  // 讀 text/event-stream：逐 frame 解析進度事件，更新進度條；done 套報告、error 拋出。
+  async function consumeReviewStream(body) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let maxPct = 0;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let sep;
+        while ((sep = buf.indexOf("\n\n")) !== -1) {
+          const frame = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          const line = frame.split("\n").find((l) => l.startsWith("data:"));
+          if (!line) continue;
+          let ev;
+          try { ev = JSON.parse(line.slice(5).trim()); } catch (_) { continue; }
+          if (ev.stage === "error") throw new Error(ev.message || "審查失敗。");
+          if (ev.stage === "done") { applyReport(ev.report); return; }
+          const pct = progressPct(ev);
+          // 僅在百分比實際前進時更新＋重繪（單調遞增、永不回退），避免同 pct 的冗餘整頁重繪。
+          if (pct != null && pct > maxPct) {
+            maxPct = pct;
+            const detail = ev.total ? `${ev.done}/${ev.total}` : "";
+            state.progress = { label: ev.label || "審查中", pct: maxPct, detail };
+            render();
+          }
+        }
+      }
+      throw new Error("審查串流中斷，未取得完整報告。");
+    } finally {
+      reader.cancel().catch(() => { /* 已關閉/已取消 → 忽略 */ });
+    }
+  }
+
+  // 套用最終報告 → 跳第 3 步（單次/串流共用；錯誤項預設展開對應設計 componentDidMount）。
+  function applyReport(data) {
+    state.review = data;
+    const open = {};
+    data.findings.forEach((f) => { if (f.severity === "error") open[f.id] = true; });
+    state.open = open;
+    state.filter = "all";
+    state.reviewing = false;
+    state.progress = null;
+    state.step = 3;
     render();
   }
 
@@ -383,9 +452,17 @@
 
   function renderOverlay() {
     if (!state.reviewing) return "";
+    const p = state.progress;
+    // 尚未收到首個事件 → 退回 spinner 文案，避免進度條空白閃爍。
+    if (!p) {
+      return `<div class="gv-overlay"><div class="box">
+        <div class="spin"></div><div class="t">審查中…</div>
+        <div class="s">缺件 · F01 必填 · F02 規則 · 跨表一致性</div></div></div>`;
+    }
     return `<div class="gv-overlay"><div class="box">
-      <div class="spin"></div><div class="t">審查中…</div>
-      <div class="s">缺件 · F01 必填 · F02 規則 · 跨表一致性</div></div></div>`;
+      <div class="t">審查中…${esc(p.label)}</div>
+      <div class="bar"><i style="width:${p.pct}%"></i></div>
+      <div class="s">${p.pct}%${p.detail ? " · " + esc(p.detail) : ""}</div></div></div>`;
   }
 
   // ── 主渲染 ─────────────────────────────────────────────────────

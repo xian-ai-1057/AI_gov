@@ -286,6 +286,13 @@ button { font-family: inherit; cursor: pointer; }
 }
 .gv-overlay .t { font-weight: 700; font-size: 15px; }
 .gv-overlay .s { font-size: 12.5px; color: var(--muted); }
+.gv-overlay .bar {
+  width: 280px; height: 8px; border-radius: 999px; background: var(--accent-soft); overflow: hidden;
+}
+.gv-overlay .bar > i {
+  display: block; height: 100%; border-radius: 999px; background: var(--accent);
+  transition: width .3s ease;
+}
 
 .btn-download {
   border: 1px solid var(--accent); background: var(--accent-soft); color: var(--accent);

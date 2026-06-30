@@ -189,3 +189,28 @@ def test_max_items_truncates_with_notice():
     assert client.calls == 1
     summary = next(f for f in fs if f.code == "F03.LLM_SUMMARY")
     assert "未送審 3 項" in summary.message
+
+
+def test_progress_emitted_per_batch():
+    """每批判讀完成 emit 一筆 llm 進度事件，done 單調遞增至 total == 批次數。"""
+    items = [F03ChecklistItem(item_id=f"9-{i}", topic="t", evidence_proposal=f"內容{i}") for i in range(5)]
+    client = FakeClient([
+        _resp(_v("9-0"), _v("9-1")),
+        _resp(_v("9-2"), _v("9-3")),
+        _resp(_v("9-4")),
+    ])
+    events: list[dict] = []
+    f03_evidence.run_all(F03Checklist(items=items), client, batch_size=2, progress=events.append)
+    assert [e["stage"] for e in events] == ["llm", "llm", "llm"]   # 5 項 / 每批 2 → 3 批
+    assert [e["done"] for e in events] == [1, 2, 3]                # 單調遞增
+    assert all(e["total"] == 3 for e in events)
+
+
+def test_progress_emitted_on_aborted_batches():
+    """連續失敗中止時，仍對已嘗試的批 emit 進度（不會卡在中途）。"""
+    client = FakeClient([LLMError("refused")] * 5)
+    cl = F03Checklist(items=[F03ChecklistItem(item_id=f"1-{i}", evidence_proposal="x") for i in range(5)])
+    events: list[dict] = []
+    f03_evidence.run_all(cl, client, batch_size=1, progress=events.append)
+    assert len(events) == 3                                        # 連續 3 批即中止，各 emit 一次
+    assert [e["done"] for e in events] == [1, 2, 3]
