@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from govcheck.checks.llm import f03_evidence
 from govcheck.llm.client import LLMError
+from govcheck.logging_setup import load_log_config, setup_logging
 from govcheck.models import F03Checklist, F03ChecklistItem
 
 
@@ -214,3 +216,20 @@ def test_progress_emitted_on_aborted_batches():
     f03_evidence.run_all(cl, client, batch_size=1, progress=events.append)
     assert len(events) == 3                                        # 連續 3 批即中止，各 emit 一次
     assert [e["done"] for e in events] == [1, 2, 3]
+
+
+def test_batch_failure_does_not_leak_llm_body_into_log():
+    """隱私守線：LLMError 訊息可能夾帶端點回應內容，批失敗的 log 只能記例外型別、不可記訊息本文。"""
+    setup_logging()  # prod 預設 → WARNING 會落檔
+    secret = "SECRET_RESP_BODY_xyz"  # 模擬 client 把 resp.text[:200] 夾進 LLMError
+    client = FakeClient([LLMError(f"LLM 端點回應 HTTP 500：{secret}"), _resp(_v("1-2"))])
+    cl = F03Checklist(items=[
+        F03ChecklistItem(item_id="1-1", evidence_proposal="x"),
+        F03ChecklistItem(item_id="1-2", evidence_proposal="y"),
+    ])
+    f03_evidence.run_all(cl, client, batch_size=1)
+
+    ops_log = (Path(load_log_config()["dir"]) / "govcheck.log").read_text(encoding="utf-8")
+    assert "f03 llm batch" in ops_log          # 仍記錄批次失敗事件
+    assert "LLMError" in ops_log               # 只記例外型別
+    assert secret not in ops_log               # 端點回應內容不得落 log

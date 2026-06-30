@@ -11,6 +11,9 @@ import json
 import requests
 
 from govcheck.llm.config import load_llm_config
+from govcheck.logging_setup import get_logger
+
+log = get_logger("llm_client")
 
 
 class LLMError(RuntimeError):
@@ -67,9 +70,13 @@ class ChatClient:
         try:
             resp = requests.post(self.endpoint, json=payload, headers=headers, timeout=self.timeout)
         except requests.RequestException as exc:
+            # 只記端點與例外型別；不記 payload（含佐證內容）
+            log.warning("llm request failed endpoint=%s err=%s", self.endpoint, type(exc).__name__)
             raise LLMError(f"無法連線 LLM 端點（{self.endpoint}）：{exc}") from exc
 
         if resp.status_code >= 400:
+            # 只記狀態碼；不記 resp.text（可能含回傳內容）
+            log.warning("llm endpoint http %d endpoint=%s", resp.status_code, self.endpoint)
             raise LLMError(f"LLM 端點回應 HTTP {resp.status_code}：{resp.text[:200]}")
 
         try:

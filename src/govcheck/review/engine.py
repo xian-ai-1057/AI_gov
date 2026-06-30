@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -15,12 +16,15 @@ from govcheck.checks.rule import cross_consistency, f01_rules, f02_rules, f03_ev
 from govcheck.classify.classifier import FileClassification, classify_files, route_classifications
 from govcheck.llm.client import ChatClient
 from govcheck.llm.config import load_llm_config
+from govcheck.logging_setup import audit, get_logger
 from govcheck.models import FilePresence, Finding, ReviewReport, Severity, Submission
 from govcheck.parsers.f01_parser import parse_f01
 from govcheck.parsers.f02_parser import parse_f02
 from govcheck.parsers.f03_parser import parse_f03_checklist, parse_f03_identity
 from govcheck.review.config import load_review_config
 from govcheck.scoring.f02_score import recompute
+
+log = get_logger("review")
 
 # 進度回呼：審查編排層在各階段邊界誠實回報事件（介面層據此畫進度條）。
 # 事件為純 dict，至少含 stage/label/done/total；預設 None 時所有 emit 為 no-op，
@@ -68,6 +72,10 @@ def review_submission(
     enable_llm：是否對 F03 兩段佐證做 LLM 判讀（預設關；端點不可用時自動降級，不影響規則檢查）。
     progress：選用進度回呼；於 parse / rules / llm 各階段邊界 emit 事件（預設 None = no-op）。
     """
+    t0 = time.perf_counter()
+    present = [k for k in ("f01", "f02", "f03") if files.get(k) is not None]
+    log.info("review_start forms=%s enable_llm=%s", present, enable_llm)
+
     review_cfg = cfg or load_review_config()
     findings: list[Finding] = []
     sub = _build_submission(files, supporting, review_cfg, findings, progress)
@@ -100,10 +108,16 @@ def review_submission(
     findings.sort(key=_severity_order)
     if not findings:
         findings.append(_submission_ok())
-    return ReviewReport(
-        form_type="送件包", subject=sub.subject, findings=findings,
-        risk_score=sub.risk_score, risk_grade=sub.risk_grade,
-    )
+    report = ReviewReport(form_type="送件包", subject=sub.subject, findings=findings)
+
+    dur_ms = round((time.perf_counter() - t0) * 1000)
+    log.info("review_done error=%d warn=%d passed=%s dur=%dms",
+             report.error_count, report.warn_count, report.passed, dur_ms)
+    # 稽核軌跡：只記識別資訊與計數（不記檔內容/佐證全文）；任何 profile 都落檔。
+    audit("review_done", subject=report.subject, filing_unit=sub.f02_filing_unit,
+          form_type=report.form_type, error=report.error_count, warn=report.warn_count,
+          passed=report.passed, enable_llm=enable_llm, duration_ms=dur_ms)
+    return report
 
 
 def _run_f03_llm(checklist, progress: ProgressFn | None = None) -> list[Finding]:
@@ -118,6 +132,7 @@ def _run_f03_llm(checklist, progress: ProgressFn | None = None) -> list[Finding]
             progress=progress,
         )
     except Exception as exc:  # noqa: BLE001 - LLM 不可用一律降級
+        log.warning("llm review skipped: %s", exc)
         return [Finding(
             severity=Severity.INFO,
             code="F03.LLM_SKIPPED",
@@ -207,25 +222,32 @@ def _build_submission(
         _emit(progress, stage="parse", label="解析表單", done=parse_done, total=parse_total)
 
     if presence.f01:
+        log.debug("parsing form=F01")
         try:
             sub.f01 = parse_f01(files["f01"], review_cfg)
         except Exception as exc:  # noqa: BLE001 - 介面層需把解析錯誤友善呈現
+            log.warning("parse failed form=F01 err=%s", type(exc).__name__)
             findings.append(_parse_error("F01", exc))
         _parse_step()
     if presence.f02:
+        log.debug("parsing form=F02")
         try:
             sub.f02 = parse_f02(files["f02"])
         except Exception as exc:  # noqa: BLE001
+            log.warning("parse failed form=F02 err=%s", type(exc).__name__)
             findings.append(_parse_error("F02", exc))
         _parse_step()
     if presence.f03:
+        log.debug("parsing form=F03")
         try:
             sub.f03 = parse_f03_identity(files["f03"], review_cfg)
         except Exception as exc:  # noqa: BLE001
+            log.warning("parse failed form=F03 err=%s", type(exc).__name__)
             findings.append(_parse_error("F03", exc))
         try:
             sub.f03_checklist = parse_f03_checklist(files["f03"], review_cfg)
         except Exception as exc:  # noqa: BLE001 - 檢核項解析失敗不影響識別欄與其他檢查
+            log.warning("parse failed form=F03_checklist err=%s", type(exc).__name__)
             findings.append(Finding(
                 severity=Severity.ERROR,
                 code="F03.CHECKLIST_PARSE_ERROR",
