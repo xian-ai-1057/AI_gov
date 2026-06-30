@@ -36,3 +36,4 @@ output/
 
 # 備份壓縮檔（非原始碼）
 *.zip
+.gstack/

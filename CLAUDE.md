@@ -45,7 +45,9 @@ AI治理/
 │   │   ├── rule/f02_rules.py       # ✅ 規則式檢查（單複選/系列/條件/計分比對/續填）
 │   │   └── llm/                    # ⏳ 後續 Phase：F03 兩段式判讀（測試一律 mock）
 │   ├── review/engine.py            # 編排：parse → 跑 checks → 匯總
-│   └── report/builder.py           # Finding → Markdown
+│   ├── report/builder.py           # Finding → Markdown
+│   └── web/api.py                  # FastAPI：/api/classify + /api/review + 靜態掛載（介面層，零判讀邏輯）
+├── web/                            # 高還原靜態前端（index.html/styles.css/app.js；移植自 Claude Design 設計稿）
 ├── tests/                          # 計分還原 + 規則正反例（真檔生成 fixture，皆有 ground truth）
 └── data/original/                  # 唯讀來源（PDF/xlsx 模板）；gitignore，禁寫入、禁入庫
 ```
@@ -62,7 +64,8 @@ uv sync --extra dev                            # 安裝依賴
 uv run python scripts/extract_f02_scoring.py   # （重）產出 F02 計分 config
 uv run pytest                                  # 跑測試（須全綠才收工）
 uv run ruff check src tests scripts app.py     # lint
-uv run streamlit run app.py                    # 啟動介面
+uv run uvicorn govcheck.web.api:app --port 8501  # 啟動高還原 Web 介面（FastAPI + 靜態前端）
+uv run streamlit run app.py                    # 啟動 Streamlit 介面（兩者共用同一後端）
 ```
 
 ---

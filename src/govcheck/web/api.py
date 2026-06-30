@@ -1,0 +1,179 @@
+"""FastAPI 後端：分類 / 審查 兩個 API + 靜態前端掛載。
+
+對應前端三步驟：
+  1) 上傳送件包  → 前端持有檔案
+  2) 確認自動分類 → POST /api/classify（記憶體分類、不落地）
+  3) 審查報告     → POST /api/review（temp 用後即刪 → review_routed → findings + markdown）
+
+重用既有 pipeline，零改動 checks/parsers/review。比照 app.py 的記憶體分類與
+TemporaryDirectory 用後即刪策略（最小足跡、地端不外送）。
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import tempfile
+from pathlib import Path
+
+from fastapi import FastAPI, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from govcheck.classify import (
+    KIND_LABEL,
+    FileClassification,
+    FileKind,
+    classify_fileobj,
+    route_classifications,
+)
+from govcheck.llm.config import load_llm_config
+from govcheck.models import ReviewReport, Severity
+from govcheck.report.builder import to_markdown
+from govcheck.review.engine import review_routed
+
+# 前端靜態檔位於 repo 根的 web/（src/govcheck/web/api.py → parents[3] = repo root）
+WEB_DIR = Path(__file__).resolve().parents[3] / "web"
+
+# 可指派的判定（對齊 app.py：UNKNOWN 不可手動指派，以「忽略此檔」表示排除）
+IGNORE = "ignore"
+_ASSIGNABLE = [FileKind.F01, FileKind.F02, FileKind.F03, FileKind.SUPPORTING]
+KIND_OPTIONS = [{"value": k.value, "label": KIND_LABEL[k]} for k in _ASSIGNABLE] + [
+    {"value": IGNORE, "label": "忽略此檔"}
+]
+
+app = FastAPI(title="AI 治理審查小幫手", docs_url=None, redoc_url=None)
+
+
+def _severity_str(sev: Severity) -> str:
+    return sev.value  # "error" / "warn" / "info"
+
+
+def _finding_dict(idx: int, f) -> dict:
+    return {
+        "id": str(idx),
+        "severity": _severity_str(f.severity),
+        "code": f.code,
+        "title": f.title,
+        "message": f.message,
+        "location": f.location,
+        "expected": f.expected,
+        "actual": f.actual,
+        "source": f.source,
+    }
+
+
+def _report_dict(report: ReviewReport) -> dict:
+    findings = [_finding_dict(i, f) for i, f in enumerate(report.findings)]
+    info_count = sum(1 for f in report.findings if f.severity is Severity.INFO)
+    return {
+        "form_type": report.form_type,
+        "subject": report.subject,
+        "passed": report.passed,
+        "error_count": report.error_count,
+        "warn_count": report.warn_count,
+        "info_count": info_count,
+        "findings": findings,
+        "markdown": to_markdown(report),
+    }
+
+
+@app.post("/api/classify")
+async def classify(files: list[UploadFile]) -> JSONResponse:
+    """記憶體分類預覽（不落地）：回傳每檔判定 + 旗標（dup/unknown）+ 可選項。"""
+    if not files:
+        raise HTTPException(status_code=400, detail="請上傳至少一個檔案。")
+
+    out: list[dict] = []
+    seen_form_kinds: set[FileKind] = set()
+    for idx, up in enumerate(files):
+        data = await up.read()
+        name = up.filename or f"file_{idx}"
+        c = classify_fileobj(io.BytesIO(data), name)
+
+        flag: str | None = None
+        if c.kind is FileKind.UNKNOWN:
+            flag = "unknown"
+        elif c.kind in _ASSIGNABLE and c.kind is not FileKind.SUPPORTING:
+            # F01/F02/F03 同類第 2 份起標記重複（對應分類器 route 的 DUPLICATE_*）
+            if c.kind in seen_form_kinds:
+                flag = "dup"
+            else:
+                seen_form_kinds.add(c.kind)
+
+        # 無法辨識 → 預設「忽略此檔」，逼使用者人工指定，不靜默誤路由（比照 app.py）
+        default_kind = c.kind.value if c.kind in _ASSIGNABLE else IGNORE
+        out.append({
+            "index": idx,
+            "filename": name,
+            "kind": default_kind,
+            "reason": c.reason,
+            "flag": flag,
+        })
+
+    return JSONResponse({"kinds": KIND_OPTIONS, "files": out})
+
+
+@app.post("/api/review")
+async def review(
+    files: list[UploadFile],
+    kinds: str = Form(...),
+    enable_llm: bool | None = Form(default=None),
+) -> JSONResponse:
+    """依使用者確認後的 kinds 落地 → 路由 → 審查 → 回報告 JSON + markdown。"""
+    if not files:
+        raise HTTPException(status_code=400, detail="請上傳至少一個檔案。")
+    try:
+        confirmed_kinds: list[str] = json.loads(kinds)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=f"kinds 格式錯誤：{exc}") from exc
+    if not isinstance(confirmed_kinds, list):
+        raise HTTPException(status_code=400, detail="kinds 應為陣列。")
+    if len(confirmed_kinds) != len(files):
+        raise HTTPException(status_code=400, detail="kinds 數量與檔案數不符。")
+
+    use_llm = bool(load_llm_config()["enabled"]) if enable_llm is None else bool(enable_llm)
+
+    # 用後即刪：暫存檔在 TemporaryDirectory 結束時一併清除（最小足跡、地端不外送）
+    with tempfile.TemporaryDirectory() as tmpdir:
+        confirmed: list[FileClassification] = []
+        for idx, (up, kind_value) in enumerate(zip(files, confirmed_kinds)):
+            if kind_value == IGNORE:
+                continue
+            try:
+                kind = FileKind(kind_value)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"未知判定 {kind_value!r}") from exc
+            if kind not in _ASSIGNABLE:
+                raise HTTPException(status_code=400, detail=f"不可指派的判定 {kind_value!r}")
+            name = up.filename or "file"
+            # 落地檔名一律取 basename（擋掉 ../ 與絕對路徑逃逸），並以索引前綴避免同名覆蓋。
+            # 顯示用 filename 仍保留原始名稱（供分類器/報告呈現）。
+            safe = Path(name).name or "file"
+            dest = Path(tmpdir) / f"{idx}_{safe}"
+            dest.write_bytes(await up.read())
+            confirmed.append(FileClassification(
+                path=str(dest), filename=name, kind=kind, reason="使用者確認/修正",
+            ))
+
+        if not confirmed:
+            raise HTTPException(
+                status_code=400, detail="所有檔案都被標記為「忽略此檔」，沒有可審查的內容。"
+            )
+
+        try:
+            routed_files, supporting, class_findings = route_classifications(confirmed)
+            report = review_routed(routed_files, supporting, class_findings, enable_llm=use_llm)
+        except Exception as exc:  # noqa: BLE001 - 介面層需把解析/審查錯誤友善呈現
+            raise HTTPException(status_code=400, detail=f"解析或審查失敗：{exc}") from exc
+
+    return JSONResponse(_report_dict(report))
+
+
+@app.get("/")
+async def index() -> FileResponse:
+    return FileResponse(WEB_DIR / "index.html")
+
+
+# 靜態前端（CSS/JS/字型）。掛在最後，避免吃掉 /api 路由。
+app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
