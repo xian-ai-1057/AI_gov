@@ -30,7 +30,14 @@ def to_markdown(report: ReviewReport) -> str:
             lines.append(f"- **位置**：{f.location}")
         if f.expected is not None or f.actual is not None:
             lines.append(f"- **期望**：{f.expected or '—'}　**實際**：{f.actual or '—'}")
-        lines.append(f"- **說明**：{f.message}")
+        if "\n" in f.message:
+            # 多行說明（如 LLM 佐證彙整表的 Markdown 表格）需脫離清單項才能正常成表
+            lines.append("- **說明**：")
+            lines.append("")
+            lines.append(f.message)
+            lines.append("")
+        else:
+            lines.append(f"- **說明**：{f.message}")
         lines.append(f"- **代碼**：`{f.code}`　_(需人工覆核)_")
         lines.append("")
     return "\n".join(lines)

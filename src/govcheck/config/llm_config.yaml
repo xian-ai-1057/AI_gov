@@ -1,6 +1,6 @@
 # LLM 判讀端點設定（OpenAI 相容 chat completions 接口；資料只送此端點、不外送公有雲）。
 # 僅放「非機密」預設值；api_key 一律由環境變數 GOVCHECK_LLM_API_KEY 提供，禁止寫入本檔、禁止入庫。
-# 環境變數可覆寫任一鍵：GOVCHECK_LLM_ENABLED / _BASE_URL / _MODEL / _API_KEY / _TIMEOUT / _TEMPERATURE / _MAX_ITEMS
+# 環境變數可覆寫任一鍵：GOVCHECK_LLM_ENABLED / _BASE_URL / _MODEL / _API_KEY / _TIMEOUT / _TEMPERATURE / _MAX_ITEMS / _BATCH_SIZE
 
 enabled: false                       # 預設關閉；由介面開關或 GOVCHECK_LLM_ENABLED=1 啟用
 base_url: http://localhost:11434/v1  # 本機 ollama（OpenAI 相容）；內部端點請以環境變數覆寫
@@ -8,3 +8,4 @@ model: gemma3:4b                     # 本機 ollama 範例模型；請依實際
 timeout: 60                          # 單次請求逾時（秒）
 temperature: 0                       # 判讀求穩定，預設 0
 max_items: 30                        # 單次審查送 LLM 的檢核項上限（安全閥；F03 實際約 20 項）
+batch_size: 8                        # 單次 LLM 呼叫送審的檢核項數（批次以減少呼叫；小模型上下文安全閥）

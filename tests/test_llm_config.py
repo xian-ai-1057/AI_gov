@@ -9,7 +9,7 @@ from govcheck.llm.config import load_llm_config
 _ENV_KEYS = [
     "GOVCHECK_LLM_ENABLED", "GOVCHECK_LLM_BASE_URL", "GOVCHECK_LLM_MODEL",
     "GOVCHECK_LLM_API_KEY", "GOVCHECK_LLM_TIMEOUT", "GOVCHECK_LLM_TEMPERATURE",
-    "GOVCHECK_LLM_MAX_ITEMS",
+    "GOVCHECK_LLM_MAX_ITEMS", "GOVCHECK_LLM_BATCH_SIZE",
 ]
 
 
@@ -25,6 +25,7 @@ def test_defaults_from_yaml():
     assert cfg["timeout"] == 60.0
     assert cfg["temperature"] == 0.0
     assert cfg["max_items"] == 30
+    assert cfg["batch_size"] == 8
     assert cfg["enabled"] is False
     assert cfg["api_key"] is None
 
@@ -42,6 +43,15 @@ def test_invalid_max_items_env_falls_back_to_default(monkeypatch):
     assert load_llm_config()["max_items"] == 30
     monkeypatch.setenv("GOVCHECK_LLM_MAX_ITEMS", "not-a-number")
     assert load_llm_config()["max_items"] == 30
+
+
+def test_batch_size_env_override_and_fallback(monkeypatch):
+    monkeypatch.setenv("GOVCHECK_LLM_BATCH_SIZE", "4")
+    assert load_llm_config()["batch_size"] == 4
+    monkeypatch.setenv("GOVCHECK_LLM_BATCH_SIZE", "")          # 無效 → 退回預設
+    assert load_llm_config()["batch_size"] == 8
+    monkeypatch.setenv("GOVCHECK_LLM_BATCH_SIZE", "not-a-number")
+    assert load_llm_config()["batch_size"] == 8
 
 
 def test_valid_env_overrides():
