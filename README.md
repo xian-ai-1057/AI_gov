@@ -19,9 +19,13 @@ uv sync --extra dev
 uv run python scripts/extract_f02_scoring.py
 # 測試
 uv run pytest
-# 啟動介面
-uv run streamlit run app.py
+# 啟動介面（擇一；兩者共用同一套後端 pipeline，皆地端不外送）
+uv run uvicorn govcheck.web.api:app --port 8501   # 高還原 Web 介面（FastAPI + 靜態前端）
+uv run streamlit run app.py                        # Streamlit 介面
 ```
+
+> Web 介面（`web/` + `src/govcheck/web/api.py`）由 Claude Design 設計稿移植，三步驟：
+> 上傳送件包 → 確認自動分類 → 審查報告；字型用系統 CJK 堆疊，頁面無任何外部請求。
 
 ## 架構
 
