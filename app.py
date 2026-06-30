@@ -21,9 +21,13 @@ from govcheck.classify import (
     route_classifications,
 )
 from govcheck.llm.config import load_llm_config
+from govcheck.logging_setup import get_logger, new_request_id, set_request_id, setup_logging
 from govcheck.models import Severity
 from govcheck.report.builder import ICON, LABEL, to_markdown
 from govcheck.review.engine import review_routed
+
+setup_logging()  # 冪等：擋 Streamlit 每次 rerun 重覆掛 handler
+log = get_logger("app")
 
 st.set_page_config(page_title="AI 治理審查小幫手", page_icon="🛡️", layout="wide")
 
@@ -93,6 +97,7 @@ if not st.button("② 開始審查", type="primary"):
 
 # ── 步驟 2：依確認結果落地 → 路由 → 審查 ────────────────────────────────
 # 用後即刪：所有暫存檔在 TemporaryDirectory 結束時一併清除（最小足跡、地端不外送）。
+set_request_id(new_request_id())  # 單機模式也給 request_id，串連 ops/audit log
 report = None
 with tempfile.TemporaryDirectory() as tmpdir:
     confirmed: list[FileClassification] = []
@@ -113,6 +118,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
         files, supporting, class_findings = route_classifications(confirmed)
         report = review_routed(files, supporting, class_findings, enable_llm=use_llm)
     except Exception as exc:  # noqa: BLE001 - 介面層需把解析錯誤友善呈現
+        log.exception("review failed")  # 完整堆疊寫檔（地端，不外送）
         st.error(f"解析或審查失敗：{exc}")
         st.stop()
 

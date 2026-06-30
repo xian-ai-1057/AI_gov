@@ -39,6 +39,7 @@ AI治理/
 ├── scripts/extract_f02_scoring.py  # 建置第一步：解析官方 .xlsm 公式 → 計分 config
 ├── src/govcheck/
 │   ├── config/f02_scoring.yaml     # 自動抽出的 F02 計分常數（勿手改，重跑腳本產生）
+│   ├── logging_setup.py            # 地端 log：ops(govcheck.log)+稽核(audit.log) 雙管線；profile 控細節程度
 │   ├── models/                     # F02Form / Finding / ReviewReport (Pydantic v2)
 │   ├── parsers/                    # f02_parser.py（pandas 讀續填表 + openpyxl 讀公式/快取）
 │   ├── scoring/f02_score.py        # 還原 Excel 公式：加總→加成→百分比→MAX→分級
@@ -90,12 +91,17 @@ Phase 4 佐證充分性 → Phase 5 Agent 協助提案者填寫。
 - ✅ 規則式檢查與 LLM 判讀**分離**；LLM 相關測試一律 **mock**，不打真端點。
 - ✅ 測試要有 **ground truth**（正例/反例皆有正確答案），須全綠才收工。
 - ✅ 動 `data/original/` 前確認：**唯讀來源，禁止寫入或更動**；測試 fixture 一律寫到 `tests/` 或暫存。
+- ✅ Logging 經 `logging_setup`（`get_logger` 記 ops、`audit()` 記稽核）；細節程度由
+  `GOVCHECK_LOG_PROFILE`（dev=全流程 / prod=重點 / quiet=只剩錯誤）控制。各插入點標明 level
+  （DEBUG=流程 / INFO=重點 / WARNING=降級 / exception=堆疊）。
 
 ### 不能做
 - ❌ 寫入 `data/original/`（唯讀來源）。
 - ❌ 把提交者資料、原始模板或規範內容 push 上 GitHub 或送往**外部雲端**（僅地端/內部端點）。
 - ❌ 跳過測試直接收工。
+- ❌ Log 記錄**原始檔內容/解析後儲存格值/F03 佐證全文/LLM prompt 回應全文/api_key/Authorization**；
+  只准記識別資訊與數量（系統名/單位/Finding 代碼/計數/耗時/例外型別）。
 
 ### Git / 推送守則
-- 推 GitHub 前確認 `data/original/`、`.env`、`uploads/`、`output/`、`_Archive/` 都在 `.gitignore`
-  且不在 staged 清單（原始資料絕不入庫）。remote：`https://github.com/xian-ai-1057/AI_gov.git`。
+- 推 GitHub 前確認 `data/original/`、`.env`、`uploads/`、`output/`、`logs/`、`_Archive/` 都在 `.gitignore`
+  且不在 staged 清單（原始資料與含識別資訊的稽核 log 絕不入庫）。remote：`https://github.com/xian-ai-1057/AI_gov.git`。
