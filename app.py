@@ -119,10 +119,14 @@ with tempfile.TemporaryDirectory() as tmpdir:
 # ── 步驟 3：報告（沿用既有摘要 / 明細 / 下載）─────────────────────────────
 st.divider()
 st.subheader("③ 審查報告")
-c1, c2, c3 = st.columns(3)
-c1.metric("🔴 錯誤", report.error_count)
-c2.metric("🟡 提醒", report.warn_count)
-c3.metric("結果", "✅ 規則通過" if report.passed else "❌ 待處理")
+# 含 F02 時多一欄顯示固有風險分級/分數（來源：F02 第一頁 AI系統固有風險分級評估表）
+cols = st.columns(4 if report.risk_grade else 3)
+cols[0].metric("🔴 錯誤", report.error_count)
+cols[1].metric("🟡 提醒", report.warn_count)
+cols[2].metric("結果", "✅ 規則通過" if report.passed else "❌ 待處理")
+if report.risk_grade:
+    _pct = f" · {report.risk_score:.0f}%" if report.risk_score is not None else ""
+    cols[3].metric("固有風險分級", f"{report.risk_grade}{_pct}")
 
 st.divider()
 

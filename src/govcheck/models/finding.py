@@ -37,6 +37,8 @@ class ReviewReport(BaseModel):
     form_type: str                          # "F02" 等
     subject: str | None = None              # 受審專案/服務名稱
     findings: list[Finding] = Field(default_factory=list)
+    risk_score: float | None = None         # F02 固有風險百分比（overall 0–100）；無 F02 則 None
+    risk_grade: str | None = None           # F02 固有風險分級：低/中/高；無 F02 則 None
     banner: str = "⚠️ 本報告為 AI 初判草稿，需治理人員與三遵人工覆核，最終判定權不在 AI。"
 
     @property

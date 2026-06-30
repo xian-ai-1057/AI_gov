@@ -32,5 +32,6 @@ class Submission(BaseModel):
     f03: F03Identity | None = None
     f03_checklist: F03Checklist | None = None  # F03 完整檢核項（Phase 3 佐證審查用）
     supporting_docs: list[str] = Field(default_factory=list)  # 佐證檔名（Phase 2 僅檔名）
+    risk_score: float | None = None      # 由 F02 重算取得的固有風險百分比；缺 F02 則 None
     risk_grade: str | None = None        # 由 F02 重算取得；缺 F02 則 None
     f02_filing_unit: str | None = None   # F02 風險處理計畫表 N2，供跨表單位比對

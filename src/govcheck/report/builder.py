@@ -21,9 +21,12 @@ def to_markdown(report: ReviewReport) -> str:
         f"**錯誤 {report.error_count}**　提醒 {report.warn_count}　"
         f"結果：{'✅ 規則檢查通過' if report.passed else '❌ 有須處理項目'}",
         "",
-        "---",
-        "",
     ]
+    if report.risk_grade:
+        pct = f"（{report.risk_score:.1f}%）" if report.risk_score is not None else ""
+        lines.append(f"**固有風險分級**：{report.risk_grade}{pct}")
+        lines.append("")
+    lines += ["---", ""]
     for i, f in enumerate(report.findings, 1):
         lines.append(f"### {i}. {_ICON[f.severity]} [{_LABEL[f.severity]}] {f.title}")
         if f.location:

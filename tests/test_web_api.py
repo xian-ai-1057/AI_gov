@@ -123,8 +123,12 @@ def test_review_response_contract_keys():
     ).json()
     assert set(body) == {
         "form_type", "subject", "passed",
-        "error_count", "warn_count", "info_count", "findings", "markdown",
+        "error_count", "warn_count", "info_count",
+        "risk_score", "risk_grade", "findings", "markdown",
     }
+    # 無 F02 的送件包：風險欄位為 None（前端據此不渲染風險 tile）
+    assert body["risk_score"] is None
+    assert body["risk_grade"] is None
 
 
 def test_review_kinds_not_list_rejected():
@@ -189,7 +193,8 @@ def test_review_stream_emits_progress_then_done():
     report = events[-1]["report"]
     assert set(report) == {
         "form_type", "subject", "passed",
-        "error_count", "warn_count", "info_count", "findings", "markdown",
+        "error_count", "warn_count", "info_count",
+        "risk_score", "risk_grade", "findings", "markdown",
     }
     assert "DOC.MISSING_F01" in {f["code"] for f in report["findings"]}
 
@@ -275,6 +280,10 @@ def test_review_full_bundle_passes(tmp_path):
     assert body["passed"] is True
     assert body["error_count"] == 0 and body["warn_count"] == 0
     assert body["subject"]  # F01 帶出受審對象
+    # 含 F02 → 報告頂端風險欄位有值（前端據此渲染風險 tile）
+    assert body["risk_grade"] in {"低", "中", "高"}
+    assert isinstance(body["risk_score"], (int, float))
+    assert "固有風險分級" in body["markdown"]
 
 
 @requires_templates
@@ -294,3 +303,6 @@ def test_review_stream_full_bundle_emits_parse_and_passes(tmp_path):
     assert [e["done"] for e in parse] == [1, 2, 3]   # F01/F02/F03 三表逐一解析
     report = events[-1]["report"]
     assert "SUBMISSION.OK" in {f["code"] for f in report["findings"]} and report["passed"] is True
+    # 含 F02 → 串流 done 事件報告也帶風險欄位（與 /api/review 契約一致）
+    assert report["risk_grade"] in {"低", "中", "高"}
+    assert isinstance(report["risk_score"], (int, float))

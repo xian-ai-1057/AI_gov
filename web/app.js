@@ -12,6 +12,14 @@
     info:  { fg: "var(--info-fg)", bg: "var(--info-bg)", border: "var(--info-border)", icon: "i", label: "紀錄" },
   };
   const SEV_ORDER = { error: 0, warn: 1, info: 2 };
+  // 固有風險分級 → tile 配色（含邊框 token，與其他 tile 一致）：
+  // 高/中沿用 error/warn severity 色、低用通過(ok)綠，未知分級退中性色（不誤判為低風險）。
+  function riskColors(grade) {
+    if (grade === "高") return SEV.error;
+    if (grade === "中") return SEV.warn;
+    if (grade === "低") return { bg: "var(--ok-bg)", fg: "var(--ok)", border: "var(--ok-bg)" };
+    return SEV.info;
+  }
   const STEP_LABELS = ["上傳送件包", "確認分類", "審查報告"];
   const CHECKLIST = [
     { tag: "F1", name: "F01 系統資訊表", note: "系統基本資訊與必填欄位" },
@@ -27,7 +35,7 @@
     classify: null,     // /api/classify 回應 { kinds, files:[...] }
     kinds: {},          // index -> 使用者選定 kind（覆寫預設）
     review: null,       // /api/review 回應
-    filter: "all",
+    filter: "info",     // 預設停在【紀錄】分頁（彙整表所在）
     open: {},           // finding id -> bool
     reviewing: false,
     progress: null,     // { label, pct, detail } — SSE 串流的階段進度
@@ -223,7 +231,8 @@
     const open = {};
     data.findings.forEach((f) => { if (f.severity === "error") open[f.id] = true; });
     state.open = open;
-    state.filter = "all";
+    // 預設停在【紀錄】（彙整表所在）；但若無任何紀錄項，退回【全部】，避免落地畫面空白而藏住錯誤。
+    state.filter = data.info_count > 0 ? "info" : "all";
     state.reviewing = false;
     state.progress = null;
     state.step = 3;
@@ -236,7 +245,7 @@
     state.classify = null;
     state.kinds = {};
     state.review = null;
-    state.filter = "all";
+    state.filter = "info";  // 與初始預設一致（落地分頁在 startReview 依紀錄數再決定）
     state.open = {};
     state.error = null;
     fileInput.value = "";
@@ -387,11 +396,20 @@
         <div class="n">${n}</div><div class="l">${esc(label)}</div></div>`;
     };
 
+    // 固有風險分級/分數 tile（來源：F02 第一頁 AI系統固有風險分級評估表）；無 F02 則不渲染。
+    const riskTile = (() => {
+      if (!r.risk_grade) return "";
+      const c = riskColors(r.risk_grade);
+      const pct = r.risk_score != null ? ` · ${r.risk_score.toFixed(0)}%` : "";
+      return `<div class="gv-tile" style="background:${c.bg};color:${c.fg};border-color:${c.border};min-width:120px;">
+        <div class="n">${esc(r.risk_grade)}</div><div class="l">固有風險${esc(pct)}</div></div>`;
+    })();
+
     const filterDefs = [
-      { key: "all", label: `全部 ${r.findings.length}` },
+      { key: "info", label: `紀錄 ${r.info_count}` },
       { key: "error", label: `錯誤 ${r.error_count}` },
       { key: "warn", label: `提醒 ${r.warn_count}` },
-      { key: "info", label: `紀錄 ${r.info_count}` },
+      { key: "all", label: `全部 ${r.findings.length}` },
     ];
     const filters = filterDefs.map((f) =>
       `<button class="gv-filter${state.filter === f.key ? " active" : ""}" data-action="filter" data-filter="${f.key}">${esc(f.label)}</button>`).join("");
@@ -434,6 +452,7 @@
               <div class="subline">受審：${esc(r.subject || "未標示")}　·　${esc(r.form_type)}</div></div>
           </div>
           <div class="gv-tiles">
+            ${riskTile}
             ${tile(r.error_count, "錯誤", "error", true)}
             ${tile(r.warn_count, "提醒", "warn", false)}
             ${tile(r.info_count, "通過紀錄", "info", false)}

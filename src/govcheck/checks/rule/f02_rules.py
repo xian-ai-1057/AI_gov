@@ -11,7 +11,7 @@ from govcheck.scoring.f02_score import load_config, recompute
 
 # 重算 vs 快取 比對的容許誤差（百分比）
 SCORE_TOLERANCE = 0.5
-# 剩餘風險分數續填處理計畫的門檻
+# 剩餘風險分數續填處理計畫的門檻（剩餘風險 ≥ 此值即須續填，依附件四〈四、風險分數說明〉）
 TREATMENT_THRESHOLD = 6
 
 
@@ -173,7 +173,7 @@ def check_score_consistency(form: F02Form, cfg: dict) -> list[Finding]:
 
 
 def check_followup_sheets(form: F02Form, cfg: dict) -> list[Finding]:
-    """中/高風險須填剩餘風險評鑑；剩餘分數>6 須填處理計畫。"""
+    """中/高風險須填剩餘風險評鑑；剩餘分數 ≥6 須填處理計畫。"""
     findings = []
     grade = recompute(form, cfg).grade
 
@@ -188,13 +188,13 @@ def check_followup_sheets(form: F02Form, cfg: dict) -> list[Finding]:
                 expected="已填",
                 actual="未填",
             ))
-        elif form.residual_max_score is not None and form.residual_max_score > TREATMENT_THRESHOLD:
+        elif form.residual_max_score is not None and form.residual_max_score >= TREATMENT_THRESHOLD:
             if not form.treatment_filled:
                 findings.append(Finding(
                     severity=Severity.ERROR,
                     code="F02.TREATMENT_MISSING",
                     title="缺『AI系統風險處理計畫表』",
-                    message=(f"剩餘風險分數 {form.residual_max_score:g} 大於 {TREATMENT_THRESHOLD}，"
+                    message=(f"剩餘風險分數 {form.residual_max_score:g} 大於等於 {TREATMENT_THRESHOLD}，"
                              f"依規定須續填風險處理計畫表，目前為空。"),
                     location="AI系統風險處理計畫表",
                     expected="已填",
