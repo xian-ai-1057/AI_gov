@@ -14,7 +14,9 @@
 **定位**：AI 產出「初判草稿」加速人工審閱，**最終判定權在治理人員與三遵**。
 報告全程標示「AI 初判，需人工覆核」。資料全程地端，**不外送雲端**。
 
-**現況：Phase 1（MVP）已完成** — F02 風險評鑑規則檢查端到端可跑。
+**現況：Phase 1–3 已完成** — 批次上傳自動分類 → 缺件 + F01 必填 + F02 規則 + F03 兩段佐證 LLM 比較（+彙整表）
++ 跨表一致性，端到端可跑；介面含高還原 Web（FastAPI + 靜態前端）與 Streamlit。
+（Phase 3 的 RAG 向量檢索尚未實作；F03 LLM 目前為純兩段佐證比較。）
 
 ---
 
@@ -42,8 +44,8 @@ AI治理/
 │   ├── scoring/f02_score.py        # 還原 Excel 公式：加總→加成→百分比→MAX→分級
 │   ├── checks/
 │   │   ├── base.py                 # Check 介面：__call__(form) -> list[Finding]
-│   │   ├── rule/f02_rules.py       # ✅ 規則式檢查（單複選/系列/條件/計分比對/續填）
-│   │   └── llm/                    # ⏳ 後續 Phase：F03 兩段式判讀（測試一律 mock）
+│   │   ├── rule/                   # ✅ 規則式檢查：f02_rules / f01_rules / missing_docs / cross_consistency / f03_evidence_presence
+│   │   └── llm/f03_evidence.py     # ✅ F03 兩段佐證 LLM 比較 + 彙整表（預設關、自動降級；測試一律 mock）
 │   ├── review/engine.py            # 編排：parse → 跑 checks → 匯總
 │   ├── report/builder.py           # Finding → Markdown
 │   └── web/api.py                  # FastAPI：/api/classify + /api/review + 靜態掛載（介面層，零判讀邏輯）
