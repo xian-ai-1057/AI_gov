@@ -100,6 +100,8 @@ def _report_dict(report: ReviewReport) -> dict:
         "error_count": report.error_count,
         "warn_count": report.warn_count,
         "info_count": info_count,
+        "risk_score": report.risk_score,
+        "risk_grade": report.risk_grade,
         "findings": findings,
         "markdown": to_markdown(report),
     }

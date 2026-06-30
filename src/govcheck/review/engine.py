@@ -51,7 +51,11 @@ def review_f02(path: str | Path, cfg: dict | None = None) -> ReviewReport:
                      "仍須人工覆核實質內容。"),
         ))
 
-    return ReviewReport(form_type="F02", subject=form.subject, findings=findings)
+    score, grade = _f02_risk(form, cfg)
+    return ReviewReport(
+        form_type="F02", subject=form.subject, findings=findings,
+        risk_score=score, risk_grade=grade,
+    )
 
 
 def review_submission(
@@ -256,9 +260,9 @@ def _build_submission(
         _parse_step()
 
     if sub.f02 is not None:
-        # 風險等級以答案重算為準（確定性真值），重算失敗才退回檔內快取分級；
-        # 驅動條件式佐證缺件。快取與重算不符另由 f02_rules 的 F02.GRADE_MISMATCH 標示。
-        sub.risk_grade = _safe_grade(sub.f02) or sub.f02.cached.grade
+        # 風險分數/等級以答案重算為準（確定性真值），重算失敗才退回檔內快取；
+        # 驅動條件式佐證缺件與報告頂端風險顯示。快取與重算不符另由 F02.GRADE_MISMATCH 標示。
+        sub.risk_score, sub.risk_grade = _f02_risk(sub.f02)
         sub.f02_filing_unit = sub.f02.filing_unit  # parse_f02 已讀 N2，免重複開檔
 
     # subject 只能來自 F01（F02 無系統名稱欄）
@@ -266,11 +270,13 @@ def _build_submission(
     return sub
 
 
-def _safe_grade(f02) -> str | None:
+def _f02_risk(f02, cfg: dict | None = None) -> tuple[float | None, str | None]:
+    """取 F02 固有風險（分數, 分級）：以答案重算為準，重算失敗才退回檔內快取，分數與分級同源。"""
     try:
-        return recompute(f02).grade
+        r = recompute(f02, cfg)
+        return r.overall, r.grade
     except Exception:  # noqa: BLE001
-        return None
+        return f02.cached.overall, f02.cached.grade
 
 
 def _parse_error(form_label: str, exc: Exception) -> Finding:
