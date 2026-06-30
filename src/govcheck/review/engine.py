@@ -108,7 +108,10 @@ def review_submission(
     findings.sort(key=_severity_order)
     if not findings:
         findings.append(_submission_ok())
-    report = ReviewReport(form_type="送件包", subject=sub.subject, findings=findings)
+    report = ReviewReport(
+        form_type="送件包", subject=sub.subject, findings=findings,
+        risk_score=sub.risk_score, risk_grade=sub.risk_grade,
+    )
 
     dur_ms = round((time.perf_counter() - t0) * 1000)
     log.info("review_done error=%d warn=%d passed=%s dur=%dms",
