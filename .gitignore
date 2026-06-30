@@ -31,6 +31,9 @@ data/original
 uploads/
 output/
 
+# 執行期 log（技術維運 + 治理稽核；稽核檔含識別資訊，禁止入庫）
+logs/
+
 # 作業系統
 .DS_Store
 

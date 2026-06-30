@@ -15,10 +15,12 @@ import asyncio
 import io
 import json
 import tempfile
+import time
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Form, HTTPException, UploadFile
+from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -30,9 +32,12 @@ from govcheck.classify import (
     route_classifications,
 )
 from govcheck.llm.config import load_llm_config
+from govcheck.logging_setup import get_logger, new_request_id, set_request_id, setup_logging
 from govcheck.models import ReviewReport, Severity
 from govcheck.report.builder import to_markdown
 from govcheck.review.engine import review_routed
+
+log = get_logger("api")
 
 # 前端靜態檔位於 repo 根的 web/（src/govcheck/web/api.py → parents[3] = repo root）
 WEB_DIR = Path(__file__).resolve().parents[3] / "web"
@@ -44,7 +49,27 @@ KIND_OPTIONS = [{"value": k.value, "label": KIND_LABEL[k]} for k in _ASSIGNABLE]
     {"value": IGNORE, "label": "忽略此檔"}
 ]
 
-app = FastAPI(title="AI 治理審查小幫手", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # 在伺服器啟動時才設定 log（而非 import 時），避免被 import 即在 repo root 建出 logs/。
+    setup_logging()
+    yield
+
+
+app = FastAPI(title="AI 治理審查小幫手", docs_url=None, redoc_url=None, lifespan=_lifespan)
+
+
+@app.middleware("http")
+async def _request_log(request: Request, call_next):
+    """每個請求設 request_id（contextvar，隨 asyncio.to_thread 複製進 SSE worker），
+    DEBUG 記進入、INFO 記命中端點與耗時（重點）。只記方法/路徑/狀態碼，不記 body。"""
+    set_request_id(new_request_id())
+    log.debug("%s %s", request.method, request.url.path)
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    log.info("%s %s -> %d (%dms)", request.method, request.url.path,
+             response.status_code, round((time.perf_counter() - t0) * 1000))
+    return response
 
 
 def _severity_str(sev: Severity) -> str:
@@ -160,6 +185,7 @@ async def review(
             routed_files, supporting, class_findings = route_classifications(confirmed)
             report = review_routed(routed_files, supporting, class_findings, enable_llm=use_llm)
         except Exception as exc:  # noqa: BLE001 - 介面層需把解析/審查錯誤友善呈現
+            log.exception("review failed")  # 完整堆疊寫檔（地端，不外送）
             raise HTTPException(status_code=400, detail=f"解析或審查失敗：{exc}") from exc
 
     return JSONResponse(_report_dict(report))
@@ -269,6 +295,7 @@ async def review_stream(
         except HTTPException as exc:
             emit({"stage": "error", "message": str(exc.detail)})
         except Exception as exc:  # noqa: BLE001 - 介面層需把解析/審查錯誤友善呈現
+            log.exception("review failed")  # 完整堆疊寫檔（地端，不外送）
             emit({"stage": "error", "message": f"解析或審查失敗：{exc}"})
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, sentinel)

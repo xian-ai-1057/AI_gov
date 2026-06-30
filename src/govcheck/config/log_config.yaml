@@ -1,0 +1,13 @@
+# 地端 logging 設定（技術維運 log + 治理稽核 log）。僅放「非機密」預設值。
+# 環境變數可覆寫任一鍵：GOVCHECK_LOG_PROFILE / _LEVEL / _DIR / _CONSOLE / _MAX_BYTES / _BACKUP_COUNT
+# 稽核「誰」由 GOVCHECK_OPERATOR 提供（目前無登入機制，best-effort）。
+
+# 細節程度：dev=全流程(DEBUG) / prod=重點(INFO) / quiet=只剩錯誤(WARNING)
+profile: prod
+# level 留空 → 由 profile 推導；填值（如 DEBUG）則覆蓋 profile（細粒度逃生門）
+level:
+console: true          # 是否同時輸出到 console(stderr)；以 GOVCHECK_LOG_CONSOLE 覆寫
+max_bytes: 5000000     # 單一 log 檔輪替門檻（位元組）
+backup_count: 5        # 輪替保留份數
+# dir 留空 → 預設 repo root/logs（已 gitignore，稽核檔含識別資訊絕不入庫）
+dir:

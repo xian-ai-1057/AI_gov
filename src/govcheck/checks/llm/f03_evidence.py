@@ -15,7 +15,10 @@ import json
 from collections.abc import Callable
 
 from govcheck.llm.client import ChatClient, LLMError, parse_json_object
+from govcheck.logging_setup import get_logger
 from govcheck.models import F03Checklist, F03ChecklistItem, Finding, Severity
+
+log = get_logger("f03_llm")
 
 _SYSTEM = (
     "你是台新銀行 AI 治理審查助理，協助治理人員做初步審查。"
@@ -81,12 +84,14 @@ def run_all(
     aborted = False
 
     for batch_idx, chunk in enumerate(chunks):
+        log.debug("f03 llm batch %d/%d items=%d", batch_idx + 1, len(chunks), len(chunk))
         try:
             verdicts = _judge_batch(client, chunk)
         except LLMError as exc:
             item_errors += len(chunk)
             consecutive_errors += 1
             if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                log.warning("f03 llm aborted after %d consecutive errors", consecutive_errors)
                 findings.append(Finding(
                     severity=Severity.WARN,
                     code="F03.LLM_ERROR",
@@ -100,6 +105,9 @@ def run_all(
                 _llm_step(batch_idx + 1)
                 break
             # 單批失敗（如逾時/批量過長）→ 記一筆並續審其餘批次，避免一批拖垮整體召回
+            # 只記例外型別：LLMError 訊息可能夾帶端點回應內容（resp.text/模型輸出），不可落 log；
+            # 安全的狀態碼/連線細節已由 llm.client 上游記過。
+            log.warning("f03 llm batch %d failed: %s", batch_idx + 1, type(exc).__name__)
             locs = "、".join(it.loc for it in chunk)
             findings.append(Finding(
                 severity=Severity.INFO,
@@ -145,6 +153,7 @@ def run_all(
         ))
 
     flagged = sum(1 for f in findings if f.severity is Severity.WARN and f.code != "F03.LLM_ERROR")
+    log.info("f03 llm done reviewed=%d flagged=%d errors=%d", reviewed, flagged, item_errors)
     summary = f"LLM 佐證審查：審閱 {reviewed} 項，標示 {flagged} 項待人工覆核。"
     notes: list[str] = []
     if item_errors:

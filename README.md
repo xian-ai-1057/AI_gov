@@ -54,6 +54,38 @@ export GOVCHECK_LLM_MODEL="gemma3:4b"                       # 依端點可用模
 
 本機可用 **ollama** 起地端模型測試；端點不可用時自動略過，不影響規則檢查。資料僅送上述設定端點，不外送公有雲。
 
+## 日誌與稽核（地端）
+
+執行期產生**兩條分流日誌**，皆寫入 `logs/`（已 gitignore，**不入庫**）：
+
+- **技術維運**（`logs/govcheck.log`，並同時輸出 console）：管線各階段、解析與 LLM 降級、
+  錯誤堆疊，供除錯與維運。
+- **治理稽核**（`logs/audit.log`，每次審查一行 JSON）：`subject`（系統名）、`filing_unit`
+  （送件單位）、`error`/`warn` 計數、`passed`、`duration_ms`、`operator`、`enable_llm` 等，
+  供合規 / 三遵事後查核。
+
+兩條以 `request_id` 串連同一次審查。**維運日誌的細節程度可調**：以 `GOVCHECK_LOG_PROFILE`
+一個友善開關切換——
+
+| `GOVCHECK_LOG_PROFILE` | 維運日誌（govcheck.log） | 適用 |
+| --- | --- | --- |
+| `dev` | 全流程（每階段、每批、每解析步驟 + 下列重點） | 開發 / 除錯 |
+| `prod`（預設） | 重點（審查起訖、端點命中、降級、錯誤堆疊） | 正式使用 |
+| `quiet` | 只剩降級與錯誤 | 高量 / 極簡 |
+
+> **稽核日誌固定完整落檔，不受 profile 影響**——調低維運細節不會讓合規軌跡消失。
+
+```bash
+export GOVCHECK_LOG_PROFILE=dev      # 細節程度（預設 prod）
+export GOVCHECK_LOG_LEVEL=DEBUG      # 直接指定 level，優先於 profile（選用、細粒度逃生門）
+export GOVCHECK_LOG_DIR=/var/log/govcheck   # 落地目錄（預設 repo 根的 logs/）
+export GOVCHECK_OPERATOR=alice       # 稽核「操作者」欄（目前無登入機制，best-effort）
+# 其餘可調：GOVCHECK_LOG_CONSOLE / GOVCHECK_LOG_MAX_BYTES / GOVCHECK_LOG_BACKUP_COUNT
+```
+
+**隱私**：日誌只記識別資訊與數量（系統名／送件單位／Finding 代碼／計數／耗時／例外型別），
+**絕不**記原始檔內容、F03 佐證全文、LLM prompt／回應全文、api_key。
+
 ## 架構
 
 `parsers → models → checks(rule/llm) → review.engine → report`，四段可插拔。
