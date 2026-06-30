@@ -77,7 +77,11 @@ def _run_f03_llm(checklist) -> list[Finding]:
     try:
         llm_cfg = load_llm_config()
         client = ChatClient.from_config(llm_cfg)
-        return f03_evidence.run_all(checklist, client, max_items=llm_cfg["max_items"])
+        return f03_evidence.run_all(
+            checklist, client,
+            max_items=llm_cfg["max_items"],
+            batch_size=llm_cfg["batch_size"],
+        )
     except Exception as exc:  # noqa: BLE001 - LLM 不可用一律降級
         return [Finding(
             severity=Severity.INFO,
