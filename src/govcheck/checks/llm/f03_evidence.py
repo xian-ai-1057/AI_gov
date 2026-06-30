@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 from govcheck.llm.client import ChatClient, LLMError, parse_json_object
 from govcheck.models import F03Checklist, F03ChecklistItem, Finding, Severity
@@ -46,11 +47,14 @@ def run_all(
     client: ChatClient | None,
     max_items: int = 30,
     batch_size: int = 8,
+    progress: Callable[[dict], None] | None = None,
 ) -> list[Finding]:
     """對有填佐證的檢核項做分批 LLM 判讀，回傳 Finding 清單（source=llm）。
 
     max_items：送 LLM 的檢核項總上限（安全閥）。
     batch_size：單次 LLM 呼叫送審的檢核項數（批次以減少呼叫）。
+    progress：選用進度回呼；每批判讀完成（含失敗略過）emit 一筆 llm 進度事件
+        （此為總等待時間大宗，逐批回報最有感）。預設 None = no-op。
     """
     if client is None or form is None or not form.sheet_present:
         return []
@@ -65,6 +69,10 @@ def run_all(
     size = max(1, int(batch_size))
     chunks = [targets[i:i + size] for i in range(0, len(targets), size)]
 
+    def _llm_step(done: int) -> None:
+        if progress is not None:
+            progress({"stage": "llm", "label": "LLM 佐證判讀", "done": done, "total": len(chunks)})
+
     findings: list[Finding] = []
     table_rows: list[tuple[str, ...]] = []
     reviewed = 0
@@ -72,7 +80,7 @@ def run_all(
     consecutive_errors = 0
     aborted = False
 
-    for chunk in chunks:
+    for batch_idx, chunk in enumerate(chunks):
         try:
             verdicts = _judge_batch(client, chunk)
         except LLMError as exc:
@@ -89,6 +97,7 @@ def run_all(
                     source="llm",
                 ))
                 aborted = True
+                _llm_step(batch_idx + 1)
                 break
             # 單批失敗（如逾時/批量過長）→ 記一筆並續審其餘批次，避免一批拖垮整體召回
             locs = "、".join(it.loc for it in chunk)
@@ -102,6 +111,7 @@ def run_all(
             ))
             for it in chunk:
                 table_rows.append(_row_cells(it, None, errored=True))
+            _llm_step(batch_idx + 1)
             continue
 
         consecutive_errors = 0
@@ -123,6 +133,7 @@ def run_all(
             reviewed += 1
             findings.extend(_map_verdict(it, verdict))
             table_rows.append(_row_cells(it, verdict, errored=False))
+        _llm_step(batch_idx + 1)
 
     if table_rows:
         findings.append(Finding(

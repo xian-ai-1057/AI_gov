@@ -11,13 +11,15 @@ TemporaryDirectory 用後即刪策略（最小足跡、地端不外送）。
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from govcheck.classify import (
@@ -123,14 +125,7 @@ async def review(
     """依使用者確認後的 kinds 落地 → 路由 → 審查 → 回報告 JSON + markdown。"""
     if not files:
         raise HTTPException(status_code=400, detail="請上傳至少一個檔案。")
-    try:
-        confirmed_kinds: list[str] = json.loads(kinds)
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise HTTPException(status_code=400, detail=f"kinds 格式錯誤：{exc}") from exc
-    if not isinstance(confirmed_kinds, list):
-        raise HTTPException(status_code=400, detail="kinds 應為陣列。")
-    if len(confirmed_kinds) != len(files):
-        raise HTTPException(status_code=400, detail="kinds 數量與檔案數不符。")
+    confirmed_kinds = _parse_confirmed_kinds(kinds, len(files))
 
     use_llm = bool(load_llm_config()["enabled"]) if enable_llm is None else bool(enable_llm)
 
@@ -168,6 +163,132 @@ async def review(
             raise HTTPException(status_code=400, detail=f"解析或審查失敗：{exc}") from exc
 
     return JSONResponse(_report_dict(report))
+
+
+def _parse_confirmed_kinds(kinds: str, n_files: int) -> list[str]:
+    """解析並驗證前端送來的 kinds JSON 陣列（長度須與檔案數相符）。"""
+    try:
+        confirmed_kinds = json.loads(kinds)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=f"kinds 格式錯誤：{exc}") from exc
+    if not isinstance(confirmed_kinds, list):
+        raise HTTPException(status_code=400, detail="kinds 應為陣列。")
+    if len(confirmed_kinds) != n_files:
+        raise HTTPException(status_code=400, detail="kinds 數量與檔案數不符。")
+    return confirmed_kinds
+
+
+def _run_review_blocking(
+    payloads: list[tuple[str, bytes]],
+    confirmed_kinds: list[str],
+    use_llm: bool,
+    emit: Callable[[dict], None],
+) -> dict:
+    """工作執行緒內跑：落地檔 → 路由 → 審查 → 回報告 dict。
+
+    與 /api/review 同策略（TemporaryDirectory 用後即刪、basename 防逃逸、索引前綴防覆蓋），
+    差別僅在落地與審查各階段透過 emit 串出進度事件（upload / parse / rules / llm）。
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 先濾掉「忽略此檔」，再以原始索引落地（與 /api/review 的 idx 命名一致）
+        to_write = [
+            (idx, name, data, kind_value)
+            for idx, ((name, data), kind_value) in enumerate(zip(payloads, confirmed_kinds))
+            if kind_value != IGNORE
+        ]
+        confirmed: list[FileClassification] = []
+        for done, (idx, name, data, kind_value) in enumerate(to_write, start=1):
+            try:
+                kind = FileKind(kind_value)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"未知判定 {kind_value!r}") from exc
+            if kind not in _ASSIGNABLE:
+                raise HTTPException(status_code=400, detail=f"不可指派的判定 {kind_value!r}")
+            safe = Path(name).name or "file"
+            dest = Path(tmpdir) / f"{idx}_{safe}"
+            dest.write_bytes(data)
+            confirmed.append(FileClassification(
+                path=str(dest), filename=name, kind=kind, reason="使用者確認/修正",
+            ))
+            emit({"stage": "upload", "label": "落地檔案", "done": done, "total": len(to_write)})
+
+        if not confirmed:
+            raise HTTPException(
+                status_code=400, detail="所有檔案都被標記為「忽略此檔」，沒有可審查的內容。"
+            )
+
+        routed_files, supporting, class_findings = route_classifications(confirmed)
+        report = review_routed(
+            routed_files, supporting, class_findings, enable_llm=use_llm, progress=emit,
+        )
+    return _report_dict(report)
+
+
+@app.post("/api/review/stream")
+async def review_stream(
+    files: list[UploadFile],
+    kinds: str = Form(...),
+    enable_llm: bool | None = Form(default=None),
+) -> StreamingResponse:
+    """同 /api/review，但以 SSE（text/event-stream）即時串出各階段進度，最後一筆帶完整報告。
+
+    阻塞式審查在工作執行緒跑，進度事件經 asyncio.Queue 跨執行緒回主事件圈再 yield 出去；
+    用後即刪、地端不外送策略與 /api/review 完全一致。
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="請上傳至少一個檔案。")
+    confirmed_kinds = _parse_confirmed_kinds(kinds, len(files))
+    # 入參驗證一律在串流開始前完成 → 回正規 HTTP 4xx（串流一旦開始 header 已送出，只能改用
+    # in-band error 事件；與 /api/review 對齊，避免「壞輸入卻回 200」的契約漂移）。
+    assignable_values = {k.value for k in _ASSIGNABLE}
+    non_ignored = [kv for kv in confirmed_kinds if kv != IGNORE]
+    for kv in non_ignored:
+        if kv not in assignable_values:
+            raise HTTPException(status_code=400, detail=f"不可指派的判定 {kv!r}")
+    if not non_ignored:
+        raise HTTPException(
+            status_code=400, detail="所有檔案都被標記為「忽略此檔」，沒有可審查的內容。"
+        )
+    use_llm = bool(load_llm_config()["enabled"]) if enable_llm is None else bool(enable_llm)
+
+    # UploadFile.read 是 async，必須在事件圈內先讀成 bytes，才能丟進工作執行緒。
+    payloads: list[tuple[str, bytes]] = [(up.filename or "file", await up.read()) for up in files]
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    sentinel = object()
+
+    def emit(event: dict) -> None:
+        # 工作執行緒 → 主事件圈：執行緒安全地把事件丟進 queue，順序保留。
+        loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    def worker() -> None:
+        try:
+            report = _run_review_blocking(payloads, confirmed_kinds, use_llm, emit)
+            emit({"stage": "done", "label": "完成", "report": report})
+        except HTTPException as exc:
+            emit({"stage": "error", "message": str(exc.detail)})
+        except Exception as exc:  # noqa: BLE001 - 介面層需把解析/審查錯誤友善呈現
+            emit({"stage": "error", "message": f"解析或審查失敗：{exc}"})
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+
+    async def gen():
+        task = asyncio.create_task(asyncio.to_thread(worker))
+        try:
+            while True:
+                event = await queue.get()
+                if event is sentinel:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        finally:
+            await task
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/")

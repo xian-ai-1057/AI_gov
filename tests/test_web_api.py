@@ -167,6 +167,69 @@ def test_review_bad_kinds_json_rejected():
     assert res.status_code == 400
 
 
+# ── /api/review/stream：SSE 逐階段進度（無須官方範本）────────────────────
+
+
+def _sse_events(res) -> list[dict]:
+    """把 text/event-stream 回應切成事件 dict 清單。"""
+    return [json.loads(line[5:].strip()) for line in res.text.splitlines() if line.startswith("data:")]
+
+
+def test_review_stream_emits_progress_then_done():
+    res = client.post(
+        "/api/review/stream", data={"kinds": json.dumps(["supporting"])}, files=[_pdf()]
+    )
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/event-stream")
+    events = _sse_events(res)
+    stages = [e["stage"] for e in events]
+    assert "upload" in stages and "rules" in stages       # 至少含落地與規則階段進度
+    assert stages[-1] == "done"                            # 最後一筆為完成事件
+    # done 事件帶完整報告，且頂層契約與 /api/review 一致（前端直接讀這些鍵）
+    report = events[-1]["report"]
+    assert set(report) == {
+        "form_type", "subject", "passed",
+        "error_count", "warn_count", "info_count", "findings", "markdown",
+    }
+    assert "DOC.MISSING_F01" in {f["code"] for f in report["findings"]}
+
+
+def test_review_stream_progress_monotonic_within_stage():
+    res = client.post(
+        "/api/review/stream", data={"kinds": json.dumps(["supporting"])}, files=[_pdf()]
+    )
+    rules = [e for e in _sse_events(res) if e["stage"] == "rules"]
+    assert [e["done"] for e in rules] == sorted(e["done"] for e in rules)  # done 不回退
+    assert all(0 < e["done"] <= e["total"] for e in rules)
+
+
+def test_review_stream_matches_review_findings():
+    """串流端點與舊端點對同輸入應產出相同 findings（契約不漂移）。"""
+    payload = {"data": {"kinds": json.dumps(["supporting"])}, "files": [_pdf()]}
+    plain = client.post("/api/review", **payload).json()
+    stream_report = _sse_events(client.post("/api/review/stream", **payload))[-1]["report"]
+    assert {f["code"] for f in plain["findings"]} == {f["code"] for f in stream_report["findings"]}
+    assert plain["passed"] == stream_report["passed"]
+
+
+def test_review_stream_validation_errors_are_http_status():
+    # 入參錯誤一律在串流開始前回正規 HTTP 4xx（而非藏在 SSE error 事件裡），與 /api/review 對齊
+    assert client.post("/api/review/stream", files=[]).status_code in (400, 422)
+    assert client.post(
+        "/api/review/stream", data={"kinds": "not-json"}, files=[_pdf()]
+    ).status_code == 400
+    assert client.post(
+        "/api/review/stream", data={"kinds": json.dumps(["supporting", "supporting"])}, files=[_pdf()]
+    ).status_code == 400
+    # 全部「忽略此檔」→ 前置 400（與 /api/review 同契約），不進串流
+    res = client.post("/api/review/stream", data={"kinds": json.dumps(["ignore"])}, files=[_pdf()])
+    assert res.status_code == 400 and "忽略" in res.json()["detail"]
+    # 不可指派的判定（如 unknown）→ 前置 400
+    assert client.post(
+        "/api/review/stream", data={"kinds": json.dumps(["unknown"])}, files=[_pdf()]
+    ).status_code == 400
+
+
 # ── 靜態前端 ────────────────────────────────────────────────────────
 
 
@@ -212,3 +275,22 @@ def test_review_full_bundle_passes(tmp_path):
     assert body["passed"] is True
     assert body["error_count"] == 0 and body["warn_count"] == 0
     assert body["subject"]  # F01 帶出受審對象
+
+
+@requires_templates
+def test_review_stream_full_bundle_emits_parse_and_passes(tmp_path):
+    from tests.test_f02_rules import BASELINE
+    f01 = build_f01_fixture(tmp_path / "f01.xlsx")
+    f02 = build_f02_fixture(tmp_path / "f02.xlsm", answers=BASELINE, cached_grade="低")
+    f03 = build_f03_fixture(tmp_path / "f03.xlsx")
+    res = client.post(
+        "/api/review/stream",
+        data={"kinds": json.dumps(["f01", "f02", "f03", "supporting"])},
+        files=[_path_file(f01), _path_file(f02), _path_file(f03), _pdf("模型卡.pdf")],
+    )
+    assert res.status_code == 200
+    events = _sse_events(res)
+    parse = [e for e in events if e["stage"] == "parse"]
+    assert [e["done"] for e in parse] == [1, 2, 3]   # F01/F02/F03 三表逐一解析
+    report = events[-1]["report"]
+    assert "SUBMISSION.OK" in {f["code"] for f in report["findings"]} and report["passed"] is True

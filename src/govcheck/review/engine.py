@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from govcheck.checks.llm import f03_evidence
@@ -20,6 +21,16 @@ from govcheck.parsers.f02_parser import parse_f02
 from govcheck.parsers.f03_parser import parse_f03_checklist, parse_f03_identity
 from govcheck.review.config import load_review_config
 from govcheck.scoring.f02_score import recompute
+
+# 進度回呼：審查編排層在各階段邊界誠實回報事件（介面層據此畫進度條）。
+# 事件為純 dict，至少含 stage/label/done/total；預設 None 時所有 emit 為 no-op，
+# 既有呼叫者（Streamlit / CLI / 舊 API / 測試）行為完全不變。
+ProgressFn = Callable[[dict], None]
+
+
+def _emit(progress: ProgressFn | None, **event) -> None:
+    if progress is not None:
+        progress(event)
 
 
 def review_f02(path: str | Path, cfg: dict | None = None) -> ReviewReport:
@@ -44,27 +55,43 @@ def review_submission(
     supporting: list[str] | None = None,
     cfg: dict | None = None,
     enable_llm: bool = False,
+    progress: ProgressFn | None = None,
 ) -> ReviewReport:
     """整份送件包初步審查。
 
     files：{"f01": path, "f02": path, "f03": path}，未上傳者不放鍵（或值為 None）。
     supporting：佐證檔名清單（Phase 2 僅看檔名做關鍵字比對，不解析內容）。
     enable_llm：是否對 F03 兩段佐證做 LLM 判讀（預設關；端點不可用時自動降級，不影響規則檢查）。
+    progress：選用進度回呼；於 parse / rules / llm 各階段邊界 emit 事件（預設 None = no-op）。
     """
     review_cfg = cfg or load_review_config()
     findings: list[Finding] = []
-    sub = _build_submission(files, supporting, review_cfg, findings)
+    sub = _build_submission(files, supporting, review_cfg, findings, progress)
 
-    findings += missing_docs.run_all(sub, review_cfg)
+    # 規則階段總步數（依實際會跑的檢查動態計：缺件與跨表恆跑，其餘視表單是否存在）
+    has_f03_checklist = sub.f03_checklist is not None and sub.f03_checklist.sheet_present
+    rules_total = 2 + (sub.f01 is not None) + (sub.f02 is not None) + has_f03_checklist
+    rules_done = 0
+
+    def _rule_step(result: list[Finding]) -> list[Finding]:
+        nonlocal rules_done
+        rules_done += 1
+        _emit(progress, stage="rules", label="規則檢查", done=rules_done, total=rules_total)
+        return result
+
+    # 檢查順序維持原狀（missing → f01 → f02 → f03 規則 → f03 LLM → 跨表），確保 findings 插入
+    # 順序與既有行為一致；僅在各檢查邊界 emit 進度。跨表進度事件雖在 LLM 之後 emit，前端以
+    # 單調 pct 夾制，不會回退。
+    findings += _rule_step(missing_docs.run_all(sub, review_cfg))
     if sub.f01 is not None:
-        findings += f01_rules.run_all(sub.f01, review_cfg)
+        findings += _rule_step(f01_rules.run_all(sub.f01, review_cfg))
     if sub.f02 is not None:
-        findings += f02_rules.run_all(sub.f02)  # F02 規則用自己的 scoring config
-    if sub.f03_checklist is not None and sub.f03_checklist.sheet_present:
-        findings += f03_evidence_presence.run_all(sub.f03_checklist, review_cfg)  # 規則：恆跑、無網路
+        findings += _rule_step(f02_rules.run_all(sub.f02))  # F02 規則用自己的 scoring config
+    if has_f03_checklist:
+        findings += _rule_step(f03_evidence_presence.run_all(sub.f03_checklist, review_cfg))  # 規則：恆跑、無網路
         if enable_llm:
-            findings += _run_f03_llm(sub.f03_checklist)  # LLM：啟用才跑，失敗自動降級
-    findings += cross_consistency.run_all(sub, review_cfg)
+            findings += _run_f03_llm(sub.f03_checklist, progress)  # LLM：啟用才跑，失敗自動降級
+    findings += _rule_step(cross_consistency.run_all(sub, review_cfg))
 
     findings.sort(key=_severity_order)
     if not findings:
@@ -72,7 +99,7 @@ def review_submission(
     return ReviewReport(form_type="送件包", subject=sub.subject, findings=findings)
 
 
-def _run_f03_llm(checklist) -> list[Finding]:
+def _run_f03_llm(checklist, progress: ProgressFn | None = None) -> list[Finding]:
     """建立 LLM 客戶端並跑 F03 佐證判讀；任何初始化/執行失敗一律降級為 INFO，不中斷規則檢查。"""
     try:
         llm_cfg = load_llm_config()
@@ -81,6 +108,7 @@ def _run_f03_llm(checklist) -> list[Finding]:
             checklist, client,
             max_items=llm_cfg["max_items"],
             batch_size=llm_cfg["batch_size"],
+            progress=progress,
         )
     except Exception as exc:  # noqa: BLE001 - LLM 不可用一律降級
         return [Finding(
@@ -98,15 +126,19 @@ def review_routed(
     class_findings: list[Finding] | None = None,
     cfg: dict | None = None,
     enable_llm: bool = False,
+    progress: ProgressFn | None = None,
 ) -> ReviewReport:
     """已分類路由後的審查：跑既有 review_submission，再併入分類 Findings。
 
     review_submission 行為不變；此處於其上薄薄一層，把分類產生的 Findings
     （CLASSIFY.SUMMARY / 重複 / 無法辨識）併入，重排後僅在整體無 ERROR/WARN 時補 OK。
     enable_llm 透傳給 review_submission（控制 F03 佐證 LLM 判讀）。
+    progress 透傳給 review_submission（介面層據此畫進度條；預設 None = no-op）。
     """
     review_cfg = cfg or load_review_config()
-    report = review_submission(files, supporting=supporting, cfg=review_cfg, enable_llm=enable_llm)
+    report = review_submission(
+        files, supporting=supporting, cfg=review_cfg, enable_llm=enable_llm, progress=progress,
+    )
 
     merged = [f for f in report.findings if f.code != "SUBMISSION.OK"]
     merged = list(class_findings or []) + merged
@@ -148,6 +180,7 @@ def _build_submission(
     supporting: list[str] | None,
     review_cfg: dict,
     findings: list[Finding],
+    progress: ProgressFn | None = None,
 ) -> Submission:
     """逐檔解析成 Submission；每檔包 try/except，失敗加 PARSE_ERROR 並繼續（介面層不崩）。"""
     presence = FilePresence(
@@ -157,16 +190,27 @@ def _build_submission(
     )
     sub = Submission(presence=presence, supporting_docs=list(supporting or []))
 
+    # 解析是耗時大宗（openpyxl 每檔約 1–3 秒）；每解析完一張表 emit 一次進度。
+    parse_total = int(presence.f01) + int(presence.f02) + int(presence.f03)
+    parse_done = 0
+
+    def _parse_step() -> None:
+        nonlocal parse_done
+        parse_done += 1
+        _emit(progress, stage="parse", label="解析表單", done=parse_done, total=parse_total)
+
     if presence.f01:
         try:
             sub.f01 = parse_f01(files["f01"], review_cfg)
         except Exception as exc:  # noqa: BLE001 - 介面層需把解析錯誤友善呈現
             findings.append(_parse_error("F01", exc))
+        _parse_step()
     if presence.f02:
         try:
             sub.f02 = parse_f02(files["f02"])
         except Exception as exc:  # noqa: BLE001
             findings.append(_parse_error("F02", exc))
+        _parse_step()
     if presence.f03:
         try:
             sub.f03 = parse_f03_identity(files["f03"], review_cfg)
@@ -184,6 +228,7 @@ def _build_submission(
                 expected="可解析的官方範本",
                 actual="解析失敗",
             ))
+        _parse_step()
 
     if sub.f02 is not None:
         # 風險等級以答案重算為準（確定性真值），重算失敗才退回檔內快取分級；
