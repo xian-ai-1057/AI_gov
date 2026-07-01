@@ -9,8 +9,11 @@ import json
 import logging
 from pathlib import Path
 
+import govcheck.logging_setup as logging_setup
 from govcheck.logging_setup import (
     audit,
+    dev_mode,
+    dump_llm_raw,
     get_logger,
     load_log_config,
     new_request_id,
@@ -155,3 +158,56 @@ def test_audit_record_has_no_secret_markers():
     text = "\n".join(_audit_lines())
     for marker in ("Authorization", "Bearer", "api_key", "sk-"):
         assert marker not in text
+
+
+# ── dev-only 原文落檔（dump_llm_raw / dev_mode） ─────────────────────────────
+
+def _llm_raw_files() -> list[Path]:
+    d = Path(load_log_config()["dir"]) / "llm_raw"
+    return sorted(d.glob("*.json")) if d.exists() else []
+
+
+def test_dev_mode_gate(monkeypatch):
+    monkeypatch.setenv("GOVCHECK_LOG_PROFILE", "dev")
+    assert dev_mode() is True
+    monkeypatch.setenv("GOVCHECK_LOG_PROFILE", "prod")
+    assert dev_mode() is False
+    monkeypatch.setenv("GOVCHECK_LOG_PROFILE", "quiet")
+    assert dev_mode() is False
+
+
+def test_dump_llm_raw_writes_full_content_in_dev(monkeypatch):
+    monkeypatch.setenv("GOVCHECK_LOG_PROFILE", "dev")
+    set_request_id("rid12345")
+    full_resp = "壞掉的回應" * 500  # 遠超終端截斷長度
+    path = dump_llm_raw({"status": "ok", "response_text": full_resp})
+    assert path is not None
+    files = _llm_raw_files()
+    assert len(files) == 1
+    rec = json.loads(files[0].read_text(encoding="utf-8"))
+    assert rec["response_text"] == full_resp        # 檔案存「完整」內容
+    assert rec["request_id"] == "rid12345"          # 依 request_id 可對回
+    assert "rid12345" in files[0].name
+
+
+def test_dump_llm_raw_noop_in_non_dev(monkeypatch):
+    for profile in ("prod", "quiet"):
+        monkeypatch.setenv("GOVCHECK_LOG_PROFILE", profile)
+        assert dump_llm_raw({"status": "ok", "response_text": "x"}) is None
+    assert _llm_raw_files() == []                    # 非 dev 完全不寫檔
+
+
+def test_dump_llm_raw_retention_cap(monkeypatch):
+    monkeypatch.setenv("GOVCHECK_LOG_PROFILE", "dev")
+    monkeypatch.setattr(logging_setup, "_LLM_RAW_KEEP", 3)  # 縮小上限便於測試
+    for i in range(8):
+        dump_llm_raw({"status": "ok", "seq": i})
+    assert len(_llm_raw_files()) == 3               # 只保留最新 3 個，其餘刪除
+
+
+def test_dump_llm_raw_swallows_non_serializable(monkeypatch):
+    # 除錯輔助絕不可拖垮主流程：record 含不可序列化值 → json.dumps 拋 TypeError，
+    # dump_llm_raw 必須吞掉回 None（而非讓 TypeError 逃出去砸掉 LLM 呼叫）。
+    monkeypatch.setenv("GOVCHECK_LOG_PROFILE", "dev")
+    assert dump_llm_raw({"status": "ok", "blob": object()}) is None
+    assert _llm_raw_files() == []                    # 序列化失敗 → 不留半個檔
