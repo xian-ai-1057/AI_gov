@@ -97,7 +97,7 @@ def run_all(
                     code="F03.LLM_ERROR",
                     title="LLM 佐證審查中止",
                     message=(f"連續 {consecutive_errors} 批呼叫 LLM 端點失敗，研判端點異常，已中止；"
-                             f"已審 {reviewed} 項，尚有未完成判讀項目：{exc}"),
+                             f"已審 {reviewed} 項，尚有未完成判讀項目。"),
                     location=chunk[0].loc,
                     source="llm",
                 ))
@@ -113,7 +113,7 @@ def run_all(
                 severity=Severity.INFO,
                 code="F03.LLM_ITEM_ERROR",
                 title="本批 LLM 判讀失敗（已略過）",
-                message=f"本批 {len(chunk)} 項 LLM 判讀失敗，已略過續審其餘批次（{locs}）：{exc}",
+                message=f"本批 {len(chunk)} 項 LLM 判讀失敗，已略過續審其餘批次（{locs}）。",
                 location=chunk[0].loc,
                 source="llm",
             ))
@@ -225,7 +225,6 @@ def _map_verdict(item: F03ChecklistItem, verdict: dict) -> list[Finding]:
             title="提案規劃階段佐證過於草率/不明確",
             message=str(prop.get("reason") or "說明過於空泛或與檢查項目無實質對應，請補充具體佐證。"),
             location=loc,
-            actual=_excerpt(item.evidence_proposal),
             source="llm",
         ))
 
@@ -237,7 +236,6 @@ def _map_verdict(item: F03ChecklistItem, verdict: dict) -> list[Finding]:
             title="上線階段佐證過於草率/不明確",
             message=str(gol.get("reason") or "說明過於空泛或與檢查項目無實質對應，請補充具體佐證。"),
             location=loc,
-            actual=_excerpt(item.evidence_golive),
             source="llm",
         ))
     return out

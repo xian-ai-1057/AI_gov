@@ -78,8 +78,8 @@ def check_single_choice(form: F02Form, cfg: dict) -> list[Finding]:
     for prefix, count in cfg["groups"]["single_choice"].items():
         members = _group_members(prefix, count, cfg)
         yes = [m for m in members if form.answers.get(m) == "Y"]
-        # 全部未填的情況留給 completeness 規則，避免重複報
-        if all(form.answers.get(m) is None for m in members):
+        # 有任一子項未填 → 留給 completeness 規則處理；此處僅驗證「填齊後是否恰好 1 個 Y」
+        if any(form.answers.get(m) is None for m in members):
             continue
         if len(yes) != 1:
             findings.append(Finding(
@@ -188,7 +188,17 @@ def check_followup_sheets(form: F02Form, cfg: dict) -> list[Finding]:
                 expected="已填",
                 actual="未填",
             ))
-        elif form.residual_max_score is not None and form.residual_max_score >= TREATMENT_THRESHOLD:
+        elif form.residual_max_score is None:
+            findings.append(Finding(
+                severity=Severity.WARN,
+                code="F02.RESIDUAL_SCORE_MISSING",
+                title="剩餘風險分數無法讀取",
+                message="剩餘風險評鑑表已填寫，但無法讀取剩餘風險評鑑分數欄，無法判斷是否須續填處理計畫，請人工確認。",
+                location="AI系統剩餘風險評鑑表",
+                expected="剩餘風險評鑑分數",
+                actual="無法讀取",
+            ))
+        elif form.residual_max_score >= TREATMENT_THRESHOLD:
             if not form.treatment_filled:
                 findings.append(Finding(
                     severity=Severity.ERROR,
