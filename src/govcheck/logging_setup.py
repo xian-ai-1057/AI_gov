@@ -13,16 +13,22 @@
 禁止記錄（隱私關鍵；地端不外送，但 log 仍會落地保存）：
   原始檔 bytes、解析後儲存格值、F03 佐證全文、LLM prompt/回應全文、api_key、Authorization header。
 呼叫端只傳「識別資訊與數量」（系統名/送件單位/Finding 代碼/計數/耗時/例外型別）。
+
+dev-only 逃生門：僅 ``dev`` profile（本機 ollama 除錯、無真實送件資料）時，``dump_llm_raw()``
+會把「LLM request/response 全文」另存到 ``logs/llm_raw/``（gitignored）供解 JSON 解析失敗除錯；
+prod / quiet **完全不寫**，既有隱私守線不受影響。上線環境勿設 ``GOVCHECK_LOG_PROFILE=dev``。
 """
 
 from __future__ import annotations
 
 import contextvars
 import functools
+import itertools
 import json
 import logging
 import os
 import uuid
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -41,6 +47,11 @@ _PROFILE_LEVEL = {"dev": "DEBUG", "prod": "INFO", "quiet": "WARNING"}
 _VALID_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
 _TRUE = {"1", "true", "yes", "on", "y", "t"}
+
+# dev-only 原文落檔：目錄名、保留檔數上限、同秒去重的 process 級序號。
+_LLM_RAW_DIR = "llm_raw"
+_LLM_RAW_KEEP = 200
+_llm_raw_seq = itertools.count(1)
 
 _request_id: contextvars.ContextVar[str] = contextvars.ContextVar("govcheck_request_id", default="-")
 
@@ -213,3 +224,44 @@ def audit(event: str, **fields) -> None:
         **fields,
     }
     logging.getLogger(_AUDIT_LOGGER).info(json.dumps(record, ensure_ascii=False))
+
+
+def dev_mode() -> bool:
+    """是否為 dev profile。dev-only 除錯落檔/明細輸出的閘門；prod / quiet 一律 False。"""
+    return load_log_config()["profile"] == "dev"
+
+
+def dump_llm_raw(record: dict) -> str | None:
+    """dev-only：把一次 LLM 呼叫的「完整」request/response 落一個 JSON 檔到 logs/llm_raw/。
+
+    非 dev profile 直接回 None（不寫檔）。供解 JSON 解析失敗時回查模型實際回了什麼。
+    檔名 ``{時間}_{request_id}_{seq}.json``，可依 request_id 對回 ops log；寫完維持保留上限、
+    刪最舊者以免資料夾無限膨脹。任何例外（含 I/O、json.dumps 非序列化）都吞掉回 None
+    （除錯輔助不得反過來拖垮主流程）。回傳完整檔路徑字串（未寫檔則 None）。
+    """
+    if not dev_mode():
+        return None
+    try:
+        raw_dir = Path(load_log_config()["dir"]) / _LLM_RAW_DIR
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        seq = next(_llm_raw_seq)
+        path = raw_dir / f"{stamp}_{get_request_id()}_{seq:04d}.json"
+        payload = {"request_id": get_request_id(), **record}
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _prune_llm_raw(raw_dir)
+        return str(path)
+    except Exception:  # noqa: BLE001 - 除錯輔助絕不可反過來拖垮主流程（含 json.dumps 非序列化值的 TypeError）
+        return None
+
+
+def _prune_llm_raw(raw_dir: Path) -> None:
+    """只保留最新 _LLM_RAW_KEEP 個 dump，其餘刪除；以 mtime 排序（不受檔名序號位數/同秒影響）。"""
+    if _LLM_RAW_KEEP <= 0:  # 非正值視為關閉修剪（避免 files[:-0] == files[:0] 反而全部保留）
+        return
+    files = sorted(raw_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    for stale in files[:-_LLM_RAW_KEEP]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass

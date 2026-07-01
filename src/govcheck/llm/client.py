@@ -11,9 +11,19 @@ import json
 import requests
 
 from govcheck.llm.config import load_llm_config
-from govcheck.logging_setup import get_logger
+from govcheck.logging_setup import dev_mode, dump_llm_raw, get_logger, get_request_id
 
 log = get_logger("llm_client")
+
+# dev 終端截斷長度（完整內容另存 logs/llm_raw/；prod/quiet 不觸發）。
+_REQ_TRUNC = 300
+_RESP_TRUNC = 500
+
+
+def _trunc(text: str | None, limit: int) -> str:
+    """終端顯示用截斷：壓成單行、超長補「…」（僅 dev DEBUG 用，完整內容已另存檔）。"""
+    s = "" if text is None else " ".join(str(text).split())
+    return s if len(s) <= limit else s[:limit] + "…"
 
 
 class LLMError(RuntimeError):
@@ -72,18 +82,42 @@ class ChatClient:
         except requests.RequestException as exc:
             # 只記端點與例外型別；不記 payload（含佐證內容）
             log.warning("llm request failed endpoint=%s err=%s", self.endpoint, type(exc).__name__)
+            if dev_mode():  # dev-only：連線失敗無 response，仍存 request 全文供除錯
+                path = dump_llm_raw({
+                    "status": "connection_error", "endpoint": self.endpoint,
+                    "model": self.model, "error": str(exc), "request_messages": messages,
+                })
+                log.debug("llm conn error request_id=%s endpoint=%s req=%s raw=%s",
+                          get_request_id(), self.endpoint, _trunc(str(messages), _REQ_TRUNC), path)
             raise LLMError(f"無法連線 LLM 端點（{self.endpoint}）：{exc}") from exc
 
         if resp.status_code >= 400:
             # 只記狀態碼；不記 resp.text（可能含回傳內容）
             log.warning("llm endpoint http %d endpoint=%s", resp.status_code, self.endpoint)
+            if dev_mode():  # dev-only：存 request + HTTP 回應本文全文，終端印截斷
+                path = dump_llm_raw({
+                    "status": f"http_{resp.status_code}", "endpoint": self.endpoint,
+                    "model": self.model, "request_messages": messages, "http_body": resp.text,
+                })
+                log.debug("llm http %d request_id=%s body=%s raw=%s",
+                          resp.status_code, get_request_id(), _trunc(resp.text, _RESP_TRUNC), path)
             raise LLMError(f"LLM 端點回應 HTTP {resp.status_code}：{resp.text[:200]}")
 
         try:
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            content = data["choices"][0]["message"]["content"]
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"LLM 回應格式非預期：{exc}") from exc
+
+        if dev_mode():  # dev-only：每次呼叫都存完整 request/response，終端印截斷版
+            path = dump_llm_raw({
+                "status": "ok", "endpoint": self.endpoint, "model": self.model,
+                "request_messages": messages, "response_text": content,
+            })
+            log.debug("llm call ok request_id=%s endpoint=%s req=%s resp=%s raw=%s",
+                      get_request_id(), self.endpoint,
+                      _trunc(str(messages), _REQ_TRUNC), _trunc(content, _RESP_TRUNC), path)
+        return content
 
 
 def parse_json_object(content: str | None) -> dict:
@@ -98,10 +132,16 @@ def parse_json_object(content: str | None) -> dict:
         # 容忍圍欄/前後說明文字，且不會誤把尾端文字裡的 } 一起吞進來。
         start = text.find("{")
         if start == -1:
+            if dev_mode():  # dev-only：終端直接點出實際回了什麼（完整內容由 chat() 存 llm_raw/）
+                log.debug("llm json no-brace request_id=%s excerpt=%s",
+                          get_request_id(), _trunc(content, _RESP_TRUNC))
             raise LLMError(f"LLM 回應非 JSON：{content[:120]}") from None
         try:
             obj, _ = json.JSONDecoder().raw_decode(text, start)
         except json.JSONDecodeError as exc:
+            if dev_mode():  # dev-only：帶 request_id 可回查 logs/llm_raw/ 的完整回應
+                log.debug("llm json parse failed request_id=%s err=%s excerpt=%s",
+                          get_request_id(), exc, _trunc(content, _RESP_TRUNC))
             raise LLMError(f"LLM 回應 JSON 解析失敗：{exc}") from exc
     if not isinstance(obj, dict):
         raise LLMError("LLM 回應 JSON 不是物件")

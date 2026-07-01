@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from govcheck.logging_setup import reset_logging
+from govcheck.logging_setup import reset_logging, set_request_id
 
 ROOT = Path(__file__).resolve().parents[1]
 OFFICIAL_F02 = ROOT / "data" / "original" / "附件二：AI-R02-F02 AI風險評鑑.xlsm"
@@ -20,8 +20,10 @@ def _isolate_logging(monkeypatch, tmp_path):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("GOVCHECK_LOG_DIR", str(tmp_path / "logs"))
     reset_logging()
+    set_request_id("-")  # contextvar 不隨 test 邊界重置，清掉上個 case 殘留的 request_id
     yield
     reset_logging()
+    set_request_id("-")
 
 
 @pytest.fixture(scope="session")
