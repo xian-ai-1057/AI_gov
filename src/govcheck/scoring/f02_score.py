@@ -60,15 +60,21 @@ def recompute(form: F02Form, cfg: dict | None = None) -> F02ScoreResult:
             for d in domains:
                 pre[d] += float(spec["scores"][d])
 
-    # 3. 加成因子（答 Y=「有」取乘數，否則 ×1）
+    # 3. 加成因子（答 Y=「有」取乘數，否則 ×1）；直接以 .items() 取鍵，不用 identity 比較
     multiplier = 1.0
-    for factor in cfg["uplift_factors"].values():
-        ans = form.uplift.get(_factor_key(factor, cfg))
+    for name, factor in cfg["uplift_factors"].items():
+        ans = form.uplift.get(name)
         multiplier *= float(factor["multiplier_on_yes"]) if ans == "Y" else 1.0
     post = {d: pre[d] * multiplier for d in domains}
 
     # 4. 百分比
     denom = cfg["normalization_denominators"]
+    for d in domains:
+        if not float(denom[d]):
+            raise ValueError(
+                f"f02_scoring.yaml 正規化分母 '{d}' 為 0，"
+                "請重新執行 scripts/extract_f02_scoring.py（須在 Excel 已試算後的 .xlsm）。"
+            )
     pct = {d: (post[d] / float(denom[d])) * 100 for d in domains}
 
     # 5. MAX → 分級
@@ -81,9 +87,3 @@ def recompute(form: F02Form, cfg: dict | None = None) -> F02ScoreResult:
     )
 
 
-def _factor_key(factor: dict, cfg: dict) -> str:
-    """加成因子在 form.uplift 的鍵；以 config 中的名稱（factor1/2/3）為準。"""
-    for name, spec in cfg["uplift_factors"].items():
-        if spec is factor:
-            return name
-    raise KeyError("uplift factor not found in config")

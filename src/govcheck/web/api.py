@@ -42,6 +42,9 @@ log = get_logger("api")
 # 前端靜態檔位於 repo 根的 web/（src/govcheck/web/api.py → parents[3] = repo root）
 WEB_DIR = Path(__file__).resolve().parents[3] / "web"
 
+# 單檔上限（50 MB）：防止記憶體耗盡或磁碟塞滿
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
 # 可指派的判定（對齊 app.py：UNKNOWN 不可手動指派，以「忽略此檔」表示排除）
 IGNORE = "ignore"
 _ASSIGNABLE = [FileKind.F01, FileKind.F02, FileKind.F03, FileKind.SUPPORTING]
@@ -118,7 +121,9 @@ async def classify(files: list[UploadFile]) -> JSONResponse:
     for idx, up in enumerate(files):
         data = await up.read()
         name = up.filename or f"file_{idx}"
-        c = classify_fileobj(io.BytesIO(data), name)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"上傳檔案超過大小限制（上限 50 MB）：{name}")
+        c = await asyncio.to_thread(classify_fileobj, io.BytesIO(data), name)
 
         flag: str | None = None
         if c.kind is FileKind.UNKNOWN:
@@ -173,7 +178,10 @@ async def review(
             # 顯示用 filename 仍保留原始名稱（供分類器/報告呈現）。
             safe = Path(name).name or "file"
             dest = Path(tmpdir) / f"{idx}_{safe}"
-            dest.write_bytes(await up.read())
+            file_data = await up.read()
+            if len(file_data) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail=f"上傳檔案超過大小限制（上限 50 MB）：{name}")
+            dest.write_bytes(file_data)
             confirmed.append(FileClassification(
                 path=str(dest), filename=name, kind=kind, reason="使用者確認/修正",
             ))
@@ -187,8 +195,8 @@ async def review(
             routed_files, supporting, class_findings = route_classifications(confirmed)
             report = review_routed(routed_files, supporting, class_findings, enable_llm=use_llm)
         except Exception as exc:  # noqa: BLE001 - 介面層需把解析/審查錯誤友善呈現
-            log.exception("review failed")  # 完整堆疊寫檔（地端，不外送）
-            raise HTTPException(status_code=400, detail=f"解析或審查失敗：{exc}") from exc
+            log.error("review failed: %s", type(exc).__name__)
+            raise HTTPException(status_code=400, detail=f"解析或審查失敗：{type(exc).__name__}") from exc
 
     return JSONResponse(_report_dict(report))
 
@@ -280,7 +288,13 @@ async def review_stream(
     use_llm = bool(load_llm_config()["enabled"]) if enable_llm is None else bool(enable_llm)
 
     # UploadFile.read 是 async，必須在事件圈內先讀成 bytes，才能丟進工作執行緒。
-    payloads: list[tuple[str, bytes]] = [(up.filename or "file", await up.read()) for up in files]
+    payloads: list[tuple[str, bytes]] = []
+    for up in files:
+        name_s = up.filename or "file"
+        data_s = await up.read()
+        if len(data_s) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"上傳檔案超過大小限制（上限 50 MB）：{name_s}")
+        payloads.append((name_s, data_s))
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
@@ -297,8 +311,8 @@ async def review_stream(
         except HTTPException as exc:
             emit({"stage": "error", "message": str(exc.detail)})
         except Exception as exc:  # noqa: BLE001 - 介面層需把解析/審查錯誤友善呈現
-            log.exception("review failed")  # 完整堆疊寫檔（地端，不外送）
-            emit({"stage": "error", "message": f"解析或審查失敗：{exc}"})
+            log.error("review failed: %s", type(exc).__name__)
+            emit({"stage": "error", "message": f"解析或審查失敗：{type(exc).__name__}"})
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, sentinel)
 
