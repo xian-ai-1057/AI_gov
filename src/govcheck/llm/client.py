@@ -75,9 +75,9 @@ class ChatClient:
             raise LLMError(f"無法連線 LLM 端點（{self.endpoint}）：{exc}") from exc
 
         if resp.status_code >= 400:
-            # 只記狀態碼；不記 resp.text（可能含回傳內容）
+            # 只記狀態碼；不記 resp.text（可能含佐證內容或 prompt 片段）
             log.warning("llm endpoint http %d endpoint=%s", resp.status_code, self.endpoint)
-            raise LLMError(f"LLM 端點回應 HTTP {resp.status_code}：{resp.text[:200]}")
+            raise LLMError(f"LLM 端點回應 HTTP {resp.status_code}")
 
         try:
             data = resp.json()
@@ -98,7 +98,7 @@ def parse_json_object(content: str | None) -> dict:
         # 容忍圍欄/前後說明文字，且不會誤把尾端文字裡的 } 一起吞進來。
         start = text.find("{")
         if start == -1:
-            raise LLMError(f"LLM 回應非 JSON：{content[:120]}") from None
+            raise LLMError("LLM 回應非 JSON（無 `{` 起始字元）") from None
         try:
             obj, _ = json.JSONDecoder().raw_decode(text, start)
         except json.JSONDecodeError as exc:

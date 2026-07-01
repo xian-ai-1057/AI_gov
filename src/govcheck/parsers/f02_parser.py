@@ -43,6 +43,8 @@ def parse_f02(path: str | Path, cfg: dict | None = None) -> F02Form:
 
     answers: dict[str, str | None] = {}
     for row in ws.iter_rows():
+        if len(row) < 3:  # 防止 read_only 模式回傳的短列（< 3 欄）IndexError
+            continue
         qid_cell = row[0].value  # A 欄題號
         if isinstance(qid_cell, str) and qid_cell.strip() in question_ids:
             qid = qid_cell.strip()
@@ -50,12 +52,12 @@ def parse_f02(path: str | Path, cfg: dict | None = None) -> F02Form:
 
     uplift = {name: _norm_answer(ws[f"C{r}"].value) for name, r in UPLIFT_ROWS.items()}
 
-    # 快取百分比：若四格皆空（如 openpyxl 產生、未經 Excel 計算的檔），視為「無快取」None，
-    # 讓計分比對規則略過，而非誤判為全 0。
+    # 快取百分比：四格全有值才視為完整快取；只要有任一格為 None（部分快取狀態，
+    # 如單域試算儲存後）一律視為「無快取」，避免把 None 補 0 造成假性 SCORE_MISMATCH。
     raw_pct = {d: _num_or_none(ws[c].value) for d, c in PCT_CELLS.items()}
-    has_pct = any(v is not None for v in raw_pct.values())
+    has_pct = all(v is not None for v in raw_pct.values())
     cached = CachedScores(
-        percentages=DomainScores(**{d: (v or 0.0) for d, v in raw_pct.items()}) if has_pct else None,
+        percentages=DomainScores(**{d: v for d, v in raw_pct.items()}) if has_pct else None,
         overall=_num_or_none(ws[OVERALL_CELL].value),
         grade=_clean(ws[GRADE_CELL].value),
     )
@@ -83,7 +85,10 @@ def _read_residual(path: Path) -> tuple[bool, float | None]:
     df = df.dropna(how="all")
     if df.empty:
         return False, None
-    score_col = next((c for c in df.columns if str(c).replace("\n", " ").strip() == RESIDUAL_SCORE_COL), None)
+    score_col = next(
+        (c for c in df.columns if _normalize_header(str(c)) == _normalize_header(RESIDUAL_SCORE_COL)),
+        None,
+    )
     max_score = None
     if score_col is not None:
         nums = pd.to_numeric(df[score_col], errors="coerce").dropna()
@@ -117,6 +122,11 @@ def _norm_answer(v) -> str | None:
         return None
     s = s.strip().upper().replace("是", "Y").replace("否", "N")
     return s if s in {"Y", "N"} else None
+
+
+def _normalize_header(s: str) -> str:
+    """正規化欄標題：換行→空格、全形空白→半形空白、去首尾空白。"""
+    return s.replace("\n", " ").replace("　", " ").strip()
 
 
 def _clean(v) -> str | None:
