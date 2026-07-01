@@ -92,7 +92,7 @@ class ChatClient:
             raise LLMError(f"無法連線 LLM 端點（{self.endpoint}）：{exc}") from exc
 
         if resp.status_code >= 400:
-            # 只記狀態碼；不記 resp.text（可能含回傳內容）
+            # 只記狀態碼；不記 resp.text（可能含佐證內容或 prompt 片段）
             log.warning("llm endpoint http %d endpoint=%s", resp.status_code, self.endpoint)
             if dev_mode():  # dev-only：存 request + HTTP 回應本文全文，終端印截斷
                 path = dump_llm_raw({
@@ -101,7 +101,7 @@ class ChatClient:
                 })
                 log.debug("llm http %d request_id=%s body=%s raw=%s",
                           resp.status_code, get_request_id(), _trunc(resp.text, _RESP_TRUNC), path)
-            raise LLMError(f"LLM 端點回應 HTTP {resp.status_code}：{resp.text[:200]}")
+            raise LLMError(f"LLM 端點回應 HTTP {resp.status_code}")
 
         try:
             data = resp.json()
@@ -135,7 +135,7 @@ def parse_json_object(content: str | None) -> dict:
             if dev_mode():  # dev-only：終端直接點出實際回了什麼（完整內容由 chat() 存 llm_raw/）
                 log.debug("llm json no-brace request_id=%s excerpt=%s",
                           get_request_id(), _trunc(content, _RESP_TRUNC))
-            raise LLMError(f"LLM 回應非 JSON：{content[:120]}") from None
+            raise LLMError("LLM 回應非 JSON（無 `{` 起始字元）") from None
         try:
             obj, _ = json.JSONDecoder().raw_decode(text, start)
         except json.JSONDecodeError as exc:
