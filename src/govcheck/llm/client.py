@@ -53,16 +53,22 @@ class ChatClient:
     def endpoint(self) -> str:
         return f"{self.base_url}/chat/completions"
 
-    def chat(self, messages: list[dict], *, temperature: float | None = None, want_json: bool = True) -> str:
-        """送出 chat completions 請求，回傳 assistant 訊息 content；失敗丟 LLMError。"""
+    def chat(self, messages: list[dict], *, temperature: float | None = None, schema: dict | None = None) -> str:
+        """送出 chat completions 請求，回傳 assistant 訊息 content；失敗丟 LLMError。
+
+        schema：提供時以 OpenAI `json_schema` 結構化輸出模式約束回應（strict，欄位/型別在解碼階段
+        即強制符合，較舊的 json_object 更穩定）；不支援的端點通常忽略此鍵（仍靠 prompt 約束輸出）。
+        """
         payload: dict = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature if temperature is None else temperature,
         }
-        if want_json:
-            # OpenAI 相容的 JSON 模式；不支援的端點通常忽略此鍵（仍靠 prompt 約束輸出）
-            payload["response_format"] = {"type": "json_object"}
+        if schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "govcheck_result", "schema": schema, "strict": True},
+            }
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
