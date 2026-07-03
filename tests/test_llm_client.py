@@ -33,15 +33,30 @@ def test_chat_posts_openai_compatible_payload(monkeypatch):
 
     monkeypatch.setattr(requests, "post", fake_post)
     c = ChatClient(base_url="http://host:11434/v1", model="m1", api_key="secret", timeout=30, temperature=0)
-    out = c.chat([{"role": "user", "content": "hi"}])
+    out = c.chat([{"role": "user", "content": "hi"}], schema={"type": "object"})
 
     assert out == '{"ok":true}'
     assert captured["url"] == "http://host:11434/v1/chat/completions"
     assert captured["json"]["model"] == "m1"
     assert captured["json"]["messages"][0]["content"] == "hi"
-    assert captured["json"]["response_format"] == {"type": "json_object"}
+    assert captured["json"]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "govcheck_result", "schema": {"type": "object"}, "strict": True},
+    }
     assert captured["headers"]["Authorization"] == "Bearer secret"
     assert captured["timeout"] == 30
+
+
+def test_chat_without_schema_omits_response_format(monkeypatch):
+    captured: dict = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured.update(json=json)
+        return _ok('{"ok":true}')
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    ChatClient(base_url="http://h/v1", model="m").chat([{"role": "user", "content": "hi"}])
+    assert "response_format" not in captured["json"]
 
 
 def test_chat_omits_auth_header_without_key(monkeypatch):
