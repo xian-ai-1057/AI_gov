@@ -11,8 +11,15 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from govcheck.checks.llm import f03_evidence
-from govcheck.checks.rule import cross_consistency, f01_rules, f02_rules, f03_evidence_presence, missing_docs
+from govcheck.checks.llm import f03_evidence, f03_rag
+from govcheck.checks.rule import (
+    cross_consistency,
+    f01_rules,
+    f02_reg_refs,
+    f02_rules,
+    f03_evidence_presence,
+    missing_docs,
+)
 from govcheck.classify.classifier import FileClassification, classify_files, route_classifications
 from govcheck.llm.client import ChatClient
 from govcheck.llm.config import load_llm_config
@@ -21,7 +28,11 @@ from govcheck.models import FilePresence, Finding, ReviewReport, Severity, Submi
 from govcheck.parsers.f01_parser import parse_f01
 from govcheck.parsers.f02_parser import parse_f02
 from govcheck.parsers.f03_parser import parse_f03_checklist, parse_f03_identity
+from govcheck.rag.config import load_rag_config
+from govcheck.rag.mapping import load_retrieval_map
+from govcheck.rag.models import RagConfig
 from govcheck.review.config import load_review_config
+from govcheck.scoring.f02_score import load_config as load_scoring_config
 from govcheck.scoring.f02_score import recompute
 
 log = get_logger("review")
@@ -103,6 +114,9 @@ def review_submission(
         findings += _rule_step(f03_evidence_presence.run_all(sub.f03_checklist, review_cfg))  # 規則：恆跑、無網路
         if enable_llm:
             findings += _run_f03_llm(sub.f03_checklist, progress)  # LLM：啟用才跑，失敗自動降級
+    # RAG 查表（Phase 3）：刻意置於 has_f03_checklist 區塊之外、cross_consistency 之前，
+    # 使 F02-only 送件包（無 F03）也能跑 F02 規則查表；未啟用或失敗一律降級，絕不 raise。
+    findings += _run_rag_checks(sub, enable_llm, progress)
     findings += _rule_step(cross_consistency.run_all(sub, review_cfg))
 
     findings.sort(key=_severity_order)
@@ -143,6 +157,73 @@ def _run_f03_llm(checklist, progress: ProgressFn | None = None) -> list[Finding]
             message=f"無法初始化或執行 LLM 判讀（{exc}）；其餘規則檢查不受影響。",
             source="llm",
         )]
+
+
+def _rag_skipped(exc_type: str) -> Finding:
+    """RAG 降級 Finding：任何 mapping 缺檔 / 未預期例外皆收斂為此單筆 INFO（絕不 raise）。"""
+    return Finding(
+        severity=Severity.INFO,
+        code="RAG.SKIPPED",
+        title="RAG 法規比對已略過",
+        message=(f"RAG 法規比對無法執行（{exc_type}），已略過；"
+                 "其餘規則檢查與報告不受影響，請人工覆核。"),
+        source="rule",
+    )
+
+
+def _run_rag_checks(
+    sub: Submission,
+    enable_llm: bool,
+    progress: ProgressFn | None = None,
+) -> list[Finding]:
+    """RAG 查表整合：F03 LLM 符合性判讀 + F02 規則查表（p3-03 §4.4）。
+
+    - 實際啟用 = enable_llm AND rag.enabled；未啟用 → 回 []（零事件、零 Finding）。
+    - 外層 try/except：mapping 缺檔/版本不符或任何未預期例外 → 單筆 RAG.SKIPPED（INFO），絕不 raise。
+    - 內部各自判存在：sub.f03_checklist（且 sheet_present）→ 跑 f03_rag（RAG 專用 client，timeout=cfg.timeout）；
+      sub.f02 → 跑 f02_reg_refs（純規則、無 LLM；F02-only 送件包亦跑）。
+    - log 只記代碼/計數/耗時/例外型別。
+    """
+    rag_cfg = load_rag_config()
+    if not enable_llm or not rag_cfg.get("enabled", False):
+        return []  # 未啟用 → 零事件、零 Finding（回歸硬條件：預設關 = 零差異）
+
+    # mapping 載入單獨攔截：缺檔/版本不符/任何例外 → RAG.SKIPPED（絕不 raise）
+    try:
+        retrieval_map = load_retrieval_map(rag_cfg.get("mapping_path"))
+    except Exception as exc:  # noqa: BLE001 - 缺 mapping 一律降級，不逸出
+        log.warning("rag mapping load skipped: %s", type(exc).__name__)
+        return [_rag_skipped(type(exc).__name__)]
+
+    # cfg_model 建構 + f03_rag/f02_reg_refs 執行同包一層 try：任何失敗 → RAG.SKIPPED（never-raise 洞修補）
+    try:
+        # 防禦性過濾：只餵 RagConfig 已定義的鍵，避免 extra="forbid" 遇多餘鍵拋例外
+        cfg_model = RagConfig.model_validate(
+            {k: v for k, v in rag_cfg.items() if k in RagConfig.model_fields}
+        )
+        findings: list[Finding] = []
+
+        # F03 RAG 符合性判讀（需 F03 檢核表且 sheet_present；建 RAG 專用 client）
+        if sub.f03_checklist is not None and sub.f03_checklist.sheet_present:
+            llm_cfg = load_llm_config()
+            rag_client = ChatClient(
+                base_url=llm_cfg["base_url"],
+                model=llm_cfg["model"],
+                api_key=llm_cfg.get("api_key"),
+                timeout=cfg_model.timeout,  # RAG 獨立 120s，不沿用 chat 60s
+                temperature=llm_cfg.get("temperature", 0.0),
+            )
+            findings += f03_rag.run_all(sub.f03_checklist, retrieval_map, rag_client, cfg_model, progress)
+
+        # F02 規則查表（純規則、零 LLM；F02-only 送件包也會跑）
+        if sub.f02 is not None:
+            findings += f02_reg_refs.run_all(sub.f02, retrieval_map, load_scoring_config())
+
+        log.info("rag checks done findings=%d", len(findings))
+        return findings
+    except Exception as exc:  # noqa: BLE001 - 任何未預期例外收斂為 RAG.SKIPPED，絕不 raise
+        log.warning("rag checks skipped: %s", type(exc).__name__)
+        return [_rag_skipped(type(exc).__name__)]
 
 
 def review_routed(

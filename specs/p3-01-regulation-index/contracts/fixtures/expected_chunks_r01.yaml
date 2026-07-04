@@ -1,0 +1,45 @@
+# Ground truth：synthetic_r01_lines.txt 經條文式 chunker 後的期望輸出（逐欄）。
+# 呼叫：chunk_regulation(lines, reg_code="R01",
+#         reg_title="AI系統範例導入辦法（測試用）", style="article")
+# 規則要點：^第[..]+條 起新 chunk；section_path=條號；breadcrumb 取代條號標籤，
+#           條號 prefix 由 body 剝除；同條多行（未被 pdf_text 併行者）以 \n 保留。
+reg_code: R01
+reg_title: AI系統範例導入辦法（測試用）
+chunks:
+  - reg_code: R01
+    reg_title: AI系統範例導入辦法（測試用）
+    section_path: 第一條
+    title: 第一條
+    chunk_seq: 0
+    order: 0
+    text: |-
+      【R01 AI系統範例導入辦法（測試用）|第一條】
+      為規範本行人工智慧系統之導入與治理，並確保其運作符合相關法令與內部規範，特訂定本測試辦法。
+  - reg_code: R01
+    reg_title: AI系統範例導入辦法（測試用）
+    section_path: 第二條
+    title: 第二條
+    chunk_seq: 0
+    order: 1
+    text: |-
+      【R01 AI系統範例導入辦法（測試用）|第二條】
+      本辦法所稱人工智慧系統，指運用機器學習或其他人工智慧技術所建置，用以輔助或執行決策之資訊系統。
+  - reg_code: R01
+    reg_title: AI系統範例導入辦法（測試用）
+    section_path: 第三條
+    title: 第三條
+    chunk_seq: 0
+    order: 2
+    text: |-
+      【R01 AI系統範例導入辦法（測試用）|第三條】
+      各單位於導入人工智慧系統前，應完成風險評鑑並填具相關表單，送治理單位審查。
+      本條所稱相關表單，包括系統資訊表、風險評鑑表及上線檢核表，其格式由治理單位另定之。
+  - reg_code: R01
+    reg_title: AI系統範例導入辦法（測試用）
+    section_path: 第四條
+    title: 第四條
+    chunk_seq: 0
+    order: 3
+    text: |-
+      【R01 AI系統範例導入辦法（測試用）|第四條】
+      本辦法自發布日施行。

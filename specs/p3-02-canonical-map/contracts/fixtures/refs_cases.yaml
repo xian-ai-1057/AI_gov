@@ -1,0 +1,99 @@
+# refs.py 表驅動測試案例（全 synthetic：僅用格式 token，不含任何真實條文/題文）。
+# 每案：input = L 欄「規範參考」原始字串；expected = 解析後 RegulationRef 清單（保序）。
+# reg_code 大寫 R + 兩位數；section_path_prefix 正準形式（全形→半形、去空白、（二）→(二)）；
+# "" 代表整部規範。expect_dropped = 因無法解析而丟棄並計數（DEBUG，不 log 原文）的殘段數。
+#
+# 實作對接：refs.parse_regulation_refs(raw: str | None) -> list[RegulationRef]
+# 文法：entry := reg_codes ("/" path_token)* ；reg_codes := R\d{2}(("&"|"、")R\d{2})* ；
+#      多 entry 以換行或 ";" 分隔。同一 entry 的多個 reg code 共用其後的 path。
+
+cases:
+  - name: single_ref
+    input: "R03/五/(二)/2"
+    expected:
+      - {reg_code: "R03", section_path_prefix: "五/(二)/2"}
+    expect_dropped: 0
+
+  - name: shared_path_ampersand
+    input: "R03&R07/五/(二)/2"
+    expected:
+      - {reg_code: "R03", section_path_prefix: "五/(二)/2"}
+      - {reg_code: "R07", section_path_prefix: "五/(二)/2"}
+    expect_dropped: 0
+
+  - name: shared_path_dunhao
+    input: "R03、R07/五/(二)/2"
+    expected:
+      - {reg_code: "R03", section_path_prefix: "五/(二)/2"}
+      - {reg_code: "R07", section_path_prefix: "五/(二)/2"}
+    expect_dropped: 0
+
+  - name: fullwidth_normalized
+    # 全形 Ｒ／數字／（）→ 半形；期望與 single_ref 等價
+    input: "Ｒ０３／五／（二）／２"
+    expected:
+      - {reg_code: "R03", section_path_prefix: "五/(二)/2"}
+    expect_dropped: 0
+
+  - name: whitespace_stripped
+    input: " R03 / 五 / (二) "
+    expected:
+      - {reg_code: "R03", section_path_prefix: "五/(二)"}
+    expect_dropped: 0
+
+  - name: multi_entry_newline
+    input: "R03/五/(二)/2\nR04/三/(一)"
+    expected:
+      - {reg_code: "R03", section_path_prefix: "五/(二)/2"}
+      - {reg_code: "R04", section_path_prefix: "三/(一)"}
+    expect_dropped: 0
+
+  - name: multi_entry_semicolon
+    input: "R03/五;R04/三"
+    expected:
+      - {reg_code: "R03", section_path_prefix: "五"}
+      - {reg_code: "R04", section_path_prefix: "三"}
+    expect_dropped: 0
+
+  - name: r01_article_form
+    # R01 為條文式，section_path 用「第一條」
+    input: "R01/第一條"
+    expected:
+      - {reg_code: "R01", section_path_prefix: "第一條"}
+    expect_dropped: 0
+
+  - name: reg_only_whole_regulation
+    input: "R06"
+    expected:
+      - {reg_code: "R06", section_path_prefix: ""}
+    expect_dropped: 0
+
+  - name: reg_code_with_unparseable_tail
+    # 認得 R06，其後 token 無法解析 → 退整部規範（不丟棄整段）
+    input: "R06（適用全部）"
+    expected:
+      - {reg_code: "R06", section_path_prefix: ""}
+    expect_dropped: 0
+
+  - name: garbage_no_reg_code_dropped
+    # 無 reg code → 整段丟棄並計數（不 log 原文）
+    input: "（請提案單位自行補充）"
+    expected: []
+    expect_dropped: 1
+
+  - name: mixed_valid_entry_and_garbage_entry
+    input: "R03/五\n（備註：與本項無關的文字）"
+    expected:
+      - {reg_code: "R03", section_path_prefix: "五"}
+    expect_dropped: 1
+
+  - name: empty_string
+    input: ""
+    expected: []
+    expect_dropped: 0
+
+  - name: none_input
+    # L 欄未填 → None；等同無結果、無丟棄計數
+    input: null
+    expected: []
+    expect_dropped: 0

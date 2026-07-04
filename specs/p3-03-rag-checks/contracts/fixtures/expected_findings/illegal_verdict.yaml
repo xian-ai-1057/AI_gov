@@ -1,0 +1,9 @@
+# 對應 canned_llm_responses/illegal_verdict.json。1-1 verdict="maybe"（白名單外）→ 降為 undetermined
+# → RAG_UNDETERMINED（INFO）；不因單項壞值丟整批。1-2 covered。
+name: illegal_verdict
+reviewed: 2
+findings:
+  - {code: "F03.RAG_UNDETERMINED", severity: "info", source: "llm", location_contains: "1-1"}
+  - {code: "F03.RAG_TABLE", severity: "info", source: "llm"}
+  - {code: "F03.RAG_SUMMARY", severity: "info", source: "llm"}
+summary_contains: ["審閱 2 項", "無法判定 1 項"]

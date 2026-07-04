@@ -1,0 +1,8 @@
+# 對應 canned_llm_responses/missing_item.json。批次回應漏回 1-2 → 該項記 RAG_ITEM_ERROR（INFO），其餘正常。
+name: missing_item
+reviewed: 1
+findings:
+  - {code: "F03.RAG_ITEM_ERROR", severity: "info", source: "llm", location_contains: "1-2"}
+  - {code: "F03.RAG_TABLE", severity: "info", source: "llm"}
+  - {code: "F03.RAG_SUMMARY", severity: "info", source: "llm"}
+summary_contains: ["審閱 1 項", "1 項判讀失敗"]

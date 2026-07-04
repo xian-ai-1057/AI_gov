@@ -43,6 +43,7 @@ F03_SHEET = "檢核表"
 F03_CHECK_COLS = {"是": "F", "否": "G", "不適用": "H"}  # 是否完成檢核（擇一）
 F03_PROPOSAL_COL = "I"  # 前項佐證說明(提案規劃階段)
 F03_GOLIVE_COL = "J"    # 前項佐證說明(上線階段;列出與提案差異)
+F03_REF_COL = "L"       # 規範參考（Phase 3 RAG：TEMPLATE_REF_MODIFIED 比對來源）
 
 
 def build_f02_fixture(
@@ -154,7 +155,8 @@ def build_f03_fixture(
 
     system_owner：寫入 B1（預設與 F01_DEFAULT_ROW 的 H 欄一致，便於跨表 owner 正例）。
     items：每筆 {"row": 5, "state": "是"|"否"|"不適用"|None,
-                 "proposal": str|None, "golive": str|None}，按列寫入勾選欄 F/G/H 與佐證欄 I/J。
+                 "proposal": str|None, "golive": str|None, "regulation_ref": str|None}，
+                 按列寫入勾選欄 F/G/H、佐證欄 I/J 與規範參考欄 L。未給 regulation_ref → 不寫（該列 L 欄留空）。
     絕不寫回 data/original：輸出一律寫到呼叫端指定的暫存路徑。
     """
     out_path = Path(out_path)
@@ -176,6 +178,8 @@ def build_f03_fixture(
             ws[f"{F03_PROPOSAL_COL}{r}"] = it["proposal"]
         if it.get("golive") is not None:
             ws[f"{F03_GOLIVE_COL}{r}"] = it["golive"]
+        if it.get("regulation_ref") is not None:
+            ws[f"{F03_REF_COL}{r}"] = it["regulation_ref"]
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
