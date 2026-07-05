@@ -101,6 +101,9 @@ Phase 4 佐證充分性 → Phase 5 Agent 協助提案者填寫。
 - ❌ 跳過測試直接收工。
 - ❌ Log 記錄**原始檔內容/解析後儲存格值/F03 佐證全文/LLM prompt 回應全文/api_key/Authorization**；
   只准記識別資訊與數量（系統名/單位/Finding 代碼/計數/耗時/例外型別）。
+  - **唯一例外（dev-only 除錯）**：`dev` profile 時 `dump_llm_raw()` 會把 LLM request/response 全文
+    存到 `logs/llm_raw/`（gitignored）供解 JSON 解析失敗除錯；終端只印截斷版。prod / quiet **完全不寫**。
+    僅限本機 ollama、無真實送件資料的情境；上線環境勿設 `GOVCHECK_LOG_PROFILE=dev`。
 
 ### Git / 推送守則
 - 推 GitHub 前確認 `data/original/`、`.env`、`uploads/`、`output/`、`logs/`、`_Archive/` 都在 `.gitignore`
