@@ -1,0 +1,11 @@
+# 對應 canned_llm_responses/gap.json。
+# 測試場景（見 spec §4.2）：單批含檢核項 1-1、1-2；皆有兩段佐證、retrieval_map 有其 canonical sections、
+# 上傳檔 L 欄與 canonical 相符（無 TEMPLATE_REF_MODIFIED）。findings 為排序前、f03_rag.run_all 產出的順序。
+name: gap
+reviewed: 2
+findings:
+  - {code: "F03.RAG_GAP", severity: "warn", source: "llm", location_contains: "1-1"}
+  - {code: "F03.RAG_TABLE", severity: "info", source: "llm"}
+  - {code: "F03.RAG_SUMMARY", severity: "info", source: "llm"}
+summary_contains: ["審閱 2 項", "缺口 1 項"]
+# 1-1 判 gap → RAG_GAP（WARN）；1-2 判 covered → 無個別 Finding（僅入彙整表與摘要計數）。

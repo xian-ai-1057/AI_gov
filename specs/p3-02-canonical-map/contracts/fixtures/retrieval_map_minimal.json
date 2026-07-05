@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "built_at": "2026-01-01T00:00:00Z",
+  "embedding_model": "fake-embedding-model",
+  "f03_items": {},
+  "f02_questions": {}
+}

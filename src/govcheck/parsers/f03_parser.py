@@ -78,6 +78,7 @@ def parse_f03_checklist(path: str | Path, cfg: dict | None = None) -> F03Checkli
     desc_col = lc["item_desc_col"]
     prop_col = lc["evidence_proposal_col"]
     golive_col = lc["evidence_golive_col"]
+    ref_col = lc.get("regulation_ref_col", "L")  # 規範參考 L 欄（缺 config 時退回 L）
     check_cols: dict[str, str] = lc["check_cols"]  # 標籤 → 欄字母
 
     items: list[F03ChecklistItem] = []
@@ -99,6 +100,7 @@ def parse_f03_checklist(path: str | Path, cfg: dict | None = None) -> F03Checkli
             check_state=_check_state(ws, r, check_cols),
             evidence_proposal=clean(ws[f"{prop_col}{r}"].value),
             evidence_golive=clean(ws[f"{golive_col}{r}"].value),
+            regulation_ref_raw=clean(ws[f"{ref_col}{r}"].value),  # L 欄原始字串，不解析
         ))
 
     wb.close()

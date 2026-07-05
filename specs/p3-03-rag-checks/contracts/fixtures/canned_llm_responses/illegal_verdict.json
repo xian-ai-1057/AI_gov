@@ -1,0 +1,1 @@
+{"results":[{"item_id":"1-1","verdict":"maybe","gap_refs":[],"reason":"模型回了白名單外的 verdict，f03_rag 應降為 undetermined"},{"item_id":"1-2","verdict":"covered","gap_refs":[],"reason":"佐證已對應條文要求"}]}

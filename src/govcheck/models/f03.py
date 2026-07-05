@@ -28,6 +28,7 @@ class F03ChecklistItem(BaseModel):
     check_state: str | None = None        # 是否完成檢核：是 / 否 / 不適用（由 F/G/H 推得）
     evidence_proposal: str | None = None  # I 前項佐證說明(提案規劃階段)
     evidence_golive: str | None = None    # J 前項佐證說明(上線階段;列出與提案差異)
+    regulation_ref_raw: str | None = None  # L 規範參考（parse 存原始字串、不解析；供 RAG 判 TEMPLATE_REF_MODIFIED）
 
     @property
     def is_done(self) -> bool:

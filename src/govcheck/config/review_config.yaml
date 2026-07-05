@@ -55,6 +55,7 @@ f03:
       不適用: H
     evidence_proposal_col: I    # 前項佐證說明(提案規劃階段)
     evidence_golive_col: J      # 前項佐證說明(上線階段;列出與提案差異)
+    regulation_ref_col: L       # 規範參考（Phase 3 RAG：存原始字串供 TEMPLATE_REF_MODIFIED 比對）
 
 documents:
   core:                         # F01/F03 一律必備 → 缺則 ERROR

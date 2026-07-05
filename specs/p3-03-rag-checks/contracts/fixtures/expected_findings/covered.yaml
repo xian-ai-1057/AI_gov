@@ -1,0 +1,7 @@
+# 對應 canned_llm_responses/covered.json。1-1、1-2 皆 covered → 無個別 Finding，只有彙整表與摘要。
+name: covered
+reviewed: 2
+findings:
+  - {code: "F03.RAG_TABLE", severity: "info", source: "llm"}
+  - {code: "F03.RAG_SUMMARY", severity: "info", source: "llm"}
+summary_contains: ["審閱 2 項", "缺口 0 項"]

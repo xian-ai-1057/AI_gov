@@ -9,3 +9,17 @@ timeout: 60                          # 單次請求逾時（秒）
 temperature: 0                       # 判讀求穩定，預設 0
 max_items: 30                        # 單次審查送 LLM 的檢核項上限（安全閥；F03 實際約 20 項）
 batch_size: 8                        # 單次 LLM 呼叫送審的檢核項數（批次以減少呼叫；小模型上下文安全閥）
+
+# Phase 3 RAG 法規比對（一體啟停；實際啟用 = enable_llm AND rag.enabled）。
+# 缺此區段時 load_rag_config() 全用硬碼預設，行為一致。機密（EMBEDDING_API_KEY / MILVUS_TOKEN）只走環境變數。
+# 環境變數可覆寫任一鍵：GOVCHECK_RAG_ENABLED / _MAPPING_PATH / _BATCH_SIZE / _MAX_SECTIONS_PER_ITEM / _MAX_EXCERPT_CHARS / _TIMEOUT / _MAX_ITEMS ...
+rag:
+  enabled: false                     # 預設關閉；rag.enabled=true 且 enable_llm 才實際啟用
+  mapping_path: data/rag/retrieval_map.json  # build-time 產物（gitignored；runtime 只讀查表）
+  batch_size: 2                      # RAG 判讀批次（canonical 摘錄使 prompt 較長，保守起步）
+  max_sections_per_item: 3           # 每檢核項最多引用條文段數
+  max_excerpt_chars: 300             # 每段摘錄字數上限（prompt 預算防護）
+  timeout: 120                       # RAG 判讀獨立逾時（秒）；不沿用 chat 的 60s
+  max_items: 30                      # 單次送 RAG 判讀的檢核項上限（安全閥）
+  # 暫定保守值；curated（L 欄）為主檢索路徑，semantic 為輔，recall@4≈79%；可經 --eval 重新校準
+  score_threshold: 0.08
