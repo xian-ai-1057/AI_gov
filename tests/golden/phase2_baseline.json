@@ -1,0 +1,66 @@
+{
+  "generated_by": "tests/golden/generate_snapshot.py",
+  "note": "Re-generate: uv run python tests/golden/generate_snapshot.py  | 此快照依賴未修改的 Phase 2 engine；Phase 3b 修改 engine 前先 commit 此快照。",
+  "schema_version": "phase2_baseline_v1",
+  "submissions": [
+    {
+      "description": "F01+F02+F03 合規低風險基線；預期 findings=SUBMISSION.OK",
+      "label": "full_f01_f02_f03",
+      "report": {
+        "banner": "⚠️ 本報告為 AI 初判草稿，需治理人員與三遵人工覆核，最終判定權不在 AI。",
+        "findings": [
+          {
+            "actual": null,
+            "code": "SUBMISSION.OK",
+            "expected": null,
+            "location": null,
+            "message": "核心文件齊備、F01 必填完整、F02 規則通過、跨表一致。仍須人工覆核實質內容。",
+            "needs_human": true,
+            "severity": "info",
+            "source": "rule",
+            "title": "送件包規則檢查未發現問題"
+          }
+        ],
+        "form_type": "送件包",
+        "risk_grade": "低",
+        "risk_score": 18.75,
+        "subject": "智能客服小幫手"
+      }
+    },
+    {
+      "description": "僅 F02、缺 F01/F03；預期 findings 含 DOC.MISSING_F01 / DOC.MISSING_F03",
+      "label": "f02_only",
+      "report": {
+        "banner": "⚠️ 本報告為 AI 初判草稿，需治理人員與三遵人工覆核，最終判定權不在 AI。",
+        "findings": [
+          {
+            "actual": "未上傳",
+            "code": "DOC.MISSING_F01",
+            "expected": "已附 F01 AI系統資訊表",
+            "location": "送件包",
+            "message": "送件包未包含「F01 AI系統資訊表」，依規定為必備文件。",
+            "needs_human": true,
+            "severity": "error",
+            "source": "rule",
+            "title": "缺件：F01 AI系統資訊表"
+          },
+          {
+            "actual": "未上傳",
+            "code": "DOC.MISSING_F03",
+            "expected": "已附 F03 上線檢核表",
+            "location": "送件包",
+            "message": "送件包未包含「F03 上線檢核表」，依規定為必備文件。",
+            "needs_human": true,
+            "severity": "error",
+            "source": "rule",
+            "title": "缺件：F03 上線檢核表"
+          }
+        ],
+        "form_type": "送件包",
+        "risk_grade": "低",
+        "risk_score": 18.75,
+        "subject": null
+      }
+    }
+  ]
+}

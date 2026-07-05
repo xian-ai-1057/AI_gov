@@ -16,6 +16,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "python-multipart>=0.0.12",
+    "pymilvus[milvus_lite]>=2.4",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +36,9 @@ packages = ["src/govcheck"]
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
 testpaths = ["tests"]
+markers = [
+    "local_data: 需要 data/original 真實檔案的測試(缺檔自動 skip)",
+]
 
 [tool.ruff]
 line-length = 100

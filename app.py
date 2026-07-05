@@ -42,7 +42,7 @@ with st.sidebar:
     use_llm = st.toggle(
         "啟用 LLM 佐證審查",
         value=bool(_llm_cfg["enabled"]),
-        help="對 F03『提案規劃階段』與『上線階段』兩段佐證做差異比較，並標示草率/不明確的說明。預設關閉。",
+        help="對 F03『提案規劃階段』與『上線階段』兩段佐證做差異比較，並標示草率/不明確的說明。啟用後含法規比對判讀，整體審查時間較長（本機小模型約 10–15 分鐘）。預設關閉。",
     )
     if use_llm:
         st.caption(f"端點：`{_llm_cfg['base_url']}`")

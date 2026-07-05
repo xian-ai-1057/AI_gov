@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "mapping_path": "data/rag/retrieval_map.json",
+  "batch_size": 2,
+  "max_sections_per_item": 3,
+  "max_excerpt_chars": 300,
+  "timeout": 120.0,
+  "max_items": 30,
+  "embedding_base_url": "http://localhost:11434/v1",
+  "embedding_model": "fake-embedding-model",
+  "embedding_dim": 1024,
+  "milvus_uri": "data/milvus/governance.db",
+  "top_k": 4,
+  "score_threshold": null
+}

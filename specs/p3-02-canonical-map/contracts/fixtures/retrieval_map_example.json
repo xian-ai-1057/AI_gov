@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "built_at": "2026-01-01T00:00:00Z",
+  "embedding_model": "fake-embedding-model",
+  "f03_items": {
+    "1-1": {
+      "item_id": "1-1",
+      "canonical_topic": "示例議題A",
+      "canonical_description": "示例檢查項目描述A（synthetic）",
+      "canonical_ref_raw": "R03&R07/五/(二)/2",
+      "refs": [
+        {"reg_code": "R03", "section_path_prefix": "五/(二)/2"},
+        {"reg_code": "R07", "section_path_prefix": "五/(二)/2"}
+      ],
+      "sections": [
+        {
+          "reg_code": "R03",
+          "section_path": "五/(二)/2",
+          "title": "示例條標題（synthetic）",
+          "excerpt": "（示例條文摘錄，非真實法規內容）",
+          "score": null,
+          "origin": "curated"
+        },
+        {
+          "reg_code": "R07",
+          "section_path": "五/(二)/2",
+          "title": "示例條標題2（synthetic）",
+          "excerpt": "（示例條文摘錄2，非真實法規內容）",
+          "score": null,
+          "origin": "curated"
+        },
+        {
+          "reg_code": "R04",
+          "section_path": "三/(一)",
+          "title": "示例語意補充條（synthetic）",
+          "excerpt": "（示例語意檢索補充摘錄，非真實法規內容）",
+          "score": 0.71,
+          "origin": "semantic"
+        }
+      ]
+    },
+    "2-1": {
+      "item_id": "2-1",
+      "canonical_topic": "示例議題B",
+      "canonical_description": "示例檢查項目描述B（synthetic）",
+      "canonical_ref_raw": "R01/第一條",
+      "refs": [
+        {"reg_code": "R01", "section_path_prefix": "第一條"}
+      ],
+      "sections": [
+        {
+          "reg_code": "R01",
+          "section_path": "第一條",
+          "title": "示例條文式條標題（synthetic）",
+          "excerpt": "（示例條文式摘錄，非真實法規內容）",
+          "score": null,
+          "origin": "curated"
+        }
+      ]
+    }
+  },
+  "f02_questions": {
+    "UC-01": {
+      "qid": "UC-01",
+      "sections": [
+        {
+          "reg_code": "R02",
+          "section_path": "四/(一)",
+          "title": "示例F02對應條（synthetic）",
+          "excerpt": "（示例F02語意檢索摘錄，非真實法規內容）",
+          "score": 0.65,
+          "origin": "semantic"
+        }
+      ]
+    }
+  }
+}

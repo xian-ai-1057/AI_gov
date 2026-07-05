@@ -1,0 +1,10 @@
+# 對應 canned_llm_responses/not_json.txt。整批解析失敗（非 JSON）→ 本批記 RAG_ITEM_ERROR（INFO），
+# 續審其餘批次（此處僅一批）。未達連錯 3 → 不中止、不出 RAG_ERROR。彙整表仍標本批為判讀失敗列。
+name: not_json
+reviewed: 0
+findings:
+  - {code: "F03.RAG_ITEM_ERROR", severity: "info", source: "llm", location_contains: "1-1"}
+  - {code: "F03.RAG_TABLE", severity: "info", source: "llm"}
+  - {code: "F03.RAG_SUMMARY", severity: "info", source: "llm"}
+summary_contains: ["審閱 0 項", "2 項判讀失敗"]
+absent_codes: ["F03.RAG_ERROR"]

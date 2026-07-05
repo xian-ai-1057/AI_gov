@@ -1,0 +1,71 @@
+# section_path prefix 雙向比對表驅動案例（全 synthetic，僅格式 token）。
+# 對接：refs.ref_matches_chunk(ref: RegulationRef, chunk_reg_code: str, chunk_section_path: str) -> bool
+#
+# 命中規則（reg_code 必須相同，否則一律 false）：
+#   1. section_path 相等
+#   2. chunk path 以 ref+"/" 開頭（ref 較粗、chunk 較細）— 屬「展開比對」，受 per-ref cap 限制
+#   3. ref 以 chunk path+"/" 開頭（ref 較細、chunk 較粗）
+#   4. ref.section_path_prefix == ""（整部規範）→ 命中該 reg 之任一 chunk — 屬「展開比對」，受 cap 限制
+#
+# per-ref cap：規則 2 與規則 4 屬「一 ref 展開命中多 chunk」，每個 ref 上限 3 chunk，
+#             依 chunk.order 由小到大取前 3（避免整部規範/粗路徑灌爆一項的 sections）。
+
+# --- 布林命中案例 ---
+match_cases:
+  - name: exact_equal
+    ref: {reg_code: "R03", section_path_prefix: "五/(二)/2"}
+    chunk: {reg_code: "R03", section_path: "五/(二)/2"}
+    expected: true
+
+  - name: chunk_under_ref
+    ref: {reg_code: "R03", section_path_prefix: "五/(二)"}
+    chunk: {reg_code: "R03", section_path: "五/(二)/2"}
+    expected: true
+
+  - name: ref_under_chunk
+    ref: {reg_code: "R03", section_path_prefix: "五/(二)/2"}
+    chunk: {reg_code: "R03", section_path: "五/(二)"}
+    expected: true
+
+  - name: whole_regulation_matches_any
+    ref: {reg_code: "R06", section_path_prefix: ""}
+    chunk: {reg_code: "R06", section_path: "三/(一)"}
+    expected: true
+
+  - name: reg_code_differs
+    ref: {reg_code: "R03", section_path_prefix: "五"}
+    chunk: {reg_code: "R07", section_path: "五"}
+    expected: false
+
+  - name: sibling_no_match
+    ref: {reg_code: "R03", section_path_prefix: "五/(二)/2"}
+    chunk: {reg_code: "R03", section_path: "五/(二)/3"}
+    expected: false
+
+  - name: partial_token_not_prefix
+    # "五/(二)" 不是 "五/(二十)" 的前綴（避免以字元 startswith 誤命中；須以 path 分段比對）
+    ref: {reg_code: "R03", section_path_prefix: "五/(二)"}
+    chunk: {reg_code: "R03", section_path: "五/(二十)"}
+    expected: false
+
+# --- per-ref cap 展開案例 ---
+# 一個粗 ref 命中多個細 chunk 時，最多取 3 個（依 order）。
+cap_cases:
+  - name: broad_ref_capped_to_3
+    ref: {reg_code: "R03", section_path_prefix: "五"}
+    chunks:                                   # 皆命中規則 2；order 決定取捨
+      - {reg_code: "R03", section_path: "五/(一)",     order: 10}
+      - {reg_code: "R03", section_path: "五/(二)",     order: 11}
+      - {reg_code: "R03", section_path: "五/(二)/1",   order: 12}
+      - {reg_code: "R03", section_path: "五/(二)/2",   order: 13}
+      - {reg_code: "R03", section_path: "五/(三)",     order: 14}
+    expected_matched_paths: ["五/(一)", "五/(二)", "五/(二)/1"]   # 取 order 最小的前 3
+
+  - name: whole_regulation_capped_to_3
+    ref: {reg_code: "R06", section_path_prefix: ""}
+    chunks:
+      - {reg_code: "R06", section_path: "一",   order: 1}
+      - {reg_code: "R06", section_path: "二",   order: 2}
+      - {reg_code: "R06", section_path: "三",   order: 3}
+      - {reg_code: "R06", section_path: "四",   order: 4}
+    expected_matched_paths: ["一", "二", "三"]
