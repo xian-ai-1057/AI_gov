@@ -126,6 +126,28 @@ export GOVCHECK_LLM_MODEL="gemma3:4b"                       # 依端點可用模
 
 ---
 
+## 啟用 RAG 法規檢索（Phase 3，預設關閉）
+
+F03 LLM 判讀時動態檢索相關 R01–R07 條文輔助判斷，F02 觸發題也會查表提示對應條文（`F02.REG_REF_NOTE`）。
+**一體啟停**：實際生效需 `enable_llm` **且** `rag.enabled` 同時為真；缺 `rag:` 設定區段時全用硬碼預設，行為不變。
+
+```bash
+uv run python scripts/build_regulation_index.py --dry-run  # 建索引前先看切塊結果（不寫入）
+uv run python scripts/build_regulation_index.py             # 建置一次：法規索引 + canonical 檢索映射
+uv run python scripts/build_regulation_index.py --eval      # 檢索品質 recall@k 報告（校準 score_threshold 用）
+
+export GOVCHECK_LLM_ENABLED=1        # RAG 需先啟用 LLM 判讀
+export GOVCHECK_RAG_ENABLED=1
+export GOVCHECK_RAG_EMBEDDING_BASE_URL="http://localhost:11434/v1"  # 預設值；embedding 端點
+export GOVCHECK_RAG_EMBEDDING_MODEL="bge-m3"                        # 預設值
+```
+
+索引/映射為 build-time 產物（`data/rag/`、`data/milvus/`，已 gitignore），本機開發預設用 **Milvus Lite**（單機嵌入式）；
+多程序部署或需要併發檢索時，遷移到 Milvus Server 見 [docs/milvus_migration.md](docs/milvus_migration.md)。
+索引未建置或端點不可用時自動降級略過，不影響規則檢查與既有 LLM 判讀。
+
+---
+
 ## 現況（Phase 1–3 完成）
 
 端到端可跑：**批次上傳 → 自動分類 → 缺件 / 必填 / 規則 / 跨表一致 / F03 佐證 LLM + RAG 檢索 → 報告**。
@@ -186,12 +208,17 @@ src/govcheck/
 ├── models/       F01/F02/F03 表單、Finding、ReviewReport 等契約
 ├── scoring/      還原 F02 Excel 計分公式 → 分數/分級
 ├── classify/     依工作表名稱自動分類送件包
+├── rag/          Build-time RAG：pdf_text/chunker/refs/embedding/store/mapping
 ├── checks/
-│   ├── rule/     確定性規則（缺件/F01/F02/跨表/F03佐證存在性）
-│   └── llm/      F03 兩段佐證 LLM 比較
+│   ├── rule/     確定性規則（缺件/F01/F02/跨表/F03佐證存在性/F02觸發題條文查表）
+│   └── llm/      F03 兩段佐證 LLM 比較 + RAG 檢索輔助判讀
 ├── review/       engine：編排 parse → checks → 匯總
 ├── report/       Finding → Markdown
 └── web/          FastAPI（/api/classify、/api/review、/api/review/stream）+ 靜態前端掛載
+
+scripts/build_regulation_index.py   # Phase 3：R01–R07 PDF 分塊 + embedding → 索引 + canonical 映射
+specs/                              # SDD spec：p3-01 法規索引 / p3-02 canonical 映射 / p3-03 RAG 判讀
+docs/milvus_migration.md            # Milvus Lite → Milvus Server 遷移手冊
 ```
 
 ---
@@ -200,6 +227,6 @@ src/govcheck/
 
 - Phase 1 ✅ F02 風險評鑑規則
 - Phase 2 ✅ 缺件 + F01 必填 + F01/F02/F03 跨表一致 + 批次上傳自動分類
-- Phase 3 ✅ F03 兩段佐證 LLM 比較 + 彙整表（RAG 向量檢索規劃中）
+- Phase 3 ✅ F03 兩段佐證 LLM 比較 + 彙整表 + RAG 法規檢索（build-time 索引 + canonical 映射，預設關）
 - Phase 4 ⏳ 佐證充分性（解析佐證文件內容並評估是否支持檢核項）
 - Phase 5 ⏳ Agent 協助提案者填寫
