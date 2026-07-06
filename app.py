@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 import streamlit as st
+from dotenv import load_dotenv
 
 from govcheck.classify import (
     KIND_LABEL,
@@ -26,6 +27,7 @@ from govcheck.models import Severity
 from govcheck.report.builder import ICON, LABEL, to_markdown
 from govcheck.review.engine import review_routed
 
+load_dotenv()  # repo root .env（若存在）→ os.environ；GOVCHECK_* 才讀得到覆寫值
 setup_logging()  # 冪等：擋 Streamlit 每次 rerun 重覆掛 handler
 log = get_logger("app")
 
