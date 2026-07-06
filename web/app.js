@@ -28,6 +28,44 @@
     { tag: "＋", name: "佐證文件", note: "模型卡、測試報告等（非 Excel）" },
   ];
 
+  // 只有 F03 檢核項 finding 的 location 會長這樣（見 f03.py F03ChecklistItem.loc）：
+  // 「項次 1-1」或「項次 1-1（管理議題）」。F01/F02/DOC/CROSS/CLASSIFY 一律不會命中。
+  const ITEM_LOC_RE = /^項次\s*(\d+-\d+)(?:（([^）]*)）)?/;
+
+  // 兩張 F03 彙整表（LLM_TABLE / RAG_TABLE）的儲存格前導符號 → 狀態種類。
+  const CELL_MARKER_KIND = [["✅", "ok"], ["🟡", "warn"], ["❓", "undet"], ["⚠️", "err"]];
+
+  // 彙整參考分頁：順序即 defaultRefTab 的優先序（原始彙整 → 法規對應 → 通過紀錄 → 全部）。
+  const REF_TAB_ORDER = ["aggregate", "regref", "passlog", "all"];
+  const REF_TAB_LABELS = { aggregate: "原始彙整", regref: "法規對應", passlog: "通過紀錄", all: "全部" };
+
+  // 非項次 info finding 的分桶依據（見 f03_evidence.py / f03_rag.py / f02_reg_refs.py 產出代碼）。
+  const AGGREGATE_CODES = new Set(["F03.LLM_TABLE", "F03.LLM_SUMMARY", "F03.RAG_TABLE", "F03.RAG_SUMMARY"]);
+  function isRegRefCode(code) { return code === "F02.REG_REF_SUMMARY" || code === "F02.REG_REF_NOTE"; }
+
+  // 總覽表「主因」欄位的問題欄 → 顯示字樣；CAUSE_CODE_MAP 讓「無彙整表」時仍能由個別
+  // finding 代碼推出主因（見 buildMatrix 的 no-LLM fallback 說明）。
+  const CAUSE_LABELS = {
+    golive: "上線階段佐證不足",
+    prop: "提案階段佐證不足",
+    diff: "提案與上線差異",
+    rag: "法規符合性缺口",
+  };
+  const CAUSE_CODE_MAP = {
+    "F03.EVIDENCE_MISSING_PROPOSAL": "prop",
+    "F03.LLM_VAGUE_PROPOSAL": "prop",
+    "F03.EVIDENCE_MISSING_GOLIVE": "golive",
+    "F03.LLM_VAGUE_GOLIVE": "golive",
+    "F03.LLM_DIFF": "diff",
+    "F03.RAG_GAP": "rag",
+  };
+  // 規則式「佐證空白」finding → 狀態格後備（no-LLM 模式下整列不再全「—」）；
+  // 僅在該格尚無彙整表資料（kind === "none"）時套用，表格判讀永遠優先。
+  const RULE_CELL_FALLBACK = {
+    "F03.EVIDENCE_MISSING_PROPOSAL": "prop",
+    "F03.EVIDENCE_MISSING_GOLIVE": "golive",
+  };
+
   // ── 狀態 ───────────────────────────────────────────────────────
   const state = {
     step: 1,
@@ -35,8 +73,12 @@
     classify: null,     // /api/classify 回應 { kinds, files:[...] }
     kinds: {},          // index -> 使用者選定 kind（覆寫預設）
     review: null,       // /api/review 回應
-    filter: "info",     // 預設停在【紀錄】分頁（彙整表所在）
-    open: {},           // finding id -> bool
+    filter: "info",     // 【彙整參考】「全部」後備分頁用的舊版嚴重度濾鏡（保留原行為）
+    open: {},           // finding id -> bool（扁平清單 / 彙整卡共用的展開狀態）
+    rowOpen: {},        // 檢核項狀態總覽表：itemId -> 是否展開
+    matrixFilter: "attention", // 總覽表濾鏡："attention"（只看有問題）| "all"（全部）
+    refOpen: false,     // 【彙整參考】卡片是否展開
+    refTab: null,       // 【彙整參考】目前分頁 key（aggregate/regref/passlog/all）
     reviewing: false,
     progress: null,     // { label, pct, detail } — SSE 串流的階段進度
     error: null,
@@ -79,15 +121,34 @@
     return "📗";
   }
 
-  // 極簡 GFM 表格渲染（給 F03 LLM 佐證彙整表的多行訊息）；非表格純文字保留換行。
-  function renderMessage(msg) {
-    if (!msg) return "";
-    const lines = String(msg).split("\n");
+  // 從 lines[i] 開始嘗試解析一個 GFM 表格（| 開頭列 + 分隔列 + 資料列）；不是表格開頭回 null。
+  // 回傳 next = 表格結束後下一行索引，供呼叫端（renderMessage）續掃剩餘內容。
+  function parseGfmTableAt(lines, i) {
     const isSep = (l) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l);
     // 僅把「以 | 開頭」的列視為表格列（我們的彙整表必有前導 |，且儲存格已去除 |），
     // 避免含管線符號的一般說明文字被誤判為表格。
     const isRow = (l) => l.trimStart().startsWith("|");
     const splitRow = (l) => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+    if (!(i + 1 < lines.length && isRow(lines[i]) && isSep(lines[i + 1]))) return null;
+    const header = splitRow(lines[i]);
+    let j = i + 2;
+    const rows = [];
+    while (j < lines.length && isRow(lines[j]) && !isSep(lines[j])) { rows.push(splitRow(lines[j])); j++; }
+    return { header, rows, next: j };
+  }
+
+  // 給 buildMatrix 用：F03.LLM_TABLE / F03.RAG_TABLE 的 message 恆「以表格開頭、無其餘文字」，
+  // 故直接從第 0 行找表格即可；非表格（或 message 為空）回 null。
+  function parseGfmTable(msg) {
+    if (!msg) return null;
+    const t = parseGfmTableAt(String(msg).split("\n"), 0);
+    return t ? { header: t.header, rows: t.rows } : null;
+  }
+
+  // 極簡 GFM 表格渲染（給 F03 LLM 佐證彙整表的多行訊息）；非表格純文字保留換行。
+  function renderMessage(msg) {
+    if (!msg) return "";
+    const lines = String(msg).split("\n");
     let html = "";
     let buf = [];
     const flush = () => {
@@ -95,16 +156,14 @@
     };
     let i = 0;
     while (i < lines.length) {
-      if (i + 1 < lines.length && isRow(lines[i]) && isSep(lines[i + 1])) {
+      const table = parseGfmTableAt(lines, i);
+      if (table) {
         flush();
-        const header = splitRow(lines[i]);
-        i += 2;
-        const rows = [];
-        while (i < lines.length && isRow(lines[i]) && !isSep(lines[i])) { rows.push(splitRow(lines[i])); i++; }
         html += "<table class=\"md-table\"><thead><tr>" +
-          header.map((h) => `<th>${esc(h)}</th>`).join("") + "</tr></thead><tbody>" +
-          rows.map((r) => "<tr>" + r.map((c) => `<td>${esc(c)}</td>`).join("") + "</tr>").join("") +
+          table.header.map((h) => `<th>${esc(h)}</th>`).join("") + "</tr></thead><tbody>" +
+          table.rows.map((r) => "<tr>" + r.map((c) => `<td>${esc(c)}</td>`).join("") + "</tr>").join("") +
           "</tbody></table>";
+        i = table.next;
       } else if (lines[i].trim() === "") {
         flush(); i++;
       } else {
@@ -113,6 +172,201 @@
     }
     flush();
     return html;
+  }
+
+  // ── 純函式：F03 項次定位 / 排序 / 嚴重度 / 摘要 / 儲存格判讀 ──────────
+
+  // 從 finding.location 解析「項次 1-1」「項次 1-1（管理議題）」→ {itemId, topic}；不符回 null。
+  function parseItemLoc(location) {
+    if (!location) return null;
+    const m = ITEM_LOC_RE.exec(location);
+    if (!m) return null;
+    return { itemId: m[1], topic: m[2] || null };
+  }
+
+  // 項次自然排序：依「-」拆段後逐段比數值（"1-1" < "1-2" < "2-1" < "10-1"）。
+  function naturalItemCompare(a, b) {
+    const pa = String(a).split("-").map(Number);
+    const pb = String(b).split("-").map(Number);
+    const len = Math.max(pa.length, pb.length);
+    for (let i = 0; i < len; i++) {
+      const da = pa[i] || 0;
+      const db = pb[i] || 0;
+      if (da !== db) return da - db;
+    }
+    return 0;
+  }
+
+  // 一組 finding 中最高（數字最小）的嚴重度；空陣列回 null。
+  function maxSeverity(findings) {
+    if (!findings.length) return null;
+    let best = findings[0].severity;
+    findings.forEach((f) => { if (SEV_ORDER[f.severity] < SEV_ORDER[best]) best = f.severity; });
+    return best;
+  }
+
+  // 彙整表儲存格文字 → {kind, note}：kind 由「前導符號」決定，note 為符號後剩餘文字（trim）。
+  // 空白或「—」→ none；不含已知符號的文字（理論上不會發生）也回 none，並把全文塞進 note。
+  function cellStatus(cellText) {
+    const text = (cellText == null ? "" : String(cellText)).trim();
+    if (!text || text === "—") return { kind: "none", note: "" };
+    for (const [marker, kind] of CELL_MARKER_KIND) {
+      if (text.startsWith(marker)) return { kind, note: text.slice(marker.length).trim() };
+    }
+    return { kind: "none", note: text };
+  }
+
+  // 彙整參考預設分頁：依 REF_TAB_ORDER 找第一個非空桶；理論上 all 恆非空，僅作保底。
+  function defaultRefTab(reference) {
+    for (const key of REF_TAB_ORDER) { if (reference[key] && reference[key].length) return key; }
+    return "all";
+  }
+
+  // ── 檢核項狀態總覽表：把 findings 分流成「項次列 / 其他待處理 / 彙整參考」──
+
+  function newMatrixRow(itemId, topic) {
+    return {
+      itemId,
+      topic: topic || null,
+      findings: [],
+      cells: {
+        prop: { kind: "none", note: "" },
+        golive: { kind: "none", note: "" },
+        diff: { kind: "none", note: "" },
+        rag: { kind: "none", note: "" },
+      },
+      refs: "",
+    };
+  }
+
+  // 摘要欄：優先序為「兩段差異摘要 → 上線佐證草率原因 → 法規缺口 → 首個附掛 finding 標題」。
+  // 後備取 title 而非 message：no-LLM 模式下 message 是整句規則說明文，塞進摘要欄變雜訊；
+  // title 本來就是精煉字樣（如「上線階段佐證空白」）。
+  // 注意：須在 applyRuleCellFallback 之前呼叫，讓儲存格 note 只反映彙整表判讀結果。
+  function rowGist(row) {
+    if (row.cells.diff.note) return row.cells.diff.note;
+    if (row.cells.golive.note) return row.cells.golive.note;
+    if (row.cells.rag.kind === "warn" && row.cells.rag.note) return row.cells.rag.note;
+    if (row.findings.length) return row.findings[0].title;
+    return "—";
+  }
+
+  // 規則式「佐證空白」finding 補進狀態格（僅填 kind === "none" 的格，表格資料永遠優先）。
+  function applyRuleCellFallback(row) {
+    row.findings.forEach((f) => {
+      const col = RULE_CELL_FALLBACK[f.code];
+      if (col && row.cells[col].kind === "none") row.cells[col] = { kind: "warn", note: "空白" };
+    });
+  }
+
+  // 這一列「問題出在哪一欄」的集合：優先看彙整表儲存格狀態，再補上個別 finding 代碼
+  // （沒有彙整表時，個別 finding 代碼是唯一線索，讓 no-LLM fallback 也能算出主因）。
+  function rowCauses(row) {
+    const causes = new Set();
+    if (row.cells.golive.kind === "warn") causes.add("golive");
+    if (row.cells.prop.kind === "warn") causes.add("prop");
+    if (row.cells.diff.kind === "warn" || row.cells.diff.kind === "err") causes.add("diff");
+    if (row.cells.rag.kind === "warn") causes.add("rag");
+    row.findings.forEach((f) => { const c = CAUSE_CODE_MAP[f.code]; if (c) causes.add(c); });
+    return causes;
+  }
+
+  function computePrimaryCause(attentionRows) {
+    const tally = { golive: 0, prop: 0, diff: 0, rag: 0 };
+    attentionRows.forEach((row) => { row.causes.forEach((c) => { tally[c] += 1; }); });
+    let best = null;
+    let bestN = 0;
+    ["golive", "prop", "diff", "rag"].forEach((k) => { if (tally[k] > bestN) { best = k; bestN = tally[k]; } });
+    return best ? CAUSE_LABELS[best] : "—";
+  }
+
+  // 單一入口：一次掃過所有 findings，產出總覽表列、其他待處理、彙整參考四桶、統計。
+  function buildMatrix(report) {
+    const rowMap = new Map();
+    const others = [];
+    const reference = { aggregate: [], regref: [], passlog: [], all: [] };
+
+    report.findings.forEach((f) => {
+      const loc = parseItemLoc(f.location);
+      if (loc) {
+        // 項次-定位的 finding 一律進 Map，不分 severity：即使是 info 等級的
+        // 「上線階段佐證空白」，也正是治理人員要親自確認的項目；這樣一來，
+        // 完全沒有 LLM/RAG 彙整表時，總覽表仍有內容可看（不會整表空白）。
+        let row = rowMap.get(loc.itemId);
+        if (!row) { row = newMatrixRow(loc.itemId, loc.topic); rowMap.set(loc.itemId, row); }
+        if (loc.topic && !row.topic) row.topic = loc.topic;
+        row.findings.push(f);
+      } else if (f.severity !== "info") {
+        others.push(f);
+      } else if (AGGREGATE_CODES.has(f.code)) {
+        reference.aggregate.push(f);
+      } else if (isRegRefCode(f.code)) {
+        reference.regref.push(f);
+      } else {
+        reference.passlog.push(f);
+      }
+    });
+    reference.all = [...report.findings].sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity]);
+
+    const llmTableFinding = reference.aggregate.find((f) => f.code === "F03.LLM_TABLE");
+    const ragTableFinding = reference.aggregate.find((f) => f.code === "F03.RAG_TABLE");
+    const llmTable = llmTableFinding ? parseGfmTable(llmTableFinding.message) : null;
+    const ragTable = ragTableFinding ? parseGfmTable(ragTableFinding.message) : null;
+    const noTables = !llmTable && !ragTable;
+
+    if (llmTable) {
+      llmTable.rows.forEach((cells) => {
+        const [itemId, topic, diffCell, propCell, golCell] = cells;
+        if (!itemId) return;
+        let row = rowMap.get(itemId);
+        if (!row) { row = newMatrixRow(itemId, topic); rowMap.set(itemId, row); }
+        if (topic && topic !== "—") row.topic = topic; // 表格 topic 優先
+        row.cells.diff = cellStatus(diffCell);
+        row.cells.prop = cellStatus(propCell);
+        row.cells.golive = cellStatus(golCell);
+      });
+    }
+    if (ragTable) {
+      ragTable.rows.forEach((cells) => {
+        const [itemId, topic, verdictCell, refsCell] = cells;
+        if (!itemId) return;
+        let row = rowMap.get(itemId);
+        if (!row) { row = newMatrixRow(itemId, topic); rowMap.set(itemId, row); }
+        if (topic && topic !== "—") row.topic = topic;
+        row.cells.rag = cellStatus(verdictCell);
+        row.refs = refsCell && refsCell !== "—" ? refsCell : "";
+      });
+    }
+
+    const rows = [...rowMap.values()];
+    rows.forEach((row) => {
+      // 順序有意為之：先算摘要（此時儲存格 note 只含彙整表判讀結果），再補規則式狀態格
+      // （避免後備填入的「空白」note 蓋掉更精煉的 finding 標題摘要），最後才統計注意/嚴重度。
+      row.gist = rowGist(row);
+      applyRuleCellFallback(row);
+      const cellKeys = ["prop", "golive", "diff", "rag"];
+      const anyCellWarnErr = cellKeys.some((k) => {
+        const kind = row.cells[k].kind;
+        return kind === "warn" || kind === "err";
+      });
+      const anyErrCell = cellKeys.some((k) => row.cells[k].kind === "err");
+      const findingSev = maxSeverity(row.findings);
+      const anyFindingWarnErr = findingSev === "error" || findingSev === "warn";
+      // 有問題的儲存格／有 warn+ 的附掛 finding／或彙整表完全缺席時任何附掛 finding 都算數
+      // （no-LLM fallback：規則式的佐證空白 finding 是唯一線索，不能被漏掉）。
+      row.hasAttention = anyCellWarnErr || anyFindingWarnErr || (noTables && row.findings.length > 0);
+      row.rowSeverity = (anyErrCell || findingSev === "error") ? "error" : (row.hasAttention ? "warn" : "info");
+      row.causes = rowCauses(row);
+    });
+    rows.sort((a, b) => naturalItemCompare(a.itemId, b.itemId));
+
+    const attentionRows = rows.filter((r) => r.hasAttention);
+    const stats = {
+      attention: attentionRows.length,
+      total: rows.length,
+      primaryCause: computePrimaryCause(attentionRows),
+    };
+    return { rows, others, reference, stats };
   }
 
   async function postForm(url, formData) {
@@ -231,8 +485,18 @@
     const open = {};
     data.findings.forEach((f) => { if (f.severity === "error") open[f.id] = true; });
     state.open = open;
-    // 預設停在【紀錄】（彙整表所在）；但若無任何紀錄項，退回【全部】，避免落地畫面空白而藏住錯誤。
+    // 預設停在【紀錄】（彙整表所在，供「彙整參考→全部」後備分頁沿用）；
+    // 若無任何紀錄項，退回【全部】，避免落地畫面空白而藏住錯誤。
     state.filter = data.info_count > 0 ? "info" : "all";
+
+    const m = buildMatrix(data);
+    const rowOpen = {};
+    m.rows.forEach((row) => { if (row.rowSeverity === "error") rowOpen[row.itemId] = true; });
+    state.rowOpen = rowOpen;
+    state.matrixFilter = m.stats.attention > 0 ? "attention" : "all";
+    state.refOpen = false;
+    state.refTab = defaultRefTab(m.reference);
+
     state.reviewing = false;
     state.progress = null;
     state.step = 3;
@@ -247,6 +511,12 @@
     state.review = null;
     state.filter = "info";  // 與初始預設一致（落地分頁在 startReview 依紀錄數再決定）
     state.open = {};
+    state.rowOpen = {};
+    state.matrixFilter = "attention";
+    state.refOpen = false;
+    state.refTab = null;
+    state.reviewing = false;  // 防禦性清空：正常路徑 applyReport/錯誤處理已先清，這裡保持完整
+    state.progress = null;
     state.error = null;
     fileInput.value = "";
     render();
@@ -383,18 +653,55 @@
       </div></div>`;
   }
 
+  // ── 渲染：finding 卡片共用（扁平清單 / 彙整參考 / 其他待處理 共用）────
+
+  // 期望/實際比較區塊；無 expected/actual 時回空字串。
+  function findingCompareHtml(f) {
+    const hasCompare = f.expected != null || f.actual != null;
+    if (!hasCompare) return "";
+    const s = SEV[f.severity];
+    return `<div class="gv-compare">
+      <div class="col expected"><div class="k">期望</div><div class="v">${esc(f.expected || "—")}</div></div>
+      <div class="col" style="background:${s.bg};border-color:${s.border};"><div class="k">實際</div>
+        <div class="v" style="color:${s.fg};">${esc(f.actual || "—")}</div></div></div>`;
+  }
+
+  // finding 展開內容：期望/實際比較 + renderMessage + 代碼列（扁平卡與總覽表明細列共用）。
+  function findingBodyHtml(f) {
+    return `<div class="fbody">${findingCompareHtml(f)}${renderMessage(f.message)}
+      <div class="fcode-line"><span class="fcode">${esc(f.code)}</span>
+        <span class="fhint">· 需人工覆核</span></div></div>`;
+  }
+
+  // 單一可展開/收合的 finding 卡片（扁平清單 / 彙整參考 / 其他待處理 共用）。
+  function renderFindingCard(f) {
+    const s = SEV[f.severity];
+    const open = !!state.open[f.id];
+    const loc = f.location ? `<span class="floc">${esc(f.location)}</span>` : "";
+    const bodyHtml = open ? findingBodyHtml(f) : "";
+    return `<div class="gv-finding ${f.severity === "error" ? "err" : ""}${open ? " open" : ""}">
+      <button class="fbtn" data-action="toggle" data-id="${esc(f.id)}">
+        <span class="fbadge" style="background:${s.bg};color:${s.fg};">${s.icon}</span>
+        <span class="fsev" style="color:${s.fg};">${esc(s.label)}</span>
+        <span class="ftitle">${esc(f.title)}</span>${loc}
+        <span class="fcaret">⌄</span></button>${bodyHtml}</div>`;
+  }
+
   // ── 渲染：Step 3 報告 ──────────────────────────────────────────
-  function renderStep3() {
-    const r = state.review;
+
+  // Hero：徽章＋標題＋受審對象＋結論條 + tiles（固有風險 / 錯誤 / 待確認項 / 無異常項）。
+  function renderSummary(r, m) {
     const passed = r.passed;
     const barColor = passed ? "var(--ok)" : "var(--err-fg)";
+    const { attention, total, primaryCause } = m.stats;
+    const clean = total - attention;
 
-    const tile = (n, label, sevKey, big) => {
-      const s = SEV[sevKey];
-      const outline = big && n > 0 ? `outline-color:${s.fg};` : "";
-      return `<div class="gv-tile${big && n > 0 ? " big" : ""}" style="background:${s.bg};color:${s.fg};border-color:${s.border};${outline}">
+    const tileHtml = (n, label, colors, outline) => {
+      const out = outline && n > 0 ? `outline-color:${colors.fg};` : "";
+      return `<div class="gv-tile${outline && n > 0 ? " big" : ""}" style="background:${colors.bg};color:${colors.fg};border-color:${colors.border};${out}">
         <div class="n">${n}</div><div class="l">${esc(label)}</div></div>`;
     };
+    const okColors = { bg: "var(--ok-bg)", fg: "var(--ok)", border: "var(--ok-bg)" };
 
     // 固有風險分級/分數 tile（來源：F02 第一頁 AI系統固有風險分級評估表）；無 F02 則不渲染。
     const riskTile = (() => {
@@ -405,6 +712,141 @@
         <div class="n">${esc(r.risk_grade)}</div><div class="l">固有風險${esc(pct)}</div></div>`;
     })();
 
+    const hasAttn = attention > 0;
+    const conclusion = hasAttn
+      ? `「${r.error_count} 錯誤 · ${attention}/${total} 檢核項需人工確認 · 主因：${primaryCause}」`
+      : `「${r.error_count} 錯誤 · 檢核項無需人工確認」`;
+
+    return `<div class="gv-summary" style="--bar:${barColor};">
+      <div class="top">
+        <div class="lead">
+          <span class="badge" style="background:${passed ? "var(--ok-bg)" : "var(--err-bg)"};color:${passed ? "var(--ok)" : "var(--err-fg)"};">${passed ? "✓" : "✕"}</span>
+          <div><div class="title" style="color:${passed ? "var(--ok)" : "var(--err-fg)"};">${passed ? "規則通過" : "待處理"}</div>
+            <div class="subline">受審：${esc(r.subject || "未標示")}　·　${esc(r.form_type)}</div>
+            <div class="gv-hero-conclusion ${hasAttn ? "attn" : "ok"}">${esc(conclusion)}</div>
+          </div>
+        </div>
+        <div class="gv-tiles">
+          ${riskTile}
+          ${tileHtml(r.error_count, "錯誤", SEV.error, true)}
+          ${tileHtml(attention, "待確認項", SEV.warn, true)}
+          ${tileHtml(clean, "無異常項", okColors, false)}
+        </div>
+      </div>
+      <div class="foot"><span class="note spacer">⚠ 本報告為 AI 初判，每項皆需人工覆核</span></div>
+    </div>`;
+  }
+
+  // 其他待處理：非項次的 error/warn finding，沿用扁平卡片；只在存在時渲染整節。
+  function renderOthers(m) {
+    if (!m.others.length) return "";
+    const sorted = [...m.others].sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity]);
+    return `<div class="gv-others">
+      <h2 class="gv-h2">其他待處理</h2>
+      <div class="gv-findings">${sorted.map(renderFindingCard).join("")}</div>
+    </div>`;
+  }
+
+  // 狀態格 note 截短（僅總覽表狀態格使用；完整文字在展開明細與摘要欄，不損失資訊）：
+  // 1) 去「上線階段/提案階段」前綴 — 欄名已標明階段，重複只佔寬度；
+  // 2) 取第一個標點（，。；、：）前的片段 — 兼去尾標點，避免截在句中殘留逗號；
+  // 3) 仍超過 8 字 → 硬截 8 字加「…」；放得下則不加。
+  // 例：「上線階段沒有提供任何佐證」→「沒有提供任何佐證」；「佐證為空白，無法判斷」→「佐證為空白」。
+  const CELL_NOTE_MAX = 8;
+  function shortCellNote(note) {
+    let s = String(note == null ? "" : note).trim();
+    s = s.replace(/^(上線階段|提案階段)/, "");
+    const m = /[，。；、：]/.exec(s);
+    if (m) s = s.slice(0, m.index);
+    s = s.trim();
+    return s.length > CELL_NOTE_MAX ? s.slice(0, CELL_NOTE_MAX) + "…" : s;
+  }
+
+  // 狀態格 → 小色塊 label（依 kind 決定顏色/字樣；warn 依欄位不同截短或改固定字樣）。
+  function matrixCellHtml(colKey, cell) {
+    if (cell.kind === "ok") return `<span class="st-ok">✓ ${esc(cell.note || "充分")}</span>`;
+    if (cell.kind === "undet") return `<span class="st-undet">？無法判定</span>`;
+    if (cell.kind === "err") return `<span class="st-err">✕ 判讀失敗</span>`;
+    if (cell.kind === "warn") {
+      if (colKey === "diff") return `<span class="st-warn">▲ 有差異</span>`;
+      const short = shortCellNote(cell.note) || "待確認";
+      return `<span class="st-warn">▲ ${esc(short)}</span>`;
+    }
+    return `<span class="st-none">—</span>`;
+  }
+
+  // 展開列裡單一附掛 finding 的完整明細（沿用 findingBodyHtml，加一行嚴重度＋標題）。
+  function matrixDetailFindingHtml(f) {
+    const s = SEV[f.severity];
+    return `<div class="gv-mdetail-finding">
+      <div class="gv-mdetail-head" style="color:${s.fg};">${esc(s.label)} · ${esc(f.title)}</div>
+      ${findingBodyHtml(f)}
+    </div>`;
+  }
+
+  function renderMatrixDetailRow(row) {
+    const inner = row.findings.length
+      ? row.findings.map(matrixDetailFindingHtml).join('<div class="gv-mdetail-sep"></div>')
+      : `<div class="gv-mdetail-empty">此項次無個別 finding；狀態來自彙整表判讀。</div>`;
+    const refsLine = row.refs ? `<div class="gv-mdetail-refs">條文引用：${esc(row.refs)}</div>` : "";
+    return `<tr class="gv-matrix-detail"><td colspan="8">${inner}${refsLine}</td></tr>`;
+  }
+
+  function renderMatrixRow(row) {
+    const open = !!state.rowOpen[row.itemId];
+    const rowClass = row.rowSeverity === "error" ? " row-err" : (row.hasAttention ? " row-attn" : "");
+    const topic = row.topic ? esc(row.topic) : "—";
+    const gist = esc(row.gist || "—");
+    const mainRow = `<tr class="gv-mrow${rowClass}${open ? " open" : ""}" data-action="row-toggle" data-key="${esc(row.itemId)}">
+      <td>${esc(row.itemId)}</td>
+      <td>${topic}</td>
+      <td>${matrixCellHtml("prop", row.cells.prop)}</td>
+      <td>${matrixCellHtml("golive", row.cells.golive)}</td>
+      <td>${matrixCellHtml("diff", row.cells.diff)}</td>
+      <td>${matrixCellHtml("rag", row.cells.rag)}</td>
+      <td class="gv-mgist" title="${gist}">${gist}</td>
+      <td class="gv-mcaret"><span class="fcaret">⌄</span></td>
+    </tr>`;
+    return mainRow + (open ? renderMatrixDetailRow(row) : "");
+  }
+
+  // ① 檢核項狀態總覽：整份報告的中心視覺 — 一眼看出哪些檢核項有問題待確認。
+  function renderMatrix(m) {
+    const { rows, stats } = m;
+    if (!rows.length) {
+      return `<div class="gv-matrix">
+        <div class="gv-matrix-head"><h2 class="gv-h2">① 檢核項狀態總覽</h2></div>
+        <div class="gv-matrix-empty">規則檢查無需人工確認項目</div>
+      </div>`;
+    }
+    const shown = state.matrixFilter === "all" ? rows : rows.filter((r) => r.hasAttention);
+    const pillDefs = [
+      { key: "attention", label: `只看有問題 ${stats.attention}` },
+      { key: "all", label: `全部 ${stats.total}` },
+    ];
+    const pills = pillDefs.map((p) =>
+      `<button class="gv-filter${state.matrixFilter === p.key ? " active" : ""}" data-action="matrix-filter" data-mf="${p.key}">${esc(p.label)}</button>`
+    ).join("");
+
+    return `<div class="gv-matrix">
+      <div class="gv-matrix-head">
+        <h2 class="gv-h2">① 檢核項狀態總覽</h2>
+        <div class="gv-matrix-filters">${pills}</div>
+      </div>
+      <div class="gv-matrix-card">
+        <table>
+          <thead><tr>
+            <th>項次</th><th>管理議題</th><th>提案佐證</th><th>上線佐證</th>
+            <th>兩段差異</th><th>法規符合</th><th>摘要</th><th></th>
+          </tr></thead>
+          <tbody>${shown.map(renderMatrixRow).join("")}</tbody>
+        </table>
+      </div>
+    </div>`;
+  }
+
+  // 【彙整參考】「全部」後備分頁：逐字保留舊版扁平清單行為（state.filter 嚴重度濾鏡 + 舊卡片）。
+  function renderAllFallback(r) {
     const filterDefs = [
       { key: "info", label: `紀錄 ${r.info_count}` },
       { key: "error", label: `錯誤 ${r.error_count}` },
@@ -417,52 +859,58 @@
     const sorted = [...r.findings].sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity]);
     const shown = state.filter === "all" ? sorted : sorted.filter((f) => f.severity === state.filter);
 
-    const cards = shown.map((f) => {
-      const s = SEV[f.severity];
-      const open = !!state.open[f.id];
-      const hasCompare = f.expected != null || f.actual != null;
-      const loc = f.location ? `<span class="floc">${esc(f.location)}</span>` : "";
-      let bodyHtml = "";
-      if (open) {
-        let compare = "";
-        if (hasCompare) {
-          compare = `<div class="gv-compare">
-            <div class="col expected"><div class="k">期望</div><div class="v">${esc(f.expected || "—")}</div></div>
-            <div class="col" style="background:${s.bg};border-color:${s.border};"><div class="k">實際</div>
-              <div class="v" style="color:${s.fg};">${esc(f.actual || "—")}</div></div></div>`;
-        }
-        bodyHtml = `<div class="fbody">${compare}${renderMessage(f.message)}
-          <div class="fcode-line"><span class="fcode">${esc(f.code)}</span>
-            <span class="fhint">· 需人工覆核</span></div></div>`;
-      }
-      return `<div class="gv-finding ${f.severity === "error" ? "err" : ""}${open ? " open" : ""}">
-        <button class="fbtn" data-action="toggle" data-id="${esc(f.id)}">
-          <span class="fbadge" style="background:${s.bg};color:${s.fg};">${s.icon}</span>
-          <span class="fsev" style="color:${s.fg};">${esc(s.label)}</span>
-          <span class="ftitle">${esc(f.title)}</span>${loc}
-          <span class="fcaret">⌄</span></button>${bodyHtml}</div>`;
-    }).join("");
+    return `<div class="gv-filters">${filters}</div>
+      <div class="gv-findings">${shown.map(renderFindingCard).join("")}</div>`;
+  }
 
+  // ② 彙整參考：預設收合的教師卡；展開後依分頁顯示彙整表原文 / 法規對應 / 通過紀錄 / 全部後備。
+  function renderReference(r, m) {
+    const ref = m.reference;
+    const counts = {
+      aggregate: ref.aggregate.length,
+      regref: ref.regref.length,
+      passlog: ref.passlog.length,
+      all: ref.all.length,
+    };
+    const teaserSummary = `原始彙整 ${counts.aggregate}　法規對應 ${counts.regref}　通過紀錄 ${counts.passlog}`;
+    const teaser = `<button class="gv-ref-teaser" data-action="ref-toggle">
+      <span class="badge">②</span>
+      <div class="body"><div class="title">彙整參考</div><div class="sum">${esc(teaserSummary)}</div></div>
+      <span class="fcaret${state.refOpen ? " open" : ""}">⌄</span>
+    </button>`;
+
+    if (!state.refOpen) {
+      return `<div class="gv-reference">${teaser}</div>`;
+    }
+
+    const tabs = REF_TAB_ORDER.map((key) => ({ key, label: `${REF_TAB_LABELS[key]} ${counts[key]}` }));
+    const tabPills = tabs.map((t) =>
+      `<button class="gv-filter${state.refTab === t.key ? " active" : ""}" data-action="ref-tab" data-tab="${t.key}">${esc(t.label)}</button>`
+    ).join("");
+
+    let body;
+    if (state.refTab === "all") {
+      body = renderAllFallback(r);
+    } else {
+      const list = ref[state.refTab] || [];
+      body = `<div class="gv-findings">${list.length ? list.map(renderFindingCard).join("") : '<div class="gv-matrix-empty">尚無項目</div>'}</div>`;
+    }
+
+    return `<div class="gv-reference">${teaser}
+      <div class="gv-ref-tabs">${tabPills}</div>
+      <div class="gv-ref-body">${body}</div>
+    </div>`;
+  }
+
+  function renderStep3() {
+    const r = state.review;
+    const m = buildMatrix(r);
     return `<div>
-      <div class="gv-summary" style="--bar:${barColor};">
-        <div class="top">
-          <div class="lead">
-            <span class="badge" style="background:${passed ? "var(--ok-bg)" : "var(--err-bg)"};color:${passed ? "var(--ok)" : "var(--err-fg)"};">${passed ? "✓" : "✕"}</span>
-            <div><div class="title" style="color:${passed ? "var(--ok)" : "var(--err-fg)"};">${passed ? "規則通過" : "待處理"}</div>
-              <div class="subline">受審：${esc(r.subject || "未標示")}　·　${esc(r.form_type)}</div></div>
-          </div>
-          <div class="gv-tiles">
-            ${riskTile}
-            ${tile(r.error_count, "錯誤", "error", true)}
-            ${tile(r.warn_count, "提醒", "warn", false)}
-            ${tile(r.info_count, "通過紀錄", "info", false)}
-          </div>
-        </div>
-        <div class="foot"><span class="note spacer">⚠ 本報告為 AI 初判，每項皆需人工覆核</span></div>
-      </div>
+      ${renderSummary(r, m)}
       ${renderError()}
-      <div class="gv-filters">${filters}</div>
-      <div class="gv-findings">${cards}</div>
+      ${renderOthers(m)}
+      ${renderMatrix(m)}
+      ${renderReference(r, m)}
       <div class="row-split" style="padding-top:22px;border-top:1px solid var(--border);">
         <button class="btn-ghost" data-action="reset">↻　審查新的送件包</button>
         <button class="btn-download" data-action="download">⬇ 下載 Markdown 報告</button>
@@ -521,6 +969,10 @@
     else if (action === "toggle") { const id = el.dataset.id; state.open[id] = !state.open[id]; render(); }
     else if (action === "filter") { state.filter = el.dataset.filter; render(); }
     else if (action === "download") downloadMarkdown();
+    else if (action === "row-toggle") { const key = el.dataset.key; state.rowOpen[key] = !state.rowOpen[key]; render(); }
+    else if (action === "matrix-filter") { state.matrixFilter = el.dataset.mf; render(); }
+    else if (action === "ref-toggle") { state.refOpen = !state.refOpen; render(); }
+    else if (action === "ref-tab") { state.refTab = el.dataset.tab; state.refOpen = true; render(); }
   });
 
   app.addEventListener("change", (e) => {

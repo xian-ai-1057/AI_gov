@@ -298,3 +298,101 @@ button { font-family: inherit; cursor: pointer; }
   border: 1px solid var(--accent); background: var(--accent-soft); color: var(--accent);
   border-radius: 10px; padding: 12px 22px; font-weight: 700; font-size: 14px;
 }
+
+/* ── Step 3 報告改版：Hero 結論條 / 其他待處理 / 檢核項狀態總覽 / 彙整參考 ── */
+
+/* Hero 結論條：錯誤數 + 待確認項比例 + 主因，一眼定調整份報告要不要處理。 */
+.gv-hero-conclusion {
+  display: inline-block; margin-top: 8px;
+  font-size: 13.5px; font-weight: 600; line-height: 1.4;
+  border-radius: 8px; padding: 7px 12px;
+}
+.gv-hero-conclusion.attn { background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-fg); }
+.gv-hero-conclusion.ok { background: var(--ok-bg); border: 1px solid var(--ok-bg); color: var(--ok); }
+
+/* 章節共用標題（serif，比 gv-h1 略小，供三個新章節使用）＋ 上下節奏間距。 */
+.gv-h2 { font-family: var(--head-font); font-size: 18px; font-weight: 700; margin: 0; }
+.gv-others, .gv-matrix, .gv-reference { margin-top: 26px; }
+
+/* 其他待處理：非項次 error/warn，沿用 .gv-finding 卡片，只有存在時才渲染整節。 */
+.gv-others .gv-h2 { margin-bottom: 14px; }
+
+/* ① 檢核項狀態總覽：章節標頭（標題＋濾鏡並排）。 */
+.gv-matrix-head {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
+  gap: 12px; margin-bottom: 14px;
+}
+.gv-matrix-filters { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* 總覽表白卡：橫向捲動避免窄螢幕擠壓，表格本身滿版。 */
+.gv-matrix-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--rad);
+  box-shadow: var(--shadow); overflow-x: auto;
+}
+.gv-matrix-card table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.gv-matrix-card th {
+  text-align: left; font-size: 11.5px; font-weight: 700; color: var(--muted);
+  background: var(--bg); padding: 9px 12px; white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+.gv-matrix-card td { padding: 8px 12px; border-top: 1px solid var(--border); vertical-align: middle; }
+.gv-matrix-card tbody tr:first-child td { border-top: none; }
+
+.gv-mrow { cursor: pointer; }
+.gv-mrow:not(.row-attn):not(.row-err):hover td { background: var(--bg); }
+/* 有問題的列淡色提示：先給不支援 color-mix 的瀏覽器一個純色後備，再用 color-mix 淡化。 */
+.gv-mrow.row-attn td { background: var(--warn-bg); background: color-mix(in srgb, var(--warn-bg) 45%, var(--surface)); }
+.gv-mrow.row-err td { background: var(--err-bg); background: color-mix(in srgb, var(--err-bg) 45%, var(--surface)); }
+
+.gv-mcaret { text-align: right; }
+.gv-matrix-card .fcaret { display: inline-block; color: var(--muted); font-size: 14px; transition: transform .2s; }
+.gv-mrow.open .fcaret { transform: rotate(180deg); }
+
+/* 狀態格：小色塊 label，依 kind 上色；white-space:nowrap 避免欄位內折行。 */
+.st-ok, .st-warn, .st-undet, .st-err, .st-none { font-weight: 600; font-size: 12px; white-space: nowrap; }
+.st-ok { color: var(--ok); }
+.st-warn { color: var(--warn-fg); }
+.st-undet { color: var(--muted); }
+.st-err { color: var(--err-fg); }
+.st-none { color: var(--muted); }
+
+/* 摘要欄：單行省略號，完整內容在展開列 / title 屬性。 */
+.gv-mgist {
+  max-width: 220px; color: var(--muted); font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 展開明細列：淺底色卡片，內含每個附掛 finding 的完整明細（沿用 .fbody）。 */
+.gv-matrix-detail td { background: var(--drop-bg); padding: 14px 16px; border-top: none; }
+.gv-mdetail-finding { padding: 4px 0; }
+.gv-mdetail-head { font-size: 12.5px; font-weight: 700; margin-bottom: 2px; }
+.gv-mdetail-sep { border-top: 1px solid var(--border); margin: 12px 0; }
+.gv-mdetail-empty { font-size: 13px; color: var(--muted); padding: 4px 0; }
+.gv-mdetail-refs { margin-top: 10px; font-size: 12px; color: var(--muted); }
+
+/* 總覽表 / 分頁清單的空狀態：虛線框，與資料卡明顯區隔。 */
+.gv-matrix-empty {
+  border: 1px dashed var(--border); border-radius: var(--rad); background: var(--drop-bg);
+  color: var(--muted); font-size: 13.5px; text-align: center; padding: 26px 20px;
+}
+
+/* ② 彙整參考：預設收合教師卡；展開後上方分頁 + 下方內容。 */
+.gv-ref-teaser {
+  width: 100%; display: flex; align-items: center; gap: 14px; text-align: left;
+  appearance: none; border: 1px solid var(--border); background: var(--surface);
+  border-radius: var(--rad); padding: 16px 20px; box-shadow: var(--shadow);
+}
+.gv-ref-teaser .badge {
+  flex: none; width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent); font-weight: 800; font-size: 13px;
+}
+.gv-ref-teaser .body { flex: 1; min-width: 0; }
+.gv-ref-teaser .title { font-weight: 700; font-size: 14.5px; color: var(--text); }
+.gv-ref-teaser .sum {
+  font-size: 12.5px; color: var(--muted); margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.gv-ref-teaser .fcaret { flex: none; color: var(--muted); font-size: 14px; transition: transform .2s; }
+.gv-ref-teaser .fcaret.open { transform: rotate(180deg); }
+.gv-ref-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 14px 0 12px; }
+.gv-ref-body { margin-top: 2px; }
