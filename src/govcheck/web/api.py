@@ -20,6 +20,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -54,7 +55,8 @@ KIND_OPTIONS = [{"value": k.value, "label": KIND_LABEL[k]} for k in _ASSIGNABLE]
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    # 在伺服器啟動時才設定 log（而非 import 時），避免被 import 即在 repo root 建出 logs/。
+    # 在伺服器啟動時才讀 .env / 設定 log（而非 import 時），避免被 import 即產生副作用。
+    load_dotenv()  # repo root .env（若存在）→ os.environ；GOVCHECK_* 才讀得到覆寫值
     setup_logging()
     yield
 

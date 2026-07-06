@@ -27,6 +27,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from govcheck.logging_setup import get_logger
 from govcheck.parsers.f02_parser import ASSESS_SHEET
 from govcheck.rag.config import load_rag_config
@@ -634,6 +636,7 @@ def run_eval(
 
 def main() -> None:
     """argparse CLI：--dry-run ③ / --eval ④ / 預設 ①+②。"""
+    load_dotenv()  # repo root .env（若存在）→ os.environ；GOVCHECK_RAG_* 才讀得到覆寫值
     parser = argparse.ArgumentParser(
         description="Build RAG regulation index (①③) + canonical retrieval map (②④)"
     )
