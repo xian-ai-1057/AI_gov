@@ -26,7 +26,7 @@ def test_defaults_from_yaml():
     assert cfg["temperature"] == 0.0
     assert cfg["max_items"] == 30
     assert cfg["batch_size"] == 8
-    assert cfg["enabled"] is False
+    assert cfg["enabled"] is True  # 專案預設已改為開啟（2026-07-07）
     assert cfg["api_key"] is None
 
 

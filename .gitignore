@@ -28,6 +28,10 @@ data/rag/
 data/original/
 data/original
 
+# 測試/示範用送件包樣本與介面重新設計截圖（含真實表單與審查內容，僅本機留存，不入庫）
+data/samples/
+data/ui_redesign/
+
 # 提交者上傳的審查資料（含敏感內容，禁止入庫）
 uploads/
 output/

@@ -2,7 +2,7 @@
 # 僅放「非機密」預設值；api_key 一律由環境變數 GOVCHECK_LLM_API_KEY 提供，禁止寫入本檔、禁止入庫。
 # 環境變數可覆寫任一鍵：GOVCHECK_LLM_ENABLED / _BASE_URL / _MODEL / _API_KEY / _TIMEOUT / _TEMPERATURE / _MAX_ITEMS / _BATCH_SIZE
 
-enabled: false                       # 預設關閉；由介面開關或 GOVCHECK_LLM_ENABLED=1 啟用
+enabled: true                       # 預設關閉；由介面開關或 GOVCHECK_LLM_ENABLED=1 啟用
 base_url: http://localhost:11434/v1  # 本機 ollama（OpenAI 相容）；內部端點請以環境變數覆寫
 model: gemma3:4b                     # 本機 ollama 範例模型；請依實際部署以 GOVCHECK_LLM_MODEL 覆寫
 timeout: 60                          # 單次請求逾時（秒）
@@ -14,7 +14,7 @@ batch_size: 8                        # 單次 LLM 呼叫送審的檢核項數（
 # 缺此區段時 load_rag_config() 全用硬碼預設，行為一致。機密（EMBEDDING_API_KEY / MILVUS_TOKEN）只走環境變數。
 # 環境變數可覆寫任一鍵：GOVCHECK_RAG_ENABLED / _MAPPING_PATH / _BATCH_SIZE / _MAX_SECTIONS_PER_ITEM / _MAX_EXCERPT_CHARS / _TIMEOUT / _MAX_ITEMS ...
 rag:
-  enabled: false                     # 預設關閉；rag.enabled=true 且 enable_llm 才實際啟用
+  enabled: true                     # 預設關閉；rag.enabled=true 且 enable_llm 才實際啟用
   mapping_path: data/rag/retrieval_map.json  # build-time 產物（gitignored；runtime 只讀查表）
   batch_size: 2                      # RAG 判讀批次（canonical 摘錄使 prompt 較長，保守起步）
   max_sections_per_item: 3           # 每檢核項最多引用條文段數
