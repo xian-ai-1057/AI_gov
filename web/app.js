@@ -43,6 +43,11 @@
   const AGGREGATE_CODES = new Set(["F03.LLM_TABLE", "F03.LLM_SUMMARY", "F03.RAG_TABLE", "F03.RAG_SUMMARY"]);
   function isRegRefCode(code) { return code === "F02.REG_REF_SUMMARY" || code === "F02.REG_REF_NOTE"; }
 
+  // 整段 AI 判讀降級訊號（端點連不上而略過，或連續失敗而中止）：非合規判讀結果，
+  // 代表「這次 LLM/RAG 判讀未完整跑」。須在主視圖顯著提示，不可埋進單一項次列或收合的彙整參考。
+  // 只有在 LLM/RAG 原本應執行時才會由 engine/checks 產生（刻意停用不會出現），故出現即為真降級。
+  const NOTICE_CODES = new Set(["F03.LLM_SKIPPED", "RAG.SKIPPED", "F03.LLM_ERROR", "F03.RAG_ERROR"]);
+
   // 總覽表「主因」欄位的問題欄 → 顯示字樣；CAUSE_CODE_MAP 讓「無彙整表」時仍能由個別
   // finding 代碼推出主因（見 buildMatrix 的 no-LLM fallback 說明）。
   const CAUSE_LABELS = {
@@ -61,9 +66,10 @@
   };
   // 規則式「佐證空白」finding → 狀態格後備（no-LLM 模式下整列不再全「—」）；
   // 僅在該格尚無彙整表資料（kind === "none"）時套用，表格判讀永遠優先。
+  // 值取自 CAUSE_CODE_MAP（同兩碼對應的佐證欄與主因欄一致），集中管理避免雙表漂移。
   const RULE_CELL_FALLBACK = {
-    "F03.EVIDENCE_MISSING_PROPOSAL": "prop",
-    "F03.EVIDENCE_MISSING_GOLIVE": "golive",
+    "F03.EVIDENCE_MISSING_PROPOSAL": CAUSE_CODE_MAP["F03.EVIDENCE_MISSING_PROPOSAL"],
+    "F03.EVIDENCE_MISSING_GOLIVE": CAUSE_CODE_MAP["F03.EVIDENCE_MISSING_GOLIVE"],
   };
 
   // ── 狀態 ───────────────────────────────────────────────────────
@@ -284,9 +290,13 @@
   function buildMatrix(report) {
     const rowMap = new Map();
     const others = [];
+    const notices = [];
     const reference = { aggregate: [], regref: [], passlog: [], all: [] };
 
     report.findings.forEach((f) => {
+      // 降級訊號先攔下：它可能帶著某一項次的 location（如 LLM 中止取 chunk[0].loc），
+      // 若不先攔，會被下面的 item-location 分流埋進那一列的收合明細裡。
+      if (NOTICE_CODES.has(f.code)) { notices.push(f); return; }
       const loc = parseItemLoc(f.location);
       if (loc) {
         // 項次-定位的 finding 一律進 Map，不分 severity：即使是 info 等級的
@@ -345,17 +355,18 @@
       row.gist = rowGist(row);
       applyRuleCellFallback(row);
       const cellKeys = ["prop", "golive", "diff", "rag"];
-      const anyCellWarnErr = cellKeys.some((k) => {
-        const kind = row.cells[k].kind;
-        return kind === "warn" || kind === "err";
-      });
-      const anyErrCell = cellKeys.some((k) => row.cells[k].kind === "err");
+      // warn（有問題）、err（⚠️ 判讀失敗）、undet（❓ 無法判定）三種儲存格都代表「需人工確認」：
+      // err/undet 是「AI 判不了，請人看」，同樣不能在預設「只看有問題」濾鏡下被藏掉。
+      const attnKinds = { warn: 1, err: 1, undet: 1 };
+      const anyCellAttn = cellKeys.some((k) => attnKinds[row.cells[k].kind]);
       const findingSev = maxSeverity(row.findings);
       const anyFindingWarnErr = findingSev === "error" || findingSev === "warn";
-      // 有問題的儲存格／有 warn+ 的附掛 finding／或彙整表完全缺席時任何附掛 finding 都算數
+      // 有需注意的儲存格／有 warn+ 的附掛 finding／或彙整表完全缺席時任何附掛 finding 都算數
       // （no-LLM fallback：規則式的佐證空白 finding 是唯一線索，不能被漏掉）。
-      row.hasAttention = anyCellWarnErr || anyFindingWarnErr || (noTables && row.findings.length > 0);
-      row.rowSeverity = (anyErrCell || findingSev === "error") ? "error" : (row.hasAttention ? "warn" : "info");
+      row.hasAttention = anyCellAttn || anyFindingWarnErr || (noTables && row.findings.length > 0);
+      // 嚴重度（紅底＋自動展開）只由真正 error 級的附掛 finding 決定；⚠️/❓ 在後端皆為 INFO
+      // （判讀失敗/無法判定 ≠ 合規違規），不可染成紅色錯誤、搶走治理人員對真違規的 triage 注意力。
+      row.rowSeverity = findingSev === "error" ? "error" : (row.hasAttention ? "warn" : "info");
       row.causes = rowCauses(row);
     });
     rows.sort((a, b) => naturalItemCompare(a.itemId, b.itemId));
@@ -366,7 +377,7 @@
       total: rows.length,
       primaryCause: computePrimaryCause(attentionRows),
     };
-    return { rows, others, reference, stats };
+    return { rows, others, notices, reference, stats };
   }
 
   async function postForm(url, formData) {
@@ -712,10 +723,17 @@
         <div class="n">${esc(r.risk_grade)}</div><div class="l">固有風險${esc(pct)}</div></div>`;
     })();
 
-    const hasAttn = attention > 0;
-    const conclusion = hasAttn
-      ? `「${r.error_count} 錯誤 · ${attention}/${total} 檢核項需人工確認 · 主因：${primaryCause}」`
-      : `「${r.error_count} 錯誤 · 檢核項無需人工確認」`;
+    // 結論條文字與配色須反映「所有需處理的事」，不只 F03 檢核項：非項次錯誤（缺件/F01必填/
+    // 跨表不一致）進 m.others、AI 判讀降級進 m.notices；任一非空都代表待處理，不可顯示綠色「無需確認」
+    // （否則會與同一卡片內紅色「✕ 待處理」徽章及非零錯誤 tile 自相矛盾）。
+    const otherCount = m.others.length;
+    const needsAction = attention > 0 || r.error_count > 0 || otherCount > 0 || m.notices.length > 0;
+    const parts = [`${r.error_count} 錯誤`];
+    if (attention > 0) parts.push(`${attention}/${total} 檢核項需人工確認`);
+    if (otherCount > 0) parts.push(`另 ${otherCount} 項其他待處理`);
+    if (m.notices.length > 0) parts.push("AI 判讀未完整執行");
+    if (attention > 0) parts.push(`主因：${primaryCause}`);
+    const conclusion = needsAction ? `「${parts.join(" · ")}」` : "「0 錯誤 · 檢核項無需人工確認」";
 
     return `<div class="gv-summary" style="--bar:${barColor};">
       <div class="top">
@@ -723,7 +741,7 @@
           <span class="badge" style="background:${passed ? "var(--ok-bg)" : "var(--err-bg)"};color:${passed ? "var(--ok)" : "var(--err-fg)"};">${passed ? "✓" : "✕"}</span>
           <div><div class="title" style="color:${passed ? "var(--ok)" : "var(--err-fg)"};">${passed ? "規則通過" : "待處理"}</div>
             <div class="subline">受審：${esc(r.subject || "未標示")}　·　${esc(r.form_type)}</div>
-            <div class="gv-hero-conclusion ${hasAttn ? "attn" : "ok"}">${esc(conclusion)}</div>
+            <div class="gv-hero-conclusion ${needsAction ? "attn" : "ok"}">${esc(conclusion)}</div>
           </div>
         </div>
         <div class="gv-tiles">
@@ -734,6 +752,18 @@
         </div>
       </div>
       <div class="foot"><span class="note spacer">⚠ 本報告為 AI 初判，每項皆需人工覆核</span></div>
+    </div>`;
+  }
+
+  // AI 判讀降級提示：端點連不上而略過、或連續失敗而中止時，在主視圖顯著提示「這次判讀未完整跑」。
+  // 非合規違規（琥珀資訊帶，非紅色錯誤）；只在存在時渲染，避免正常情況出現空帶。
+  function renderNotices(m) {
+    if (!m.notices.length) return "";
+    const items = m.notices.map((f) =>
+      `<li><strong>${esc(f.title)}</strong>${f.message ? "：" + esc(f.message) : ""}</li>`).join("");
+    return `<div class="gv-notices">
+      <div class="gv-notices-head">⚠ AI 判讀未完整執行（規則檢查不受影響，請一併人工覆核）</div>
+      <ul>${items}</ul>
     </div>`;
   }
 
@@ -908,6 +938,7 @@
     return `<div>
       ${renderSummary(r, m)}
       ${renderError()}
+      ${renderNotices(m)}
       ${renderOthers(m)}
       ${renderMatrix(m)}
       ${renderReference(r, m)}
