@@ -1,6 +1,6 @@
 /* AI 治理審查小幫手 — 前端（vanilla JS，移植自 Claude Design .dc.html 的 DCLogic）。
    三步驟：上傳送件包 → 確認自動分類 → 審查報告。狀態驅動整頁重繪。
-   後端：POST /api/classify、POST /api/review。資料全程地端，無外部請求。 */
+   後端：POST /api/classify、POST /api/v2/review/stream。資料全程地端，無外部請求。 */
 
 (() => {
   "use strict";
@@ -46,7 +46,12 @@
   // 整段 AI 判讀降級訊號（端點連不上而略過，或連續失敗而中止）：非合規判讀結果，
   // 代表「這次 LLM/RAG 判讀未完整跑」。須在主視圖顯著提示，不可埋進單一項次列或收合的彙整參考。
   // 只有在 LLM/RAG 原本應執行時才會由 engine/checks 產生（刻意停用不會出現），故出現即為真降級。
-  const NOTICE_CODES = new Set(["F03.LLM_SKIPPED", "RAG.SKIPPED", "F03.LLM_ERROR", "F03.RAG_ERROR"]);
+  const NOTICE_CODES = new Set([
+    "F03.LLM_SKIPPED", "F03.PROMPT_UNAVAILABLE", "RAG.SKIPPED", "RAG.DISABLED",
+    "F03.LLM_ERROR", "F03.RAG_ERROR", "F03.RAG_DISABLED",
+    // 超過上限而未送審的檢核項不會出現在任何列，只能靠這條主視圖提示讓人看見。
+    "F03.ASSESSMENT_TRUNCATED",
+  ]);
 
   // 總覽表「主因」欄位的問題欄 → 顯示字樣；CAUSE_CODE_MAP 讓「無彙整表」時仍能由個別
   // finding 代碼推出主因（見 buildMatrix 的 no-LLM fallback 說明）。
@@ -63,6 +68,11 @@
     "F03.LLM_VAGUE_GOLIVE": "golive",
     "F03.LLM_DIFF": "diff",
     "F03.RAG_GAP": "rag",
+    "F03.ASSESSMENT_INCOMPLETE": "prop",
+    "F03.ASSESSMENT_VAGUE": "prop",
+    "F03.EVIDENCE_NOT_SUPPORTED": "rag",
+    "F03.EVIDENCE_CONTRADICTED": "rag",
+    "F03.EVIDENCE_SOURCE_CONFLICT": "rag",
   };
   // 規則式「佐證空白」finding → 狀態格後備（no-LLM 模式下整列不再全「—」）；
   // 僅在該格尚無彙整表資料（kind === "none"）時套用，表格判讀永遠優先。
@@ -79,6 +89,8 @@
     classify: null,     // /api/classify 回應 { kinds, files:[...] }
     kinds: {},          // index -> 使用者選定 kind（覆寫預設）
     review: null,       // /api/review 回應
+    role: "proposer",  // proposer | reviewer
+    workflowStage: "proposal",
     filter: "info",     // 【彙整參考】「全部」後備分頁用的舊版嚴重度濾鏡（保留原行為）
     open: {},           // finding id -> bool（扁平清單 / 彙整卡共用的展開狀態）
     rowOpen: {},        // 檢核項狀態總覽表：itemId -> 是否展開
@@ -242,6 +254,7 @@
         rag: { kind: "none", note: "" },
       },
       refs: "",
+      assessment: null,
     };
   }
 
@@ -322,7 +335,8 @@
     const ragTableFinding = reference.aggregate.find((f) => f.code === "F03.RAG_TABLE");
     const llmTable = llmTableFinding ? parseGfmTable(llmTableFinding.message) : null;
     const ragTable = ragTableFinding ? parseGfmTable(ragTableFinding.message) : null;
-    const noTables = !llmTable && !ragTable;
+    const assessments = report.item_assessments || [];
+    const noTables = !llmTable && !ragTable && assessments.length === 0;
 
     if (llmTable) {
       llmTable.rows.forEach((cells) => {
@@ -347,6 +361,54 @@
         row.refs = refsCell && refsCell !== "—" ? refsCell : "";
       });
     }
+
+    // API v2 的結構化 assessment 是正式資料契約；舊 Markdown 表僅保留作過渡顯示。
+    assessments.forEach((assessment) => {
+      let row = rowMap.get(assessment.item_id);
+      if (!row) {
+        row = newMatrixRow(assessment.item_id, assessment.profile);
+        rowMap.set(assessment.item_id, row);
+      }
+      row.assessment = assessment;
+      // assessed === false 代表模型從未判讀此項（端點失敗／回應缺漏／Prompt 未就緒）。
+      // 這種列的 evidence_status 只是佔位預設值，不可畫成「未找到佐證」的警示。
+      if (assessment.assessed === false) {
+        const unknown = { kind: "undet", note: "未判讀" };
+        row.cells[report.workflow_stage === "proposal" ? "prop" : "golive"] = unknown;
+        row.cells.diff = unknown;
+        row.cells.rag = unknown;
+        return;
+      }
+      const contentBad = assessment.completeness === "incomplete" ||
+        ["vague", "unreasonable"].includes(assessment.reasonableness);
+      const contentUnknown = assessment.completeness === "undetermined" ||
+        assessment.reasonableness === "undetermined";
+      const contentCell = contentBad
+        ? { kind: "warn", note: "內容需補強" }
+        : contentUnknown
+          ? { kind: "undet", note: "無法判定" }
+          : { kind: "ok", note: "內容完整" };
+      const stageColumn = report.workflow_stage === "proposal" ? "prop" : "golive";
+      row.cells[stageColumn] = contentCell;
+
+      if (["contradicted", "conflicting_sources"].includes(assessment.conflict_status)) {
+        row.cells.diff = { kind: "warn", note: "佐證有衝突" };
+      } else if (assessment.conflict_status === "consistent") {
+        row.cells.diff = { kind: "ok", note: "一致" };
+      } else {
+        row.cells.diff = { kind: "undet", note: "未知" };
+      }
+
+      if (assessment.evidence_status === "supported") {
+        row.cells.rag = { kind: "ok", note: "有佐證" };
+      } else if (assessment.evidence_status === "unreadable") {
+        row.cells.rag = { kind: "undet", note: "文件無法解析" };
+      } else {
+        row.cells.rag = { kind: "warn", note: assessment.evidence_status === "partial" ? "部分佐證" : "未找到佐證" };
+      }
+      row.refs = (assessment.citations || []).map((citation) =>
+        `${citation.document_id} ${citation.locator_type}:${citation.locator_value}`).join("、");
+    });
 
     const rows = [...rowMap.values()];
     rows.forEach((row) => {
@@ -436,9 +498,10 @@
     const confirmed = state.classify.files.map((f) =>
       state.kinds[f.index] != null ? state.kinds[f.index] : f.kind);
     fd.append("kinds", JSON.stringify(confirmed));
+    fd.append("workflow_stage", state.workflowStage);
     try {
       // SSE 串流：邊審查邊推進度，最後一筆事件帶完整報告。
-      const res = await fetch("/api/review/stream", { method: "POST", body: fd });
+      const res = await fetch("/api/v2/review/stream", { method: "POST", body: fd });
       if (!res.ok || !res.body) {
         let detail = `伺服器錯誤（${res.status}）`;
         try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (_) { /* ignore */ }
@@ -652,11 +715,28 @@
         </div></div>`;
     }).join("");
 
+    const reviewOptions = `<div class="gv-review-options">
+      <label>使用角色
+        <select class="gv-select" data-action="set-role">
+          <option value="proposer"${state.role === "proposer" ? " selected" : ""}>提案者</option>
+          <option value="reviewer"${state.role === "reviewer" ? " selected" : ""}>審查者</option>
+        </select>
+      </label>
+      <label>流程階段
+        <select class="gv-select" data-action="set-stage">
+          <option value="proposal"${state.workflowStage === "proposal" ? " selected" : ""}>提案</option>
+          <option value="acceptance"${state.workflowStage === "acceptance" ? " selected" : ""}>驗收</option>
+          <option value="production"${state.workflowStage === "production" ? " selected" : ""}>正式營運</option>
+        </select>
+      </label>
+    </div>`;
+
     return `<div>
       <h1 class="gv-h1">① 自動分類<span class="light">（可修正）</span></h1>
       <p class="gv-lead">分類依工作表名稱判定，屬確定性規則。請逐一確認；標記為「重複」或「無法辨識」的項目特別需要你的判斷。</p>
       ${renderError()}
       <div class="gv-chips">${chips.join("")}</div>
+      ${reviewOptions}
       <div class="gv-filelist">${rows}</div>
       <div class="row-split">
         <button class="btn-ghost" data-action="goto" data-step="1">←　返回上傳</button>
@@ -702,7 +782,7 @@
 
   // Hero：徽章＋標題＋受審對象＋結論條 + tiles（固有風險 / 錯誤 / 待確認項 / 無異常項）。
   function renderSummary(r, m) {
-    const passed = r.passed;
+    const passed = r.decision_status === "approved";
     const barColor = passed ? "var(--ok)" : "var(--err-fg)";
     const { attention, total, primaryCause } = m.stats;
     const clean = total - attention;
@@ -727,7 +807,7 @@
     // 跨表不一致）進 m.others、AI 判讀降級進 m.notices；任一非空都代表待處理，不可顯示綠色「無需確認」
     // （否則會與同一卡片內紅色「✕ 待處理」徽章及非零錯誤 tile 自相矛盾）。
     const otherCount = m.others.length;
-    const needsAction = attention > 0 || r.error_count > 0 || otherCount > 0 || m.notices.length > 0;
+    const needsAction = !passed || attention > 0 || r.error_count > 0 || otherCount > 0 || m.notices.length > 0;
     const parts = [`${r.error_count} 錯誤`];
     if (attention > 0) parts.push(`${attention}/${total} 檢核項需人工確認`);
     if (otherCount > 0) parts.push(`另 ${otherCount} 項其他待處理`);
@@ -815,8 +895,29 @@
   }
 
   function renderMatrixDetailRow(row) {
-    const inner = row.findings.length
+    const unassessed = row.assessment && row.assessment.assessed === false;
+    const assessmentHtml = !row.assessment ? "" : unassessed ? `<div class="gv-mdetail-finding">
+      <div class="gv-mdetail-head">結構化判讀 · 未執行</div>
+      <div class="fbody">
+        <p class="fmsg">此項目未取得模型判讀結果（判讀未執行或回應缺漏），狀態非合規結論，請人工覆核。</p>
+      </div>
+    </div>` : `<div class="gv-mdetail-finding">
+      <div class="gv-mdetail-head">結構化判讀 · 信心 ${Math.round((row.assessment.confidence || 0) * 100)}%</div>
+      <div class="fbody">
+        <p class="fmsg">完整性：${esc(row.assessment.completeness)}<br>
+          合理性：${esc(row.assessment.reasonableness)}<br>
+          佐證：${esc(row.assessment.evidence_status)}<br>
+          衝突：${esc(row.assessment.conflict_status)}</p>
+        ${(row.assessment.recommendations || []).length
+          ? `<p class="fmsg"><strong>修改建議</strong><br>${row.assessment.recommendations.map(esc).join("<br>")}</p>`
+          : ""}
+      </div>
+    </div>`;
+    const findingsHtml = row.findings.length
       ? row.findings.map(matrixDetailFindingHtml).join('<div class="gv-mdetail-sep"></div>')
+      : "";
+    const inner = assessmentHtml || findingsHtml
+      ? [assessmentHtml, findingsHtml].filter(Boolean).join('<div class="gv-mdetail-sep"></div>')
       : `<div class="gv-mdetail-empty">此項次無個別 finding；狀態來自彙整表判讀。</div>`;
     const refsLine = row.refs ? `<div class="gv-mdetail-refs">條文引用：${esc(row.refs)}</div>` : "";
     return `<tr class="gv-matrix-detail"><td colspan="8">${inner}${refsLine}</td></tr>`;
@@ -941,11 +1042,31 @@
       ${renderNotices(m)}
       ${renderOthers(m)}
       ${renderMatrix(m)}
+      ${renderReviewerMeta(r)}
       ${renderReference(r, m)}
       <div class="row-split" style="padding-top:22px;border-top:1px solid var(--border);">
         <button class="btn-ghost" data-action="reset">↻　審查新的送件包</button>
         <button class="btn-download" data-action="download">⬇ 下載 Markdown 報告</button>
       </div></div>`;
+  }
+
+  function renderReviewerMeta(r) {
+    if (state.role !== "reviewer") return "";
+    const usage = r.usage_summary || {};
+    const meta = r.review_run_meta || {};
+    const documents = r.document_statuses || [];
+    const prompts = meta.prompt_refs || [];
+    return `<div class="gv-review-meta">
+      <h2 class="gv-h2">審查執行資訊</h2>
+      <div class="gv-meta-grid">
+        <div><strong>判定</strong><span>${esc(r.decision_status || "—")}</span></div>
+        <div><strong>流程階段</strong><span>${esc(r.workflow_stage || "—")}</span></div>
+        <div><strong>模型呼叫</strong><span>主要 ${usage.review_llm_primary_calls || 0}／升級 ${usage.review_llm_escalation_calls || 0}</span></div>
+        <div><strong>Token</strong><span>輸入 ${usage.input_tokens || 0}／輸出 ${usage.output_tokens || 0}</span></div>
+        <div><strong>文件解析</strong><span>${documents.map((doc) => `${doc.document_id}:${doc.status}`).join("、") || "無佐證文件"}</span></div>
+        <div><strong>Prompt 版本</strong><span>${prompts.map((prompt) => `${prompt.prompt_id}@${prompt.prompt_version}`).join("、") || "未執行"}</span></div>
+      </div>
+    </div>`;
   }
 
   function renderOverlay() {
@@ -1007,9 +1128,12 @@
   });
 
   app.addEventListener("change", (e) => {
-    const el = e.target.closest("[data-action='set-kind']");
+    const el = e.target.closest("[data-action]");
     if (!el) return;
-    state.kinds[Number(el.dataset.index)] = el.value;
+    if (el.dataset.action === "set-kind") state.kinds[Number(el.dataset.index)] = el.value;
+    else if (el.dataset.action === "set-role") state.role = el.value;
+    else if (el.dataset.action === "set-stage") state.workflowStage = el.value;
+    else return;
     render();
   });
 

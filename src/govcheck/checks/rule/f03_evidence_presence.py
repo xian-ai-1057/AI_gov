@@ -6,10 +6,14 @@
 
 from __future__ import annotations
 
-from govcheck.models import F03Checklist, Finding, Severity
+from govcheck.models import F03Checklist, Finding, Severity, WorkflowStage
 
 
-def run_all(form: F03Checklist, cfg: dict | None = None) -> list[Finding]:  # noqa: ARG001 - 對齊 Check 介面
+def run_all(
+    form: F03Checklist,
+    cfg: dict | None = None,
+    workflow_stage: WorkflowStage = WorkflowStage.PROPOSAL,
+) -> list[Finding]:  # noqa: ARG001 - 對齊 Check 介面
     findings: list[Finding] = []
     if form is None or not form.sheet_present:
         return findings
@@ -28,7 +32,7 @@ def run_all(form: F03Checklist, cfg: dict | None = None) -> list[Finding]:  # no
                 expected="提案規劃階段佐證",
                 actual="空白",
             ))
-        if not item.evidence_golive:
+        if workflow_stage is not WorkflowStage.PROPOSAL and not item.evidence_golive:
             findings.append(Finding(
                 severity=Severity.INFO,
                 code="F03.EVIDENCE_MISSING_GOLIVE",

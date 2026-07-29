@@ -196,7 +196,9 @@ def test_rag_enabled_f03_findings_appear(monkeypatch) -> None:
     )], sheet_present=True)
     sub = Submission(presence=FilePresence(f03=True), f03_checklist=checklist)
 
-    out = engine._run_rag_checks(sub, enable_llm=True)
+    # include_f03 已改為預設 False（F03 語意判讀由統一 assessment 負責）；
+    # 這批測試針對舊版 F03 RAG 分支，須明確 opt-in 才會執行。
+    out = engine._run_rag_checks(sub, enable_llm=True, include_f03=True)
     codes = {f.code for f in out}
     assert "F03.RAG_GAP" in codes
     assert "F03.RAG_TABLE" in codes
@@ -219,7 +221,7 @@ def test_rag_client_uses_rag_timeout(monkeypatch) -> None:
     )], sheet_present=True)
     sub = Submission(presence=FilePresence(f03=True), f03_checklist=checklist)
 
-    engine._run_rag_checks(sub, enable_llm=True)
+    engine._run_rag_checks(sub, enable_llm=True, include_f03=True)
     assert captured.get("timeout") == 120.0
 
 
@@ -330,7 +332,7 @@ def test_never_raise_on_client_construction_failure(monkeypatch) -> None:
     )], sheet_present=True)
     sub = Submission(presence=FilePresence(f03=True), f03_checklist=checklist)
 
-    out = engine._run_rag_checks(sub, enable_llm=True)
+    out = engine._run_rag_checks(sub, enable_llm=True, include_f03=True)
     assert [f.code for f in out] == ["RAG.SKIPPED"]
 
 

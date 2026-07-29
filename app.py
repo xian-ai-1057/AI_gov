@@ -23,7 +23,7 @@ from govcheck.classify import (
 )
 from govcheck.llm.config import load_llm_config
 from govcheck.logging_setup import get_logger, new_request_id, set_request_id, setup_logging
-from govcheck.models import Severity
+from govcheck.models import Severity, WorkflowStage
 from govcheck.report.builder import ICON, LABEL, to_markdown
 from govcheck.review.engine import review_routed
 
@@ -39,6 +39,13 @@ st.warning("⚠️ 本工具產出為 **AI 初判草稿**，需治理人員與�
 
 # ── 側欄：F03 佐證 LLM 判讀（預設關；端點不可用時自動降級，不影響規則檢查）──────────
 with st.sidebar:
+    role = st.radio("使用角色", ["提案者", "審查者"], horizontal=True)
+    stage_label = st.selectbox("審查階段", ["提案規劃", "上線驗收", "正式營運"])
+    workflow_stage = {
+        "提案規劃": WorkflowStage.PROPOSAL,
+        "上線驗收": WorkflowStage.ACCEPTANCE,
+        "正式營運": WorkflowStage.PRODUCTION,
+    }[stage_label]
     st.header("🤖 LLM 佐證審查（F03）")
     _llm_cfg = load_llm_config()
     use_llm = st.toggle(
@@ -103,10 +110,10 @@ set_request_id(new_request_id())  # 單機模式也給 request_id，串連 ops/a
 report = None
 with tempfile.TemporaryDirectory() as tmpdir:
     confirmed: list[FileClassification] = []
-    for u, label in zip(ups, confirmed_labels):
+    for index, (u, label) in enumerate(zip(ups, confirmed_labels)):
         if label == _IGNORE:
             continue
-        dest = Path(tmpdir) / u.name
+        dest = Path(tmpdir) / f"{index}_{Path(u.name).name}"
         dest.write_bytes(u.getvalue())
         confirmed.append(FileClassification(
             path=str(dest), filename=u.name, kind=_LABEL_TO_KIND[label], reason="使用者確認/修正",
@@ -118,10 +125,21 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
     try:
         files, supporting, class_findings = route_classifications(confirmed)
-        report = review_routed(files, supporting, class_findings, enable_llm=use_llm)
+        supporting_paths = [
+            item.path for item in confirmed
+            if item.kind is FileKind.SUPPORTING and item.path is not None
+        ]
+        report = review_routed(
+            files,
+            supporting,
+            class_findings,
+            enable_llm=use_llm,
+            supporting_paths=supporting_paths,
+            workflow_stage=workflow_stage,
+        )
     except Exception as exc:  # noqa: BLE001 - 介面層需把解析錯誤友善呈現
-        log.exception("review failed")  # 完整堆疊寫檔（地端，不外送）
-        st.error(f"解析或審查失敗：{exc}")
+        log.error("review failed err=%s", type(exc).__name__)
+        st.error(f"解析或審查失敗：{type(exc).__name__}")
         st.stop()
 
 # ── 步驟 3：報告（沿用既有摘要 / 明細 / 下載）─────────────────────────────
@@ -131,7 +149,13 @@ st.subheader("③ 審查報告")
 cols = st.columns(4 if report.risk_grade else 3)
 cols[0].metric("🔴 錯誤", report.error_count)
 cols[1].metric("🟡 提醒", report.warn_count)
-cols[2].metric("結果", "✅ 規則通過" if report.passed else "❌ 待處理")
+_decision_label = {
+    "approved": "✅ 可進下一步",
+    "changes_required": "❌ 需補正",
+    "manual_review": "👤 待人工覆核",
+    "incomplete": "⚠️ 審查未完成",
+}[report.decision_status.value]
+cols[2].metric("結果", _decision_label)
 if report.risk_grade:
     _pct = f" · {report.risk_score:.0f}%" if report.risk_score is not None else ""
     cols[3].metric("固有風險分級", f"{report.risk_grade}{_pct}")
@@ -146,6 +170,37 @@ for f in report.findings:
             st.write(f"**期望**：{f.expected or '—'}　**實際**：{f.actual or '—'}")
         st.write(f"**說明**：{f.message}")
         st.caption(f"代碼 `{f.code}` · 需人工覆核")
+
+if report.item_assessments:
+    st.subheader("F03 分項評估")
+    for assessment in report.item_assessments:
+        with st.expander(f"項次 {assessment.item_id} · {assessment.profile}"):
+            st.write(
+                f"完整性：{assessment.completeness}　|　"
+                f"合理性：{assessment.reasonableness}　|　"
+                f"佐證：{assessment.evidence_status.value}　|　"
+                f"衝突：{assessment.conflict_status.value}"
+            )
+            for recommendation in assessment.recommendations:
+                st.write(f"- {recommendation}")
+            for citation in assessment.citations:
+                st.caption(
+                    f"引用 {citation.document_id} · {citation.locator_type} "
+                    f"{citation.locator_value}"
+                )
+
+if role == "審查者":
+    with st.expander("審查執行資訊"):
+        st.json({
+            "workflow_stage": report.review_run_meta.workflow_stage.value,
+            "decision_status": report.decision_status.value,
+            "usage": report.usage_summary.model_dump(mode="json"),
+            "prompt_refs": [row.model_dump(mode="json") for row in report.review_run_meta.prompt_refs],
+            "documents": [
+                row.model_dump(mode="json", exclude={"source_units"})
+                for row in report.document_statuses
+            ],
+        })
 
 st.divider()
 # 專案名稱可能含 "/"（欄名即「專案/服務名稱」），清洗避免瀏覽器把它當路徑分隔

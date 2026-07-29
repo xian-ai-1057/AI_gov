@@ -30,7 +30,7 @@ from pydantic import ValidationError
 from govcheck.checks.llm import f03_rag
 from govcheck.llm.client import LLMError
 from govcheck.logging_setup import load_log_config, setup_logging
-from govcheck.models import F03Checklist, F03ChecklistItem
+from govcheck.models import F03Checklist, F03ChecklistItem, Severity
 from govcheck.rag.models import (
     F03ItemRetrieval,
     F03RagBatchResponse,
@@ -621,3 +621,25 @@ def test_gap_refs_no_intersection_falls_back_to_all_canonical():
     # fallback：兩條 canonical 都列
     assert "R03 五、(二) 2" in gap_finding.message
     assert "R07 五、(二) 2" in gap_finding.message
+
+
+def test_rag_judging_fails_closed_without_prompt_source(monkeypatch):
+    """無 Prompt 來源 → 不得對端點送出「只有資料、沒有判讀準則」的請求。"""
+    monkeypatch.setattr(f03_rag, "LEGACY_INSTRUCTIONS", "")
+
+    calls = []
+
+    class _SpyClient:
+        def chat(self, messages, **kw):
+            calls.append(messages)
+            return "{}"
+
+    checklist = F03Checklist(items=[F03ChecklistItem(
+        item_id="1-1", topic="公平性", evidence_proposal="P", evidence_golive="G",
+    )], sheet_present=True)
+
+    findings = f03_rag.run_all(checklist, _make_retrieval_map(), _SpyClient(), DEFAULT_CFG)
+
+    assert calls == []  # 完全沒有呼叫端點
+    assert [f.code for f in findings] == ["F03.RAG_DISABLED"]
+    assert findings[0].severity is Severity.INFO

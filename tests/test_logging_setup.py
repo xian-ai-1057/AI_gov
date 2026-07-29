@@ -9,7 +9,6 @@ import json
 import logging
 from pathlib import Path
 
-import govcheck.logging_setup as logging_setup
 from govcheck.logging_setup import (
     audit,
     dev_mode,
@@ -125,10 +124,25 @@ def test_audit_line_is_json_with_fields():
     audit("review_done", subject="系統A", filing_unit="風控部", error=2, warn=3, passed=False)
     rec = json.loads(_audit_lines()[-1])
     assert rec["event"] == "review_done"
+    # 識別資訊必須留在稽核軌跡：少了它就無法回溯這筆對應哪一份送件（CLAUDE.md 規範）。
     assert rec["subject"] == "系統A"
     assert rec["filing_unit"] == "風控部"
     assert rec["error"] == 2 and rec["warn"] == 3 and rec["passed"] is False
     assert "request_id" in rec and "operator" in rec
+
+
+def test_audit_drops_content_bearing_fields_and_warns():
+    """夾帶內文的欄位要被擋下，且不可靜默——ops log 必須留下被丟棄的欄位名。"""
+    setup_logging()
+    audit("review_done", subject="系統A", evidence_text="佐證全文", prompt_body="機密 prompt")
+    rec = json.loads(_audit_lines()[-1])
+    assert rec["subject"] == "系統A"
+    assert "evidence_text" not in rec and "prompt_body" not in rec
+    assert "佐證全文" not in json.dumps(rec, ensure_ascii=False)
+    ops = _ops_log_text()
+    assert "audit fields dropped" in ops
+    assert "evidence_text" in ops and "prompt_body" in ops
+    assert "佐證全文" not in ops  # 只記欄位名，不記被丟棄的值
 
 
 # ── request_id 串連 ────────────────────────────────────────────────────────
@@ -176,18 +190,12 @@ def test_dev_mode_gate(monkeypatch):
     assert dev_mode() is False
 
 
-def test_dump_llm_raw_writes_full_content_in_dev(monkeypatch):
+def test_dump_llm_raw_noop_in_dev(monkeypatch):
     monkeypatch.setenv("GOVCHECK_LOG_PROFILE", "dev")
     set_request_id("rid12345")
     full_resp = "壞掉的回應" * 500  # 遠超終端截斷長度
-    path = dump_llm_raw({"status": "ok", "response_text": full_resp})
-    assert path is not None
-    files = _llm_raw_files()
-    assert len(files) == 1
-    rec = json.loads(files[0].read_text(encoding="utf-8"))
-    assert rec["response_text"] == full_resp        # 檔案存「完整」內容
-    assert rec["request_id"] == "rid12345"          # 依 request_id 可對回
-    assert "rid12345" in files[0].name
+    assert dump_llm_raw({"status": "ok", "response_text": full_resp}) is None
+    assert _llm_raw_files() == []
 
 
 def test_dump_llm_raw_noop_in_non_dev(monkeypatch):
@@ -199,10 +207,9 @@ def test_dump_llm_raw_noop_in_non_dev(monkeypatch):
 
 def test_dump_llm_raw_retention_cap(monkeypatch):
     monkeypatch.setenv("GOVCHECK_LOG_PROFILE", "dev")
-    monkeypatch.setattr(logging_setup, "_LLM_RAW_KEEP", 3)  # 縮小上限便於測試
     for i in range(8):
         dump_llm_raw({"status": "ok", "seq": i})
-    assert len(_llm_raw_files()) == 3               # 只保留最新 3 個，其餘刪除
+    assert _llm_raw_files() == []
 
 
 def test_dump_llm_raw_swallows_non_serializable(monkeypatch):

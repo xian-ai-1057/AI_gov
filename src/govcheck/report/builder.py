@@ -12,6 +12,12 @@ _LABEL = LABEL
 
 
 def to_markdown(report: ReviewReport) -> str:
+    decision = {
+        "approved": "✅ 可進下一步",
+        "changes_required": "❌ 需補正",
+        "manual_review": "👤 待人工覆核",
+        "incomplete": "⚠️ 審查未完成",
+    }[report.decision_status.value]
     lines = [
         f"# {report.form_type} 初步審查報告",
         "",
@@ -19,13 +25,49 @@ def to_markdown(report: ReviewReport) -> str:
         "",
         f"**受審對象**：{report.subject or '（未標示）'}　|　"
         f"**錯誤 {report.error_count}**　提醒 {report.warn_count}　"
-        f"結果：{'✅ 規則檢查通過' if report.passed else '❌ 有須處理項目'}",
+        f"結果：{decision}",
         "",
     ]
     if report.risk_grade:
         pct = f"（{report.risk_score:.1f}%）" if report.risk_score is not None else ""
         lines.append(f"**固有風險分級**：{report.risk_grade}{pct}")
         lines.append("")
+    if report.item_assessments:
+        lines += [
+            "## F03 分項評估",
+            "",
+            "| 項次 | Profile | 完整性 | 合理性 | 佐證 | 衝突 | 信心 | 引用位置 |",
+            "| --- | --- | --- | --- | --- | --- | ---: | --- |",
+        ]
+        for row in report.item_assessments:
+            refs = "、".join(
+                f"{citation.document_id} {citation.locator_type}:{citation.locator_value}"
+                for citation in row.citations
+            ) or "—"
+            values = [
+                row.item_id,
+                row.profile,
+                row.completeness,
+                row.reasonableness,
+                row.evidence_status.value,
+                row.conflict_status.value,
+                f"{row.confidence:.2f}",
+                refs,
+            ]
+            lines.append("| " + " | ".join(_table_cell(value) for value in values) + " |")
+        lines.append("")
+        recommendations = [
+            (row.item_id, recommendation)
+            for row in report.item_assessments
+            for recommendation in row.recommendations
+        ]
+        if recommendations:
+            lines += ["### 修改建議", ""]
+            lines.extend(
+                f"- **{item_id}**：{recommendation}"
+                for item_id, recommendation in recommendations
+            )
+            lines.append("")
     lines += ["---", ""]
     for i, f in enumerate(report.findings, 1):
         lines.append(f"### {i}. {_ICON[f.severity]} [{_LABEL[f.severity]}] {f.title}")
@@ -44,3 +86,7 @@ def to_markdown(report: ReviewReport) -> str:
         lines.append(f"- **代碼**：`{f.code}`　_(需人工覆核)_")
         lines.append("")
     return "\n".join(lines)
+
+
+def _table_cell(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")

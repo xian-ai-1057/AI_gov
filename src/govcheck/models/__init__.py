@@ -1,6 +1,20 @@
 from govcheck.models.f01 import F01ApplicationRow, F01Form, F01SubRef
 from govcheck.models.f02 import Answer, CachedScores, DomainScores, F02Form
 from govcheck.models.f03 import F03Checklist, F03ChecklistItem, F03Identity
+from govcheck.models.evidence import (
+    Citation,
+    ConflictStatus,
+    DecisionStatus,
+    DocumentArtifact,
+    DocumentParseStatus,
+    EvidenceStatus,
+    F03ItemAssessment,
+    PromptRunRef,
+    ReviewRunMeta,
+    SourceUnit,
+    UsageSummary,
+    WorkflowStage,
+)
 from govcheck.models.finding import Finding, ReviewReport, Severity
 from govcheck.models.submission import FilePresence, Submission
 
@@ -15,6 +29,18 @@ __all__ = [
     "F03Checklist",
     "F03ChecklistItem",
     "F03Identity",
+    "Citation",
+    "ConflictStatus",
+    "DecisionStatus",
+    "DocumentArtifact",
+    "DocumentParseStatus",
+    "EvidenceStatus",
+    "F03ItemAssessment",
+    "PromptRunRef",
+    "ReviewRunMeta",
+    "SourceUnit",
+    "UsageSummary",
+    "WorkflowStage",
     "FilePresence",
     "Finding",
     "ReviewReport",

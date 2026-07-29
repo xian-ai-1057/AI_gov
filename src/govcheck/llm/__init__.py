@@ -4,7 +4,7 @@
 不含任何治理判讀邏輯；判讀邏輯放 checks/llm/。資料只送至設定端點，不外送公有雲。
 """
 
-from govcheck.llm.client import ChatClient, LLMError, parse_json_object
+from govcheck.llm.client import ChatClient, ChatResult, LLMError, parse_json_object
 from govcheck.llm.config import load_llm_config
 
-__all__ = ["ChatClient", "LLMError", "load_llm_config", "parse_json_object"]
+__all__ = ["ChatClient", "ChatResult", "LLMError", "load_llm_config", "parse_json_object"]

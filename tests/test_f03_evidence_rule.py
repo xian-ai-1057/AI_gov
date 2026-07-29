@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from govcheck.checks.rule import f03_evidence_presence
-from govcheck.models import F03Checklist, F03ChecklistItem, Severity
+from govcheck.models import F03Checklist, F03ChecklistItem, Severity, WorkflowStage
 
 
 def _item(**kw) -> F03ChecklistItem:
@@ -27,11 +27,19 @@ def test_done_but_proposal_blank_warns():
 
 def test_done_but_golive_blank_is_info():
     cl = F03Checklist(items=[_item(check_state="是", evidence_proposal="具體佐證說明", evidence_golive=None)])
-    fs = f03_evidence_presence.run_all(cl)
+    fs = f03_evidence_presence.run_all(cl, workflow_stage=WorkflowStage.ACCEPTANCE)
     assert "F03.EVIDENCE_MISSING_GOLIVE" in _codes(fs)
     assert "F03.EVIDENCE_MISSING_PROPOSAL" not in _codes(fs)
     info = next(f for f in fs if f.code == "F03.EVIDENCE_MISSING_GOLIVE")
     assert info.severity is Severity.INFO
+
+
+def test_proposal_stage_does_not_require_golive():
+    cl = F03Checklist(items=[_item(
+        check_state="是", evidence_proposal="具體佐證說明", evidence_golive=None
+    )])
+    fs = f03_evidence_presence.run_all(cl, workflow_stage=WorkflowStage.PROPOSAL)
+    assert "F03.EVIDENCE_MISSING_GOLIVE" not in _codes(fs)
 
 
 def test_done_with_both_filled_is_clean():

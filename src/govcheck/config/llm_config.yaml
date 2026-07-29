@@ -2,19 +2,26 @@
 # 僅放「非機密」預設值；api_key 一律由環境變數 GOVCHECK_LLM_API_KEY 提供，禁止寫入本檔、禁止入庫。
 # 環境變數可覆寫任一鍵：GOVCHECK_LLM_ENABLED / _BASE_URL / _MODEL / _API_KEY / _TIMEOUT / _TEMPERATURE / _MAX_ITEMS / _BATCH_SIZE
 
-enabled: true                        # 預設開啟；設 GOVCHECK_LLM_ENABLED=0 可關閉
+enabled: false                       # 預設關閉；正式 Prompt 與核准模型都就緒後再開啟
 base_url: http://localhost:11434/v1  # 本機 ollama（OpenAI 相容）；內部端點請以環境變數覆寫
 model: gemma3:4b                     # 本機 ollama 範例模型；請依實際部署以 GOVCHECK_LLM_MODEL 覆寫
 timeout: 60                          # 單次請求逾時（秒）
 temperature: 0                       # 判讀求穩定，預設 0
 max_items: 30                        # 單次審查送 LLM 的檢核項上限（安全閥；F03 實際約 20 項）
-batch_size: 8                        # 單次 LLM 呼叫送審的檢核項數（批次以減少呼叫；小模型上下文安全閥）
+max_output_tokens: 4096              # 由應用程式控制，不採用 Prompt Manager 的 optional params
+batch_size: 8                        # 舊版檢查相容值；新版依 profile 與 token budget 動態組批
+prompt_provider: disabled            # disabled / litellm；正式 Prompt 不存放在 Git
+prompt_base_url: null                # LiteLLM Prompt Management base URL
+prompt_label: production             # 每次 review 開始時解析並固定成版本
+evidence_embedding_enabled: false    # 開啟後每個 review 以單次 embedding 請求做混合檢索
+evidence_lexical_weight: 0.7         # BM25-like 權重；其餘為 cosine embedding 權重
+evidence_top_k: 4                    # 每個 F03 項目最多送入模型的佐證片段數
 
 # Phase 3 RAG 法規比對（一體啟停；實際啟用 = enable_llm AND rag.enabled）。
 # 缺此區段時 load_rag_config() 全用硬碼預設，行為一致。機密（EMBEDDING_API_KEY / MILVUS_TOKEN）只走環境變數。
 # 環境變數可覆寫任一鍵：GOVCHECK_RAG_ENABLED / _MAPPING_PATH / _BATCH_SIZE / _MAX_SECTIONS_PER_ITEM / _MAX_EXCERPT_CHARS / _TIMEOUT / _MAX_ITEMS ...
 rag:
-  enabled: true                      # 預設開啟；設 GOVCHECK_RAG_ENABLED=0 可關閉（需 enable_llm 同時為真才生效）
+  enabled: false                     # 舊 RAG 檢查預設關閉；F03 已由統一 assessment 取代
   mapping_path: data/rag/retrieval_map.json  # build-time 產物（gitignored；runtime 只讀查表）
   batch_size: 2                      # RAG 判讀批次（canonical 摘錄使 prompt 較長，保守起步）
   max_sections_per_item: 3           # 每檢核項最多引用條文段數

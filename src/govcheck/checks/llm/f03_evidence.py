@@ -20,28 +20,13 @@ from govcheck.models import F03Checklist, F03ChecklistItem, Finding, Severity
 
 log = get_logger("f03_llm")
 
-_SYSTEM = (
-    "你是台新銀行 AI 治理審查助理，協助治理人員做初步審查。"
-    "請嚴格只輸出符合指定格式的 JSON，不要輸出任何多餘文字或說明。所有判讀僅供人工初步參考。"
-)
+# 正式 Prompt 已移轉至 PromptGateway（govcheck.f03.*），本模組是舊版相容路徑，
+# 不再內含任何指示文字。空字串 = fail closed：絕不對端點送出「只有資料、沒有判讀
+# 準則」的請求。測試以 monkeypatch 注入合成指示驗證解析邏輯（見 tests/conftest.py）。
+LEGACY_INSTRUCTIONS: str = ""
 
-_USER_TEMPLATE = """以下是 AI 系統上線檢核表中的多個檢核項，每項附「提案規劃階段佐證」與「上線階段佐證」。請逐項依準則判讀並「只輸出一個 JSON 物件」。
-
-判讀準則：
-1) difference：比較該項「提案規劃階段佐證」與「上線階段佐證」是否存在實質差異；上線階段（依表格要求）應列出與提案的差異。若上線階段為空、或僅複述提案而未說明差異、或內容與提案有實質出入卻未交代，flag 設 true，summary 用一句繁體中文說明。
-2) proposal：判斷該項「提案規劃階段佐證」是否過於草率或不明確（例如僅「已完成」「OK」「無」「同上」等空泛字眼、或與檢查項目無實質對應）。vague 為 true 時，reason 用一句繁體中文說明。
-3) golive：以同樣準則判斷該項「上線階段佐證」。
-
-每個檢核項都要在 results 陣列回一筆，並以 item_id 對應；除指定 JSON 外不要輸出任何文字。
-
-輸出格式（僅此一個 JSON 物件）：
-{{"results":[{{"item_id":"<項次>","difference":{{"flag":false,"summary":""}},"proposal":{{"vague":false,"reason":""}},"golive":{{"vague":false,"reason":""}}}}]}}
-
-【待判讀檢核項（JSON）】
-{items_json}"""
-
-
-# 結構化輸出 schema：與 _USER_TEMPLATE 的輸出格式一致，供 client 以 json_schema（strict）模式約束回應。
+# Legacy response schema retained for compatibility tests. Production review uses
+# PromptGateway + f03_assessment; no production prompt text lives in this module.
 # strict 要求每層物件都 additionalProperties=False，且所有欄位列入 required。
 _VERDICT_DETAIL = {
     "difference": {"flag": "boolean", "summary": "string"},
@@ -97,6 +82,17 @@ def run_all(
     """
     if client is None or form is None or not form.sheet_present:
         return []
+
+    if not LEGACY_INSTRUCTIONS:
+        log.info("f03 evidence judging disabled: no prompt source configured")
+        return [Finding(
+            severity=Severity.INFO,
+            code="F03.LLM_SKIPPED",
+            title="LLM 佐證審查已略過",
+            message=("本版本的舊版佐證判讀未設定判讀 Prompt 來源，已略過（未呼叫任何端點）；"
+                     "F03 語意判讀改由統一 assessment 流程負責，其餘規則檢查不受影響。"),
+            source="llm",
+        )]
 
     targets = [it for it in form.items if it.evidence_proposal or it.evidence_golive]
     if not targets:
@@ -221,11 +217,11 @@ def _judge_batch(client: ChatClient, chunk: list[F03ChecklistItem]) -> dict[str,
         }
         for it in chunk
     ]
+    if not LEGACY_INSTRUCTIONS:  # run_all 已擋下；此處為第二道防線，避免任何直接呼叫繞過
+        raise LLMError("F03 佐證判讀未設定 Prompt 來源，拒絕送出無指示的請求")
     messages = [
-        {"role": "system", "content": _SYSTEM},
-        {"role": "user", "content": _USER_TEMPLATE.format(
-            items_json=json.dumps(payload_items, ensure_ascii=False, indent=2),
-        )},
+        {"role": "system", "content": LEGACY_INSTRUCTIONS},
+        {"role": "user", "content": json.dumps(payload_items, ensure_ascii=False)},
     ]
     obj = parse_json_object(client.chat(messages, schema=_VERDICT_SCHEMA))
     results = obj.get("results")

@@ -27,29 +27,11 @@ from govcheck.rag.models import F03ItemRetrieval, RagConfig, RetrievalMap
 
 log = get_logger("f03_rag")
 
-_SYSTEM = (
-    "你是台新銀行 AI 治理審查助理，協助治理人員做初步 F03 上線檢核表符合性判讀。"
-    "請嚴格只輸出符合指定格式的 JSON，不要輸出任何多餘文字或說明。所有判讀僅供人工初步參考。"
-)
-
-_USER_TEMPLATE = """以下是 AI 系統上線檢核表中的多個檢核項，每項附「canonical 法規條文摘錄」（審查基準）、「提案規劃階段佐證」及「上線階段佐證」（提案單位填寫）。
-
-【判讀準則】
-請逐項判斷：該項兩段佐證（提案規劃 + 上線）合計，是否已充分涵蓋 canonical 條文摘錄所要求的治理事項。
-
-verdict 只能填下列三個值之一：
-- "covered"：佐證已充分涵蓋條文要求，無明顯缺口。
-- "gap"：佐證存在缺口，未涵蓋條文要求。gap_refs 請從 canonical 摘錄中識別並填寫缺口對應條號（如 "R03 五、(二) 2"）。
-- "undetermined"：佐證資訊不足或語意模糊，無法判定。
-
-reason 請用一句繁體中文說明判讀依據。
-每個檢核項都要在 results 陣列回一筆，以 item_id 對應；除指定 JSON 外不要輸出任何文字。
-
-輸出格式（僅此一個 JSON 物件）：
-{{"results":[{{"item_id":"<項次>","verdict":"covered|gap|undetermined","gap_refs":[],"reason":""}}]}}
-
-【待判讀檢核項（JSON）】
-{items_json}"""
+# 正式 Prompt 已移轉至 PromptGateway（govcheck.f03.*），本模組是舊版相容路徑，
+# 不再內含任何指示文字。空字串 = fail closed：絕不對端點送出「只有資料、沒有判讀
+# 準則」的請求（那只會換回無意義輸出）。測試以 monkeypatch 注入合成指示驗證解析
+# 邏輯（見 tests/conftest.py），與新版 StaticPromptProvider 的作法一致。
+LEGACY_INSTRUCTIONS: str = ""
 
 # 連續這麼多「批」呼叫失敗 → 研判端點系統性異常，中止後續（鏡射 f03_evidence）
 _MAX_CONSECUTIVE_ERRORS = 3
@@ -90,6 +72,17 @@ def _run_all_inner(
 ) -> list[Finding]:
     if client is None or checklist is None or not checklist.sheet_present:
         return []
+
+    if not LEGACY_INSTRUCTIONS:
+        log.info("f03 rag judging disabled: no prompt source configured")
+        return [Finding(
+            severity=Severity.INFO,
+            code="F03.RAG_DISABLED",
+            title="RAG 符合性判讀未啟用",
+            message=("本版本的 RAG 符合性判讀未設定判讀 Prompt 來源，已略過（未呼叫任何端點）；"
+                     "F03 語意判讀改由統一 assessment 流程負責，其餘規則檢查不受影響。"),
+            source="llm",
+        )]
 
     # 目標項 = 有兩段佐證之一 且 retrieval_map 有 canonical 對應；無則回空（不產摘要噪音）
     targets = [
@@ -333,7 +326,7 @@ def _build_chunks(
 ) -> list[list[tuple[F03ChecklistItem, dict]]]:
     """依 batch_size 組批；估算超過 prompt 預算的批自動降為單項批（log 只記數字）。"""
     size = max(1, int(cfg.batch_size))
-    template_overhead = _estimate_tokens(_SYSTEM + _USER_TEMPLATE)
+    template_overhead = _estimate_tokens(LEGACY_INSTRUCTIONS)
     est = {id(p): _estimate_tokens(json.dumps(p, ensure_ascii=False)) for _, p in prepared}
 
     chunks: list[list[tuple[F03ChecklistItem, dict]]] = []
@@ -359,11 +352,11 @@ def _judge_batch(
 ) -> dict[str, dict]:
     """送一批給 LLM，回傳 {item_id: 原始 result dict}；失敗或格式異常丟 LLMError。"""
     payload_items = [payload for _, payload in chunk]
+    if not LEGACY_INSTRUCTIONS:  # run_all 已擋下；此處為第二道防線，避免任何直接呼叫繞過
+        raise LLMError("F03 RAG 判讀未設定 Prompt 來源，拒絕送出無指示的請求")
     messages = [
-        {"role": "system", "content": _SYSTEM},
-        {"role": "user", "content": _USER_TEMPLATE.format(
-            items_json=json.dumps(payload_items, ensure_ascii=False, indent=2),
-        )},
+        {"role": "system", "content": LEGACY_INSTRUCTIONS},
+        {"role": "user", "content": json.dumps(payload_items, ensure_ascii=False)},
     ]
     obj = parse_json_object(client.chat(messages))
     results = obj.get("results")

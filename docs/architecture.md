@@ -16,21 +16,21 @@ flowchart TB
     U["治理人員瀏覽器"] -->|"上傳送件包（多檔）"| WEB
 
     subgraph WEB["介面層 · web/"]
-        API["FastAPI api.py<br/>/api/classify · /api/review · /api/review/stream"]
+        API["FastAPI api.py<br/>/api/classify · /api/v2/review · /api/v2/review/stream"]
         FE["靜態前端<br/>index.html · app.js · styles.css"]
     end
     FE -.->|"零判讀邏輯，純呈現"| API
 
     API --> CLASSIFY["classify/<br/>依工作表名稱判定 F01·F02·F03·佐證"]
-    CLASSIFY --> PARSERS["parsers/<br/>openpyxl + pandas 讀 .xlsx/.xlsm"]
-    PARSERS --> MODELS["models/<br/>F01Form · F02Form · F03Form · Finding"]
+    CLASSIFY --> PARSERS["parsers/<br/>主表 parser + TsParserAdapter"]
+    PARSERS --> MODELS["models/<br/>Form · DocumentArtifact · Assessment · Finding"]
 
     MODELS --> ENGINE["review/engine.py<br/>編排：parse → checks → 彙總"]
 
     subgraph CHECKS["checks/ （規則先跑，LLM 後跑，嚴格分離）"]
         direction TB
         RULE["checks/rule/<br/>缺件 · F01必填 · F02計分規則<br/>跨表一致 · F03佐證存在性 · F02觸發題查表"]
-        LLM["checks/llm/<br/>F03 兩段佐證 LLM 比較<br/>+ RAG 檢索輔助判讀"]
+        LLM["checks/llm/<br/>F03 profile 統一內容／佐證判讀<br/>+ 選擇性 escalation"]
         RULE -.->|"規則結果可影響 LLM 是否需跑"| LLM
     end
     ENGINE --> RULE
@@ -38,8 +38,10 @@ flowchart TB
 
     SCORING["scoring/f02_score.py<br/>還原官方 Excel 計分公式"] --> RULE
 
-    LLM -->|"OpenAI 相容 /chat/completions"| LLMEP[("LLM 端點<br/>本機 ollama 或內部端點")]
-    LLM -->|"只讀查表（JSON，非向量檢索）"| MAPFILE[("data/rag/retrieval_map.json<br/>build-time 產物")]
+    LLM -->|"OpenAI 相容 /chat/completions"| LLMEP[("核准的內部 LLM 端點")]
+    PROMPT["prompts/<br/>Catalog · Gateway · Provider"] -->|"固定 Prompt 版本"| LLM
+    PROMPT --> PM[("LiteLLM-compatible<br/>Prompt Management")]
+    EVIDENCE["evidence/<br/>來源定位 top-k 混合檢索"] --> LLM
 
     RULE --> REPORT["report/builder.py<br/>Finding[] → ReviewReport → Markdown"]
     LLM --> REPORT
@@ -143,7 +145,7 @@ stateDiagram-v2
     [*] --> 上傳送件包
     上傳送件包 --> 確認分類: POST /api/classify
     確認分類 --> 上傳送件包: 返回修改
-    確認分類 --> 審查中: POST /api/review/stream（SSE）
+    確認分類 --> 審查中: 選角色/階段後 POST /api/v2/review/stream（SSE）
     審查中 --> 審查報告: stage="done"
     審查報告 --> 上傳送件包: 審查新的送件包
 
@@ -159,10 +161,9 @@ stateDiagram-v2
 > 圖中「審查中」為簡化表示；實作上 `state.step` 在 SSE 期間仍停在 2，由 `state.reviewing=true`
 > 觸發全螢幕進度覆蓋層，收到 `stage="done"` 才跳到 `state.step=3`。
 
-**報告頁重點**（2026-07 改版，取代舊版 67 筆平鋪列表）：解析 `F03.LLM_TABLE`/`F03.RAG_TABLE`
-兩張彙整表，依**檢核項次**合併成單一狀態總覽表（欄位：項次｜管理議題｜提案佐證｜上線佐證｜
-兩段差異｜法規符合｜摘要），問題列標色、可展開查看完整細節；其餘彙整資訊收合到「彙整參考」，
-內含舊版平鋪列表作為 fallback，保證所有 finding 仍可被檢視。
+**報告頁重點**（2026-07 v2）：以 `item_assessments` 作正式資料來源，依**檢核項次**形成狀態總覽；
+Markdown 彙整表只保留為 v1 fallback。提案者看到缺漏、修改建議與佐證問題，審查者另看到文件狀態、
+Prompt 版本、信心、引用與使用量。
 
 ---
 
@@ -170,4 +171,5 @@ stateDiagram-v2
 
 - [README.md](../README.md) — 安裝、使用流程、環境變數總覽
 - [docs/milvus_migration.md](milvus_migration.md) — Milvus Lite → Milvus Server 遷移
+- [docs/f03_review_v2.md](f03_review_v2.md) — F03 v2、Prompt 與 parser 整合契約
 - `CLAUDE.md`（repo root）— 行為守則、目錄結構權威來源

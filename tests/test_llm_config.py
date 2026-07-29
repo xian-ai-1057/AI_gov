@@ -10,6 +10,9 @@ _ENV_KEYS = [
     "GOVCHECK_LLM_ENABLED", "GOVCHECK_LLM_BASE_URL", "GOVCHECK_LLM_MODEL",
     "GOVCHECK_LLM_API_KEY", "GOVCHECK_LLM_TIMEOUT", "GOVCHECK_LLM_TEMPERATURE",
     "GOVCHECK_LLM_MAX_ITEMS", "GOVCHECK_LLM_BATCH_SIZE",
+    "GOVCHECK_LLM_MAX_OUTPUT_TOKENS",
+    "GOVCHECK_EVIDENCE_EMBEDDING_ENABLED", "GOVCHECK_EVIDENCE_LEXICAL_WEIGHT",
+    "GOVCHECK_EVIDENCE_TOP_K",
 ]
 
 
@@ -25,8 +28,12 @@ def test_defaults_from_yaml():
     assert cfg["timeout"] == 60.0
     assert cfg["temperature"] == 0.0
     assert cfg["max_items"] == 30
+    assert cfg["max_output_tokens"] == 4096
+    assert cfg["evidence_embedding_enabled"] is False
+    assert cfg["evidence_lexical_weight"] == 0.7
+    assert cfg["evidence_top_k"] == 4
     assert cfg["batch_size"] == 8
-    assert cfg["enabled"] is True  # 專案預設已改為開啟（2026-07-07）
+    assert cfg["enabled"] is False  # Prompt provider 與核准模型就緒前預設關閉
     assert cfg["api_key"] is None
 
 
