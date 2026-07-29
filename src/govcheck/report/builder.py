@@ -32,6 +32,7 @@ def to_markdown(report: ReviewReport) -> str:
         pct = f"（{report.risk_score:.1f}%）" if report.risk_score is not None else ""
         lines.append(f"**固有風險分級**：{report.risk_grade}{pct}")
         lines.append("")
+    lines += _coverage_lines(report)
     if report.item_assessments:
         lines += [
             "## F03 分項評估",
@@ -86,6 +87,38 @@ def to_markdown(report: ReviewReport) -> str:
         lines.append(f"- **代碼**：`{f.code}`　_(需人工覆核)_")
         lines.append("")
     return "\n".join(lines)
+
+
+def _coverage_lines(report: ReviewReport) -> list[str]:
+    """檢核表涵蓋範圍：把「沒被判讀的項次」明寫出來。
+
+    分項評估表只涵蓋送進語意判讀的項次；不適用與佐證空白的項次不會出現在該表，
+    若不在此列出，讀報告的人會誤以為整份檢核表都已判讀。
+    """
+    roster = report.checklist_roster
+    if not roster:
+        return []
+    skipped = [row for row in roster if row.coverage != "assessable"]
+    lines = [
+        "## F03 檢核表涵蓋範圍",
+        "",
+        f"檢核項共 {len(roster)} 項，其中 {len(roster) - len(skipped)} 項送語意判讀、"
+        f"{len(skipped)} 項未送（下列項次的狀態非合規結論，須人工認定）。",
+        "",
+    ]
+    if skipped:
+        lines += [
+            "| 項次 | 管理議題 | 未送原因 | 提案單位說明 |",
+            "| --- | --- | --- | --- |",
+        ]
+        for row in skipped:
+            reason = (
+                "標示不適用" if row.coverage == "not_applicable" else "佐證欄空白"
+            )
+            values = [row.item_id, row.topic or "—", reason, row.reason or "—"]
+            lines.append("| " + " | ".join(_table_cell(value) for value in values) + " |")
+        lines.append("")
+    return lines
 
 
 def _table_cell(value: object) -> str:

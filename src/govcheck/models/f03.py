@@ -7,7 +7,14 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
+
+from govcheck.models.evidence import WorkflowStage
+
+# 不適用理由帶進報告供治理人員判斷「主張是否成立」；截斷避免整段長文灌進 API payload。
+_REASON_MAX_CHARS = 200
 
 
 class F03Identity(BaseModel):
@@ -40,6 +47,45 @@ class F03ChecklistItem(BaseModel):
         """Finding 定位字串（題號＋管理議題），規則與 LLM 檢查共用。"""
         return f"項次 {self.item_id}" + (f"（{self.topic}）" if self.topic else "")
 
+    def evidence_for_stage(self, stage: WorkflowStage) -> str | None:
+        """該階段可供判讀的佐證文字；空字串與 None 一律視為無。
+
+        語意判讀的送審條件與總覽表名冊必須用同一條件判斷，否則會出現
+        「名冊說可判讀、卻沒有任何 assessment」的矛盾列。
+        """
+        if stage is WorkflowStage.PROPOSAL:
+            return self.evidence_proposal or None
+        return self.evidence_proposal or self.evidence_golive or None
+
+    def coverage_for_stage(self, stage: WorkflowStage) -> F03ItemCoverage:
+        """本項在該階段的涵蓋狀態（供報告列出**每一個**檢核項）。"""
+        if self.check_state == "不適用":
+            reason = (self.evidence_proposal or "").strip()
+            return F03ItemCoverage(
+                item_id=self.item_id, topic=self.topic, check_state=self.check_state,
+                coverage="not_applicable", reason=reason[:_REASON_MAX_CHARS] or None,
+            )
+        coverage = "assessable" if self.evidence_for_stage(stage) else "no_evidence"
+        return F03ItemCoverage(
+            item_id=self.item_id, topic=self.topic,
+            check_state=self.check_state, coverage=coverage,
+        )
+
+
+class F03ItemCoverage(BaseModel):
+    """檢核項在本次審查中的涵蓋狀態。
+
+    語意判讀只吃得下「非不適用且有填佐證」的項次（見 checks/llm/f03_assessment._targets），
+    其餘項次既無 assessment 也未必有 finding。若不隨名冊一併帶進報告，整列會從總覽表消失，
+    治理人員無從得知提案單位主張了哪些項目不適用、又有哪些項目根本沒填。
+    """
+
+    item_id: str
+    topic: str | None = None
+    check_state: str | None = None                # 是 / 否 / 不適用 / None（未勾選）
+    coverage: Literal["assessable", "not_applicable", "no_evidence"]
+    reason: str | None = None                     # 不適用理由（提案單位填在佐證欄時）
+
 
 class F03Checklist(BaseModel):
     """F03「檢核表」完整解析結果。"""
@@ -47,3 +93,7 @@ class F03Checklist(BaseModel):
     subject: str | None = None  # 取 B1 系統擁有者（F03 無系統名稱欄）
     items: list[F03ChecklistItem] = Field(default_factory=list)
     sheet_present: bool = True
+
+    def roster(self, stage: WorkflowStage) -> list[F03ItemCoverage]:
+        """全部檢核項的涵蓋狀態名冊，順序同檢核表。"""
+        return [item.coverage_for_stage(stage) for item in self.items]

@@ -47,13 +47,39 @@ def test_done_with_both_filled_is_clean():
     assert f03_evidence_presence.run_all(cl) == []
 
 
-def test_not_done_states_not_required():
+def test_undone_states_do_not_require_evidence():
+    """勾「否」或未勾選＝尚未檢核，不強制附佐證（不適用另有理由要求，見下）。"""
     cl = F03Checklist(items=[
-        _item(item_id="2-1", check_state="不適用"),
         _item(item_id="2-2", check_state="否"),
         _item(item_id="2-3", check_state=None),
     ])
     assert f03_evidence_presence.run_all(cl) == []
+
+
+def test_not_applicable_without_reason_warns():
+    """不適用的項次不進語意判讀，人工是唯一把關；沒寫理由就無從確認主張成立。"""
+    cl = F03Checklist(items=[_item(item_id="2-1", check_state="不適用")])
+    fs = f03_evidence_presence.run_all(cl)
+    assert _codes(fs) == {"F03.NOT_APPLICABLE_NO_REASON"}
+    assert fs[0].severity is Severity.WARN
+    assert "2-1" in fs[0].location
+
+
+def test_not_applicable_with_reason_is_clean():
+    """把不適用理由寫在佐證欄是正確做法，不可反過來當成缺失警示。"""
+    cl = F03Checklist(items=[
+        _item(item_id="2-1", check_state="不適用", evidence_proposal="本系統不涉及該情境"),
+    ])
+    assert f03_evidence_presence.run_all(cl) == []
+
+
+def test_not_applicable_never_requires_golive_evidence():
+    """不適用項次在上線階段也只要求理由，不得再要求上線佐證。"""
+    cl = F03Checklist(items=[
+        _item(item_id="2-1", check_state="不適用", evidence_proposal="無此議題"),
+    ])
+    fs = f03_evidence_presence.run_all(cl, workflow_stage=WorkflowStage.PRODUCTION)
+    assert fs == []
 
 
 def test_absent_sheet_returns_empty():

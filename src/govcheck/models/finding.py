@@ -17,6 +17,7 @@ from govcheck.models.evidence import (
     ReviewRunMeta,
     UsageSummary,
 )
+from govcheck.models.f03 import F03ItemCoverage
 
 
 class Severity(str, Enum):
@@ -51,6 +52,8 @@ class ReviewReport(BaseModel):
     # fields explicitly; v1 callers continue seeing the original response shape.
     decision_status: DecisionStatus = Field(default=DecisionStatus.MANUAL_REVIEW, exclude=True)
     item_assessments: list[F03ItemAssessment] = Field(default_factory=list, exclude=True)
+    # 全部檢核項的涵蓋狀態；不適用／未填佐證的項次不會有 assessment，缺了名冊就整列從報告消失。
+    checklist_roster: list[F03ItemCoverage] = Field(default_factory=list, exclude=True)
     document_statuses: list[DocumentArtifact] = Field(default_factory=list, exclude=True)
     usage_summary: UsageSummary = Field(default_factory=UsageSummary, exclude=True)
     review_run_meta: ReviewRunMeta = Field(default_factory=ReviewRunMeta, exclude=True)

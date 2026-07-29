@@ -129,6 +129,7 @@ def _report_v2_dict(report: ReviewReport) -> dict:
         "decision_status": report.decision_status.value,
         "workflow_stage": report.review_run_meta.workflow_stage.value,
         "item_assessments": [row.model_dump(mode="json") for row in report.item_assessments],
+        "checklist_roster": [row.model_dump(mode="json") for row in report.checklist_roster],
         "document_statuses": [
             row.model_dump(mode="json", exclude={"source_units"})
             for row in report.document_statuses

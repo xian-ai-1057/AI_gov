@@ -163,6 +163,10 @@ def review_submission(
             llm_completed=bool(assessments) if enable_llm else False,
         ),
         item_assessments=assessments,
+        # 名冊獨立於 LLM 是否啟用：關掉語意判讀時，它是總覽表唯一能列出全部檢核項的來源。
+        checklist_roster=(
+            sub.f03_checklist.roster(workflow_stage) if has_f03_checklist else []
+        ),
         document_statuses=sub.document_artifacts,
         usage_summary=usage,
         review_run_meta=ReviewRunMeta(

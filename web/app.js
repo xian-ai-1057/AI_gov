@@ -75,6 +75,23 @@
     "F03.EVIDENCE_CONTRADICTED": "rag",
     "F03.EVIDENCE_SOURCE_CONFLICT": "rag",
   };
+  // 未進入語意判讀的檢核項（見 F03Checklist.roster）：狀態格與摘要的字樣。
+  // 這些列刻意不算「需人工確認」（kind "skip" 不在 attnKinds 內）——它們是「本次沒判」，
+  // 不是「判出問題」；但必須存在於表中，否則「全部 N」會少掉整批項次而無人察覺。
+  const COVERAGE_CELL = {
+    not_applicable: { kind: "skip", note: "不適用" },
+    no_evidence: { kind: "skip", note: "未填" },
+  };
+  const COVERAGE_GIST = {
+    not_applicable: "標示不適用，未送語意判讀",
+    no_evidence: "佐證欄空白，未送語意判讀",
+  };
+  const COVERAGE_NOTE = {
+    not_applicable: "提案單位標示此項「不適用」，故未送語意判讀。"
+      + "不適用主張是否成立由治理人員認定，AI 未做任何判斷。",
+    no_evidence: "佐證欄空白，無可判讀內容，故未送語意判讀；狀態非合規結論。",
+  };
+
   // 規則式「佐證空白」finding → 狀態格後備（no-LLM 模式下整列不再全「—」）；
   // 僅在該格尚無彙整表資料（kind === "none"）時套用，表格判讀永遠優先。
   // 值取自 CAUSE_CODE_MAP（同兩碼對應的佐證欄與主因欄一致），集中管理避免雙表漂移。
@@ -247,6 +264,8 @@
     return {
       itemId,
       topic: topic || null,
+      coverage: null,     // "assessable" | "not_applicable" | "no_evidence"（來自名冊）
+      naReason: null,     // 不適用理由（提案單位填在佐證欄時）
       findings: [],
       cells: {
         prop: { kind: "none", note: "" },
@@ -279,6 +298,15 @@
     });
   }
 
+  // 未送判讀的項次補灰底字樣。最後才套用，讓判讀結果與規則式警示都優先於「本次沒判」。
+  function applyCoverageCells(row) {
+    const cell = COVERAGE_CELL[row.coverage];
+    if (!cell) return;
+    ["prop", "golive", "diff", "rag"].forEach((k) => {
+      if (row.cells[k].kind === "none") row.cells[k] = { ...cell };
+    });
+  }
+
   // 這一列「問題出在哪一欄」的集合：優先看彙整表儲存格狀態，再補上個別 finding 代碼
   // （沒有彙整表時，個別 finding 代碼是唯一線索，讓 no-LLM fallback 也能算出主因）。
   function rowCauses(row) {
@@ -306,6 +334,16 @@
     const others = [];
     const notices = [];
     const reference = { aggregate: [], regref: [], passlog: [], all: [] };
+
+    // 先鋪名冊：總覽表是「檢核表的視圖」，每一個檢核項都該有一列。只靠 findings/assessment
+    // 長列的話，標示不適用或佐證全空的項次會整列消失，連「全部 N」都看不到（v1 舊回應無此
+    // 欄位，rowMap 留空即退回原本的長列方式）。
+    (report.checklist_roster || []).forEach((entry) => {
+      const row = newMatrixRow(entry.item_id, entry.topic);
+      row.coverage = entry.coverage;
+      row.naReason = entry.reason || null;
+      rowMap.set(entry.item_id, row);
+    });
 
     report.findings.forEach((f) => {
       // 降級訊號先攔下：它可能帶著某一項次的 location（如 LLM 中止取 chunk[0].loc），
@@ -417,6 +455,8 @@
       // （避免後備填入的「空白」note 蓋掉更精煉的 finding 標題摘要），最後才統計注意/嚴重度。
       row.gist = rowGist(row);
       applyRuleCellFallback(row);
+      applyCoverageCells(row);
+      if (row.gist === "—" && COVERAGE_GIST[row.coverage]) row.gist = COVERAGE_GIST[row.coverage];
       const cellKeys = ["prop", "golive", "diff", "rag"];
       // warn（有問題）、err（⚠️ 判讀失敗）、undet（❓ 無法判定）三種儲存格都代表「需人工確認」：
       // err/undet 是「AI 判不了，請人看」，同樣不能在預設「只看有問題」濾鏡下被藏掉。
@@ -877,6 +917,8 @@
   function matrixCellHtml(colKey, cell) {
     if (cell.kind === "ok") return `<span class="st-ok">✓ ${esc(cell.note || "充分")}</span>`;
     if (cell.kind === "undet") return `<span class="st-undet">？無法判定</span>`;
+    // 灰底：本次未判讀，非合規結論也非警示，刻意與 ✓/▲/？ 拉開視覺層級。
+    if (cell.kind === "skip") return `<span class="st-skip">${esc(cell.note || "未判讀")}</span>`;
     if (cell.kind === "err") return `<span class="st-err">✕ 判讀失敗</span>`;
     if (cell.kind === "warn") {
       if (colKey === "diff") return `<span class="st-warn">▲ 有差異</span>`;
@@ -917,8 +959,17 @@
     const findingsHtml = row.findings.length
       ? row.findings.map(matrixDetailFindingHtml).join('<div class="gv-mdetail-sep"></div>')
       : "";
-    const inner = assessmentHtml || findingsHtml
-      ? [assessmentHtml, findingsHtml].filter(Boolean).join('<div class="gv-mdetail-sep"></div>')
+    const coverageHtml = COVERAGE_NOTE[row.coverage]
+      ? `<div class="gv-mdetail-finding">
+          <div class="gv-mdetail-head">未送語意判讀</div>
+          <div class="fbody"><p class="fmsg">${esc(COVERAGE_NOTE[row.coverage])}${
+            row.naReason ? `<br><strong>提案單位填寫的理由</strong>：${esc(row.naReason)}` : ""
+          }</p></div>
+        </div>`
+      : "";
+    const blocks = [coverageHtml, assessmentHtml, findingsHtml].filter(Boolean);
+    const inner = blocks.length
+      ? blocks.join('<div class="gv-mdetail-sep"></div>')
       : `<div class="gv-mdetail-empty">此項次無個別 finding；狀態來自彙整表判讀。</div>`;
     const refsLine = row.refs ? `<div class="gv-mdetail-refs">條文引用：${esc(row.refs)}</div>` : "";
     return `<tr class="gv-matrix-detail"><td colspan="8">${inner}${refsLine}</td></tr>`;
