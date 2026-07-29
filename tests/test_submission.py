@@ -1,10 +1,12 @@
 """送件包端到端編排測試 + 回歸保護。
 
 用真檔 fixture 走完整 review_submission（parser + 缺件 + F01 必填 + F02 規則 + 跨表），
-並確認 Phase 1 的 review_f02 入口不受影響、解析錯誤不丟例外。
+並確認單張 F02 入口不受影響、解析錯誤不丟例外。
 """
 
-from govcheck.review.engine import review_f02, review_routed, review_submission
+import pytest
+
+from govcheck.review.engine import review_f02, review_submission
 from tests.fixture_builder import (
     F01_DEFAULT_ROW,
     build_f01_fixture,
@@ -12,6 +14,12 @@ from tests.fixture_builder import (
     build_f03_fixture,
 )
 from tests.test_f02_rules import BASELINE  # 重用合規低風險答案集
+
+
+@pytest.fixture(autouse=True)
+def _no_regulation_map(monkeypatch):
+    """法規對照表是本機資產，有沒有它會改變 findings；本模組一律以「缺席」為準，結果才穩定。"""
+    monkeypatch.setenv("GOVCHECK_REGULATIONS_MAPPING_PATH", "/nonexistent/retrieval_map.json")
 
 
 def codes(report) -> set[str]:
@@ -28,7 +36,7 @@ def _compliant_files(tmp_path):
 
 def test_compliant_submission_ok(tmp_path):
     report = review_submission(_compliant_files(tmp_path))
-    assert codes(report) == {"SUBMISSION.OK"}
+    assert codes(report) == {"SUBMISSION.OK", "REGULATION.MAP_UNAVAILABLE"}
 
 
 def test_missing_f02_and_f01_required(tmp_path):
@@ -71,34 +79,3 @@ def test_f02_filing_unit_read_into_model(tmp_path):
         tmp_path / "f02.xlsm", answers=BASELINE, cached_grade="低", filing_unit="數位金融處/AI應用部",
     )
     assert parse_f02(f02).filing_unit == "數位金融處/AI應用部"
-
-
-def test_progress_events_sequence(tmp_path):
-    """三表齊全（不啟用 LLM）→ parse 與 rules 兩階段事件依序 emit，done 單調遞增至 total。"""
-    events: list[dict] = []
-    review_submission(_compliant_files(tmp_path), progress=events.append)
-
-    parse = [e for e in events if e["stage"] == "parse"]
-    rules = [e for e in events if e["stage"] == "rules"]
-    assert [e["stage"] for e in events] == ["parse"] * 3 + ["rules"] * 5  # 階段順序：先解析後規則
-    assert [e["done"] for e in parse] == [1, 2, 3] and all(e["total"] == 3 for e in parse)
-    # 規則總步 = 缺件 + 跨表（恆跑）+ F01 + F02 + F03 檢核（三表皆在）= 5
-    assert [e["done"] for e in rules] == [1, 2, 3, 4, 5] and all(e["total"] == 5 for e in rules)
-    assert not [e for e in events if e["stage"] == "llm"]  # 預設不啟用 LLM
-
-
-def test_progress_does_not_change_findings(tmp_path):
-    """回歸保護：傳不傳 progress，審查結果（findings）必須完全一致（review_submission 與 review_routed 皆然）。"""
-    files = _compliant_files(tmp_path)
-    without = [(f.code, f.severity) for f in review_submission(files).findings]
-    with_cb = [(f.code, f.severity) for f in review_submission(files, progress=lambda _ev: None).findings]
-    assert without == with_cb
-
-    routed_without = [(f.code, f.severity) for f in review_routed({"f02": files["f02"]}).findings]
-    routed_events: list[dict] = []
-    routed_with = [
-        (f.code, f.severity)
-        for f in review_routed({"f02": files["f02"]}, progress=routed_events.append).findings
-    ]
-    assert routed_without == routed_with
-    assert routed_events  # review_routed 確實把 progress 透傳到底層

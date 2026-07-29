@@ -1,12 +1,7 @@
-"""rag/mapping.py — RetrievalMap loader + format_section_ref。
+"""regulations/mapping.py — 凍結法規對照表的 loader + 條文引用顯示。
 
-AC coverage（p3-02 spec §6 / p3-03 spec §4.5）：
-- AC p3-02 AC-9   : RetrievalMap round-trip（example fixture）
-- AC p3-02 AC-10  : minimal fixture 通過 model_validate
-- AC p3-02 AC-11  : extra key → ValidationError（extra="forbid"）
-- AC p3-02 AC-12  : loader 缺檔 → RetrievalMapError
-- AC p3-02 AC-13  : loader 版本不符 → RetrievalMapError
-- AC p3-03 AC-16  : format_section_ref 三形態（章節式 / 條文式 / 單段）
+對照表本身是本機資產（含法規原文，不入庫），故測試一律用 tests/fixtures/ 的合成 map，
+不依賴 data/rag/retrieval_map.json 是否存在。
 """
 
 from __future__ import annotations
@@ -17,11 +12,10 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from govcheck.rag.mapping import RetrievalMapError, format_section_ref, load_retrieval_map
-from govcheck.rag.models import RetrievalMap
+from govcheck.regulations.mapping import RetrievalMapError, format_section_ref, load_retrieval_map
+from govcheck.regulations.models import RetrievalMap
 
-# Fixture 目錄（p3-02 合約）
-FIXTURE_DIR = Path(__file__).resolve().parents[1] / "specs" / "p3-02-canonical-map" / "contracts" / "fixtures"
+FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 
 EXAMPLE_JSON = FIXTURE_DIR / "retrieval_map_example.json"
 MINIMAL_JSON = FIXTURE_DIR / "retrieval_map_minimal.json"
@@ -34,17 +28,17 @@ BAD_VERSION_JSON = FIXTURE_DIR / "retrieval_map_bad_version.json"
 
 
 def test_format_section_ref_chapter_style():
-    """AC p3-03 AC-16：章節式 五/(二)/2 → R03 五、(二) 2。"""
+    """章節式 五/(二)/2 → R03 五、(二) 2。"""
     assert format_section_ref("R03", "五/(二)/2") == "R03 五、(二) 2"
 
 
 def test_format_section_ref_article_style():
-    """AC p3-03 AC-16：條文式 第一條 → R01 第一條（單段直接接合）。"""
+    """條文式 第一條 → R01 第一條（單段直接接合）。"""
     assert format_section_ref("R01", "第一條") == "R01 第一條"
 
 
 def test_format_section_ref_single_segment_chapter():
-    """AC p3-03 AC-16：單段非條文式（如 五）→ R02 五（直接接合，無「、」）。"""
+    """單段非條文式（如 五）→ R02 五（直接接合，無「、」）。"""
     assert format_section_ref("R02", "五") == "R02 五"
 
 
@@ -69,7 +63,7 @@ def test_format_section_ref_three_levels_arabic():
 
 
 def test_retrieval_map_example_round_trip():
-    """AC p3-02 AC-9：model_validate(example) 成功；re-dump 再 validate 不失真。"""
+    """model_validate(example) 成功；re-dump 再 validate 不失真。"""
     data = json.loads(EXAMPLE_JSON.read_text(encoding="utf-8"))
     m = RetrievalMap.model_validate(data)
     assert "1-1" in m.f03_items
@@ -86,7 +80,7 @@ def test_retrieval_map_example_round_trip():
 
 
 def test_retrieval_map_minimal_is_valid():
-    """AC p3-02 AC-10：空 map（f03_items={}, f02_questions={}）合法。"""
+    """空 map（f03_items={}, f02_questions={}）合法。"""
     data = json.loads(MINIMAL_JSON.read_text(encoding="utf-8"))
     m = RetrievalMap.model_validate(data)
     assert m.f03_items == {}
@@ -99,7 +93,7 @@ def test_retrieval_map_minimal_is_valid():
 
 
 def test_retrieval_map_extra_key_raises():
-    """AC p3-02 AC-11：頂層注入未知鍵 → ValidationError（extra="forbid"）。"""
+    """頂層注入未知鍵 → ValidationError（extra="forbid"）。"""
     data = json.loads(EXAMPLE_JSON.read_text(encoding="utf-8"))
     data["unknown_field_xyz"] = "should_fail"
     with pytest.raises(ValidationError):
@@ -112,7 +106,7 @@ def test_retrieval_map_extra_key_raises():
 
 
 def test_load_retrieval_map_missing_file():
-    """AC p3-02 AC-12：缺檔 → RetrievalMapError（訊息含路徑，不含內容）。"""
+    """缺檔 → RetrievalMapError（訊息含路徑，不含內容）。"""
     with pytest.raises(RetrievalMapError) as exc_info:
         load_retrieval_map("/nonexistent/path/retrieval_map.json")
     assert "/nonexistent/path/retrieval_map.json" in str(exc_info.value)
@@ -124,7 +118,7 @@ def test_load_retrieval_map_missing_file():
 
 
 def test_load_retrieval_map_bad_version():
-    """AC p3-02 AC-13：schema_version=999 → RetrievalMapError（版本不符）。"""
+    """schema_version=999 → RetrievalMapError（版本不符）。"""
     with pytest.raises(RetrievalMapError) as exc_info:
         load_retrieval_map(BAD_VERSION_JSON)
     msg = str(exc_info.value)

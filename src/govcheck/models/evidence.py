@@ -83,6 +83,11 @@ class F03ItemAssessment(BaseModel):
     ] = "undetermined"
     evidence_status: EvidenceStatus = EvidenceStatus.NOT_FOUND
     conflict_status: ConflictStatus = ConflictStatus.UNKNOWN
+    # 佐證是否涵蓋該檢核項對應的法規條文要求。undetermined 也用於「本項無條文對照」
+    # （對照表缺檔或該項未映射）——沒有基準就不宣稱符合，也不宣稱有缺口。
+    regulation_gap: Literal["covered", "gap", "undetermined"] = "undetermined"
+    # 條文引用顯示字串，一律由對照表的 canonical section_path 推導，不採信模型自述的條號。
+    regulation_refs: list[str] = Field(default_factory=list)
     confidence: float = 0.0
     # False = 模型從未對此項做出判讀（端點失敗/回應缺漏/Prompt 未就緒）。
     # 此時 evidence_status 等欄位只是佔位預設值，不得當成實質合規結論。

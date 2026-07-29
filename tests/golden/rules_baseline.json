@@ -1,7 +1,7 @@
 {
   "generated_by": "tests/golden/generate_snapshot.py",
-  "note": "Re-generate: uv run python tests/golden/generate_snapshot.py  | 此快照依賴未修改的 Phase 2 engine；Phase 3b 修改 engine 前先 commit 此快照。",
-  "schema_version": "phase2_baseline_v1",
+  "note": "Re-generate: uv run python tests/golden/generate_snapshot.py  | 產生時強制法規對照表缺席，故此快照只鎖規則側輸出。",
+  "schema_version": "rules_baseline_v1",
   "submissions": [
     {
       "description": "F01+F02+F03 合規低風險基線；預期 findings=SUBMISSION.OK",
@@ -9,6 +9,17 @@
       "report": {
         "banner": "⚠️ 本報告為 AI 初判草稿，需治理人員與三遵人工覆核，最終判定權不在 AI。",
         "findings": [
+          {
+            "actual": null,
+            "code": "REGULATION.MAP_UNAVAILABLE",
+            "expected": null,
+            "location": null,
+            "message": "找不到或無法讀取法規對照表，本次審查未引用任何法規條文，亦未判讀法規符合性；其餘檢查不受影響，合規性請人工覆核。",
+            "needs_human": true,
+            "severity": "info",
+            "source": "rule",
+            "title": "法規對照表未就緒，本次未做條文比對"
+          },
           {
             "actual": null,
             "code": "SUBMISSION.OK",
@@ -54,6 +65,17 @@
             "severity": "error",
             "source": "rule",
             "title": "缺件：F03 上線檢核表"
+          },
+          {
+            "actual": null,
+            "code": "REGULATION.MAP_UNAVAILABLE",
+            "expected": null,
+            "location": null,
+            "message": "找不到或無法讀取法規對照表，本次審查未引用任何法規條文，亦未判讀法規符合性；其餘檢查不受影響，合規性請人工覆核。",
+            "needs_human": true,
+            "severity": "info",
+            "source": "rule",
+            "title": "法規對照表未就緒，本次未做條文比對"
           }
         ],
         "form_type": "送件包",

@@ -10,10 +10,10 @@ import os
 
 import requests
 
+from govcheck.llm.config import load_llm_config
 from govcheck.logging_setup import get_logger
-from govcheck.rag.config import load_rag_config
 
-log = get_logger("rag_embedding")
+log = get_logger("embedding")
 
 
 class EmbeddingError(RuntimeError):
@@ -38,18 +38,18 @@ class EmbeddingClient:
 
     @classmethod
     def from_config(cls, cfg: dict | None = None) -> EmbeddingClient:
-        """由 RAG 設定 dict 建立客戶端。
+        """由 LLM 設定 dict 建立客戶端。
 
-        cfg 為 None 時呼叫 load_rag_config()。
-        api_key 一律由環境變數 GOVCHECK_RAG_EMBEDDING_API_KEY 取得，
+        cfg 為 None 時呼叫 load_llm_config()。
+        api_key 一律由環境變數 GOVCHECK_EMBEDDING_API_KEY 取得，
         不從 cfg dict 讀取（避免金鑰誤寫入設定檔被入庫）。
         """
-        cfg = cfg or load_rag_config()
+        cfg = cfg or load_llm_config()
         return cls(
             base_url=cfg["embedding_base_url"],
             model=cfg["embedding_model"],
-            api_key=os.environ.get("GOVCHECK_RAG_EMBEDDING_API_KEY"),
-            timeout=cfg["timeout"],
+            api_key=os.environ.get("GOVCHECK_EMBEDDING_API_KEY"),
+            timeout=cfg["embedding_timeout"],
         )
 
     @property

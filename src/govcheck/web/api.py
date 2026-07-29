@@ -1,44 +1,32 @@
-"""FastAPI 後端：分類、v1/v2 審查 API 與靜態前端掛載。
+"""FastAPI 後端：一個審查 API + 一個就緒查詢 + 靜態前端掛載。
 
-對應前端三步驟：
-  1) 上傳送件包  → 前端持有檔案
-  2) 確認自動分類 → POST /api/classify（記憶體分類、不落地）
-  3) 審查報告     → POST /api/v2/review（temp 用後即刪 → 結構化 assessment）
+對應前端兩步驟：
+  1) 上傳送件包（F01 / F02 / F03 各一份 + 佐證多份）
+  2) 審查報告 → POST /api/review（temp 用後即刪 → 結構化報告）
 
-v1 保留舊 response adapter；v2 提供 workflow stage、citations、usage 與 run metadata。
-兩者共用 TemporaryDirectory 用後即刪策略（最小足跡、地端不外送）。
+介面層零判讀邏輯：只負責落地檔案、呼叫 review_submission、把 ReviewReport 轉成 JSON。
+暫存檔於 TemporaryDirectory 結束時一併清除（最小足跡、地端不外送）。
 """
 
 from __future__ import annotations
 
-import asyncio
-import io
-import json
 import tempfile
 import time
-from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from govcheck.classify import (
-    KIND_LABEL,
-    FileClassification,
-    FileKind,
-    classify_fileobj,
-    route_classifications,
-)
-from govcheck.llm.config import load_llm_config
 from govcheck.llm.client import ChatClient
+from govcheck.llm.config import load_llm_config
 from govcheck.logging_setup import get_logger, new_request_id, set_request_id, setup_logging
 from govcheck.models import ReviewReport, Severity, WorkflowStage
 from govcheck.prompts import build_prompt_gateway
 from govcheck.report.builder import to_markdown
-from govcheck.review.engine import review_routed
+from govcheck.review.engine import review_submission
 
 log = get_logger("api")
 
@@ -48,12 +36,6 @@ WEB_DIR = Path(__file__).resolve().parents[3] / "web"
 # 單檔上限（50 MB）：防止記憶體耗盡或磁碟塞滿
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
-# 可指派的判定（對齊 app.py：UNKNOWN 不可手動指派，以「忽略此檔」表示排除）
-IGNORE = "ignore"
-_ASSIGNABLE = [FileKind.F01, FileKind.F02, FileKind.F03, FileKind.SUPPORTING]
-KIND_OPTIONS = [{"value": k.value, "label": KIND_LABEL[k]} for k in _ASSIGNABLE] + [
-    {"value": IGNORE, "label": "忽略此檔"}
-]
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
@@ -68,8 +50,7 @@ app = FastAPI(title="AI 治理審查小幫手", docs_url=None, redoc_url=None, l
 
 @app.middleware("http")
 async def _request_log(request: Request, call_next):
-    """每個請求設 request_id（contextvar，隨 asyncio.to_thread 複製進 SSE worker），
-    DEBUG 記進入、INFO 記命中端點與耗時（重點）。只記方法/路徑/狀態碼，不記 body。"""
+    """每個請求設 request_id（串連 ops/audit log）。只記方法/路徑/狀態碼，不記 body。"""
     set_request_id(new_request_id())
     log.debug("%s %s", request.method, request.url.path)
     t0 = time.perf_counter()
@@ -79,14 +60,10 @@ async def _request_log(request: Request, call_next):
     return response
 
 
-def _severity_str(sev: Severity) -> str:
-    return sev.value  # "error" / "warn" / "info"
-
-
 def _finding_dict(idx: int, f) -> dict:
     return {
         "id": str(idx),
-        "severity": _severity_str(f.severity),
+        "severity": f.severity.value,   # "error" / "warn" / "info"
         "code": f.code,
         "title": f.title,
         "message": f.message,
@@ -98,348 +75,119 @@ def _finding_dict(idx: int, f) -> dict:
 
 
 def _report_dict(report: ReviewReport) -> dict:
-    findings = [_finding_dict(i, f) for i, f in enumerate(report.findings)]
-    info_count = sum(1 for f in report.findings if f.severity is Severity.INFO)
+    """ReviewReport → 前端 payload。
+
+    刻意不回 `passed`：它只看 error_count，會與 decision_status 互相矛盾
+    （規則全綠但 LLM 未跑 → passed=True 而 decision_status=manual_review）。
+    通過與否一律以 decision_status 為準。
+    """
     return {
         "form_type": report.form_type,
         "subject": report.subject,
-        "passed": report.passed,
-        "error_count": report.error_count,
-        "warn_count": report.warn_count,
-        "info_count": info_count,
-        "risk_score": report.risk_score,
-        "risk_grade": report.risk_grade,
-        "findings": findings,
-        "markdown": to_markdown(report),
-    }
-
-
-def _report_v2_dict(report: ReviewReport) -> dict:
-    body = _report_dict(report)
-    # v1 的 `passed` 只看 error_count，與 v2 的 decision_status 可互相矛盾
-    # （例如規則全綠但關閉 LLM → passed=True 而 decision_status=manual_review）。
-    # 同一份 body 不能同時給兩個相反的通過訊號，v2 一律以 decision_status 為準。
-    body.pop("passed", None)
-    citations = [
-        citation.model_dump(mode="json")
-        for assessment in report.item_assessments
-        for citation in assessment.citations
-    ]
-    body.update({
         "decision_status": report.decision_status.value,
         "workflow_stage": report.review_run_meta.workflow_stage.value,
+        "error_count": report.error_count,
+        "warn_count": report.warn_count,
+        "info_count": sum(1 for f in report.findings if f.severity is Severity.INFO),
+        "risk_score": report.risk_score,
+        "risk_grade": report.risk_grade,
+        "findings": [_finding_dict(i, f) for i, f in enumerate(report.findings)],
         "item_assessments": [row.model_dump(mode="json") for row in report.item_assessments],
         "checklist_roster": [row.model_dump(mode="json") for row in report.checklist_roster],
         "document_statuses": [
             row.model_dump(mode="json", exclude={"source_units"})
             for row in report.document_statuses
         ],
-        "citations": citations,
+        "citations": [
+            citation.model_dump(mode="json")
+            for assessment in report.item_assessments
+            for citation in assessment.citations
+        ],
         "usage_summary": report.usage_summary.model_dump(mode="json"),
         "review_run_meta": report.review_run_meta.model_dump(mode="json"),
-    })
-    return body
-
-
-@app.post("/api/classify")
-async def classify(files: list[UploadFile]) -> JSONResponse:
-    """記憶體分類預覽（不落地）：回傳每檔判定 + 旗標（dup/unknown）+ 可選項。"""
-    if not files:
-        raise HTTPException(status_code=400, detail="請上傳至少一個檔案。")
-
-    out: list[dict] = []
-    seen_form_kinds: set[FileKind] = set()
-    for idx, up in enumerate(files):
-        data = await up.read()
-        name = up.filename or f"file_{idx}"
-        if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail=f"上傳檔案超過大小限制（上限 50 MB）：{name}")
-        c = await asyncio.to_thread(classify_fileobj, io.BytesIO(data), name)
-
-        flag: str | None = None
-        if c.kind is FileKind.UNKNOWN:
-            flag = "unknown"
-        elif c.kind in _ASSIGNABLE and c.kind is not FileKind.SUPPORTING:
-            # F01/F02/F03 同類第 2 份起標記重複（對應分類器 route 的 DUPLICATE_*）
-            if c.kind in seen_form_kinds:
-                flag = "dup"
-            else:
-                seen_form_kinds.add(c.kind)
-
-        # 無法辨識 → 預設「忽略此檔」，逼使用者人工指定，不靜默誤路由（比照 app.py）
-        default_kind = c.kind.value if c.kind in _ASSIGNABLE else IGNORE
-        out.append({
-            "index": idx,
-            "filename": name,
-            "kind": default_kind,
-            "reason": c.reason,
-            "flag": flag,
-        })
-
-    return JSONResponse({"kinds": KIND_OPTIONS, "files": out})
+        "markdown": to_markdown(report),
+    }
 
 
 @app.post("/api/review")
 async def review(
-    files: list[UploadFile],
-    kinds: str = Form(...),
+    f01: UploadFile | None = None,
+    f02: UploadFile | None = None,
+    f03: UploadFile | None = None,
+    supporting: list[UploadFile] | None = None,
+    workflow_stage: WorkflowStage = Form(default=WorkflowStage.PROPOSAL),
     enable_llm: bool | None = Form(default=None),
 ) -> JSONResponse:
-    """依使用者確認後的 kinds 落地 → 路由 → 審查 → 回報告 JSON + markdown。"""
-    if not files:
-        raise HTTPException(status_code=400, detail="請上傳至少一個檔案。")
-    confirmed_kinds = _parse_confirmed_kinds(kinds, len(files))
+    """上傳送件包 → 審查 → 回報告 JSON（含 Markdown 版供下載）。
+
+    F01/F02/F03 各一份（未上傳者由缺件檢查報出），佐證可多份。
+    """
+    forms = {"f01": f01, "f02": f02, "f03": f03}
+    supporting = [up for up in (supporting or []) if up.filename]
+    if not any(up is not None and up.filename for up in forms.values()) and not supporting:
+        raise HTTPException(status_code=400, detail="請至少上傳一份表單或佐證檔案。")
+
     use_llm = bool(load_llm_config()["enabled"]) if enable_llm is None else bool(enable_llm)
-    report = await _review_uploads(files, confirmed_kinds, use_llm, WorkflowStage.PROPOSAL)
-    return JSONResponse(_report_dict(report))
-
-
-@app.post("/api/v2/review")
-async def review_v2(
-    files: list[UploadFile],
-    kinds: str = Form(...),
-    workflow_stage: WorkflowStage = Form(...),
-    enable_llm: bool | None = Form(default=None),
-) -> JSONResponse:
-    """Stage-aware response with item assessments, citations and usage metadata."""
-    if not files:
-        raise HTTPException(status_code=400, detail="請上傳至少一個檔案。")
-    confirmed_kinds = _parse_confirmed_kinds(kinds, len(files))
-    use_llm = bool(load_llm_config()["enabled"]) if enable_llm is None else bool(enable_llm)
-    report = await _review_uploads(files, confirmed_kinds, use_llm, workflow_stage)
-    return JSONResponse(_report_v2_dict(report))
-
-
-async def _review_uploads(
-    files: list[UploadFile],
-    confirmed_kinds: list[str],
-    use_llm: bool,
-    workflow_stage: WorkflowStage,
-) -> ReviewReport:
-    """Shared temporary-file boundary for v1 and v2 review endpoints."""
 
     # 用後即刪：暫存檔在 TemporaryDirectory 結束時一併清除（最小足跡、地端不外送）
     with tempfile.TemporaryDirectory() as tmpdir:
-        confirmed: list[FileClassification] = []
-        for idx, (up, kind_value) in enumerate(zip(files, confirmed_kinds)):
-            if kind_value == IGNORE:
-                continue
-            try:
-                kind = FileKind(kind_value)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=f"未知判定 {kind_value!r}") from exc
-            if kind not in _ASSIGNABLE:
-                raise HTTPException(status_code=400, detail=f"不可指派的判定 {kind_value!r}")
-            name = up.filename or "file"
-            # 落地檔名一律取 basename（擋掉 ../ 與絕對路徑逃逸），並以索引前綴避免同名覆蓋。
-            # 顯示用 filename 仍保留原始名稱（供分類器/報告呈現）。
-            safe = Path(name).name or "file"
-            dest = Path(tmpdir) / f"{idx}_{safe}"
-            file_data = await up.read()
-            if len(file_data) > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail=f"上傳檔案超過大小限制（上限 50 MB）：{name}")
-            dest.write_bytes(file_data)
-            confirmed.append(FileClassification(
-                path=str(dest), filename=name, kind=kind, reason="使用者確認/修正",
-            ))
+        paths: dict[str, str] = {}
+        for role, up in forms.items():
+            if up is not None and up.filename:
+                paths[role] = await _persist(up, Path(tmpdir), role)
 
-        if not confirmed:
-            raise HTTPException(
-                status_code=400, detail="所有檔案都被標記為「忽略此檔」，沒有可審查的內容。"
-            )
+        supporting_names: list[str] = []
+        supporting_paths: list[str] = []
+        for idx, up in enumerate(supporting):
+            supporting_paths.append(await _persist(up, Path(tmpdir), f"sup{idx}"))
+            supporting_names.append(up.filename or f"佐證{idx + 1}")
 
         try:
-            routed_files, supporting, class_findings = route_classifications(confirmed)
-            supporting_paths = [
-                item.path for item in confirmed
-                if item.kind is FileKind.SUPPORTING and item.path is not None
-            ]
-            report = review_routed(
-                routed_files,
-                supporting,
-                class_findings,
-                enable_llm=use_llm,
+            report = review_submission(
+                paths,
+                supporting=supporting_names,
                 supporting_paths=supporting_paths,
+                enable_llm=use_llm,
                 workflow_stage=workflow_stage,
             )
         except Exception as exc:  # noqa: BLE001 - 介面層需把解析/審查錯誤友善呈現
             log.error("review failed: %s", type(exc).__name__)
-            raise HTTPException(status_code=400, detail=f"解析或審查失敗：{type(exc).__name__}") from exc
+            raise HTTPException(
+                status_code=400, detail=f"解析或審查失敗：{type(exc).__name__}"
+            ) from exc
 
-    return report
+    return JSONResponse(_report_dict(report))
 
 
-@app.get("/api/v2/readiness/prompts")
-async def prompt_readiness() -> JSONResponse:
+async def _persist(up: UploadFile, tmpdir: Path, prefix: str) -> str:
+    """把上傳檔寫入暫存目錄，回傳落地路徑。
+
+    檔名一律取 basename（擋掉 ../ 與絕對路徑逃逸），並加前綴避免同名覆蓋。
+    """
+    name = up.filename or "file"
+    data = await up.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"上傳檔案超過大小限制（上限 50 MB）：{name}")
+    dest = tmpdir / f"{prefix}_{Path(name).name or 'file'}"
+    dest.write_bytes(data)
+    return str(dest)
+
+
+@app.get("/api/readiness")
+async def readiness() -> JSONResponse:
+    """LLM 判讀是否就緒（端點、模型、Prompt 三者齊備才算）。"""
     cfg = load_llm_config()
     prompts = build_prompt_gateway(ChatClient.from_config(cfg), cfg).readiness()
     prompt_ready = bool(prompts) and all(
         not value.startswith("unavailable:") for value in prompts.values()
     )
     model_configured = bool(cfg.get("base_url") and cfg.get("model"))
-    ready = bool(cfg.get("enabled") and prompt_ready and model_configured)
     return JSONResponse({
-        "ready": ready,
+        "ready": bool(cfg.get("enabled") and prompt_ready and model_configured),
         "llm_enabled": bool(cfg.get("enabled")),
         "model_configured": model_configured,
         "prompts": prompts,
     })
-
-
-def _parse_confirmed_kinds(kinds: str, n_files: int) -> list[str]:
-    """解析並驗證前端送來的 kinds JSON 陣列（長度須與檔案數相符）。"""
-    try:
-        confirmed_kinds = json.loads(kinds)
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise HTTPException(status_code=400, detail=f"kinds 格式錯誤：{exc}") from exc
-    if not isinstance(confirmed_kinds, list):
-        raise HTTPException(status_code=400, detail="kinds 應為陣列。")
-    if len(confirmed_kinds) != n_files:
-        raise HTTPException(status_code=400, detail="kinds 數量與檔案數不符。")
-    return confirmed_kinds
-
-
-def _run_review_blocking(
-    payloads: list[tuple[str, bytes]],
-    confirmed_kinds: list[str],
-    use_llm: bool,
-    emit: Callable[[dict], None],
-    workflow_stage: WorkflowStage = WorkflowStage.PROPOSAL,
-    api_version: int = 1,
-) -> dict:
-    """工作執行緒內跑：落地檔 → 路由 → 審查 → 回報告 dict。
-
-    與 /api/review 同策略（TemporaryDirectory 用後即刪、basename 防逃逸、索引前綴防覆蓋），
-    差別僅在落地與審查各階段透過 emit 串出進度事件（upload / parse / rules / llm）。
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # 先濾掉「忽略此檔」，再以原始索引落地（與 /api/review 的 idx 命名一致）
-        to_write = [
-            (idx, name, data, kind_value)
-            for idx, ((name, data), kind_value) in enumerate(zip(payloads, confirmed_kinds))
-            if kind_value != IGNORE
-        ]
-        confirmed: list[FileClassification] = []
-        for done, (idx, name, data, kind_value) in enumerate(to_write, start=1):
-            try:
-                kind = FileKind(kind_value)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=f"未知判定 {kind_value!r}") from exc
-            if kind not in _ASSIGNABLE:
-                raise HTTPException(status_code=400, detail=f"不可指派的判定 {kind_value!r}")
-            safe = Path(name).name or "file"
-            dest = Path(tmpdir) / f"{idx}_{safe}"
-            dest.write_bytes(data)
-            confirmed.append(FileClassification(
-                path=str(dest), filename=name, kind=kind, reason="使用者確認/修正",
-            ))
-            emit({"stage": "upload", "label": "落地檔案", "done": done, "total": len(to_write)})
-
-        if not confirmed:
-            raise HTTPException(
-                status_code=400, detail="所有檔案都被標記為「忽略此檔」，沒有可審查的內容。"
-            )
-
-        routed_files, supporting, class_findings = route_classifications(confirmed)
-        supporting_paths = [
-            item.path for item in confirmed
-            if item.kind is FileKind.SUPPORTING and item.path is not None
-        ]
-        report = review_routed(
-            routed_files,
-            supporting,
-            class_findings,
-            enable_llm=use_llm,
-            progress=emit,
-            supporting_paths=supporting_paths,
-            workflow_stage=workflow_stage,
-        )
-    return _report_v2_dict(report) if api_version == 2 else _report_dict(report)
-
-
-@app.post("/api/review/stream")
-@app.post("/api/v2/review/stream")
-async def review_stream(
-    request: Request,
-    files: list[UploadFile],
-    kinds: str = Form(...),
-    enable_llm: bool | None = Form(default=None),
-    workflow_stage: WorkflowStage = Form(default=WorkflowStage.PROPOSAL),
-) -> StreamingResponse:
-    """同 /api/review，但以 SSE（text/event-stream）即時串出各階段進度，最後一筆帶完整報告。
-
-    阻塞式審查在工作執行緒跑，進度事件經 asyncio.Queue 跨執行緒回主事件圈再 yield 出去；
-    用後即刪、地端不外送策略與 /api/review 完全一致。
-    """
-    if not files:
-        raise HTTPException(status_code=400, detail="請上傳至少一個檔案。")
-    confirmed_kinds = _parse_confirmed_kinds(kinds, len(files))
-    # 入參驗證一律在串流開始前完成 → 回正規 HTTP 4xx（串流一旦開始 header 已送出，只能改用
-    # in-band error 事件；與 /api/review 對齊，避免「壞輸入卻回 200」的契約漂移）。
-    assignable_values = {k.value for k in _ASSIGNABLE}
-    non_ignored = [kv for kv in confirmed_kinds if kv != IGNORE]
-    for kv in non_ignored:
-        if kv not in assignable_values:
-            raise HTTPException(status_code=400, detail=f"不可指派的判定 {kv!r}")
-    if not non_ignored:
-        raise HTTPException(
-            status_code=400, detail="所有檔案都被標記為「忽略此檔」，沒有可審查的內容。"
-        )
-    use_llm = bool(load_llm_config()["enabled"]) if enable_llm is None else bool(enable_llm)
-    api_version = 2 if request.url.path.startswith("/api/v2/") else 1
-
-    # UploadFile.read 是 async，必須在事件圈內先讀成 bytes，才能丟進工作執行緒。
-    payloads: list[tuple[str, bytes]] = []
-    for up in files:
-        name_s = up.filename or "file"
-        data_s = await up.read()
-        if len(data_s) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail=f"上傳檔案超過大小限制（上限 50 MB）：{name_s}")
-        payloads.append((name_s, data_s))
-
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-    sentinel = object()
-
-    def emit(event: dict) -> None:
-        # 工作執行緒 → 主事件圈：執行緒安全地把事件丟進 queue，順序保留。
-        loop.call_soon_threadsafe(queue.put_nowait, event)
-
-    def worker() -> None:
-        try:
-            report = _run_review_blocking(
-                payloads,
-                confirmed_kinds,
-                use_llm,
-                emit,
-                workflow_stage=workflow_stage,
-                api_version=api_version,
-            )
-            emit({"stage": "done", "label": "完成", "report": report})
-        except HTTPException as exc:
-            emit({"stage": "error", "message": str(exc.detail)})
-        except Exception as exc:  # noqa: BLE001 - 介面層需把解析/審查錯誤友善呈現
-            log.error("review failed: %s", type(exc).__name__)
-            emit({"stage": "error", "message": f"解析或審查失敗：{type(exc).__name__}"})
-        finally:
-            loop.call_soon_threadsafe(queue.put_nowait, sentinel)
-
-    async def gen():
-        task = asyncio.create_task(asyncio.to_thread(worker))
-        try:
-            while True:
-                event = await queue.get()
-                if event is sentinel:
-                    break
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-        finally:
-            await task
-
-    return StreamingResponse(
-        gen(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
 
 
 @app.get("/")

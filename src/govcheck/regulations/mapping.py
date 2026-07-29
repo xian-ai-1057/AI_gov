@@ -1,11 +1,10 @@
-"""RetrievalMap runtime loader + 引用顯示 helper（p3-02 §4.4 / p3-03 §4.5）。
+"""凍結法規對照表的 runtime loader + 引用顯示 helper。
 
-runtime 唯一入口：載入 data/rag/retrieval_map.json + schema 驗證；
-缺檔 / schema_version 不符 / Pydantic 驗證失敗 → 一律 RetrievalMapError
-（由 engine 的 _run_rag_checks 攔截降級為 RAG.SKIPPED，絕不讓例外逸出到介面層）。
+唯一入口：載入 `data/rag/retrieval_map.json` + schema 驗證；
+缺檔 / schema_version 不符 / Pydantic 驗證失敗 → 一律 RetrievalMapError，
+由呼叫端攔截降級（缺對照表只代表「無法引用條文」，不影響規則檢查與其餘判讀）。
 
-**runtime 零 embedding、零 Milvus**：本模組只讀 JSON + Pydantic 驗證，
-不 import EmbeddingClient / RegulationStore。
+本模組只讀 JSON + Pydantic 驗證，不碰網路、不碰向量庫。
 """
 
 from __future__ import annotations
@@ -17,11 +16,12 @@ from pydantic import ValidationError
 
 from govcheck.logging_setup import get_logger
 from govcheck.paths import resolve_data_path
-from govcheck.rag.models import SCHEMA_VERSION, RetrievalMap
+from govcheck.regulations.config import DEFAULT_MAPPING_PATH
+from govcheck.regulations.models import SCHEMA_VERSION, RetrievalMap
 
-log = get_logger("rag_mapping")
+log = get_logger("regulations_map")
 
-_DEFAULT_PATH = Path("data/rag/retrieval_map.json")
+_DEFAULT_PATH = Path(DEFAULT_MAPPING_PATH)
 
 
 class RetrievalMapError(RuntimeError):
@@ -68,7 +68,7 @@ def load_retrieval_map(path: str | Path | None = None) -> RetrievalMap:
 
 
 def format_section_ref(reg_code: str, section_path: str) -> str:
-    """section_path 正準形式 → 顯示字串（f03_rag / f02_reg_refs 共用；spec §4.5）。
+    """section_path 正準形式 → 顯示字串（f03_assessment / f02_reg_refs 共用）。
 
     - 章節式 ``五/(二)/2`` → ``R03 五、(二) 2``（首段中文序號後接「、」，
       括號層直接接續，阿拉伯數字等其餘段前置空格）。

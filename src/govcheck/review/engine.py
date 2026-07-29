@@ -1,18 +1,18 @@
 """審查編排器：parse → 跑已註冊的 checks → 匯總成 ReviewReport。
 
-- review_f02：單張 F02 風險評鑑（Phase 1）。
-- review_submission：整份送件包（Phase 2）= 缺件 + F01 必填 + F02 規則 + 跨表一致性。
-未來新增表單/LLM 檢查只要在對應 review_* 裡多串一個 Check。
+- review_f02：單張 F02 風險評鑑。
+- review_submission：整份送件包 = 缺件 + F01 必填 + F02 規則 + F03 佐證缺漏 +
+  跨表一致性 +（啟用 LLM 時）F03 語意判讀（內容品質 + 佐證支持 + 法規符合性一次判完）。
+
+新增檢查 = 新增 Check + 在此註冊，不動既有程式。
 """
 
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
 from pathlib import Path
 
-from govcheck.checks.llm import f03_assessment, f03_rag
-from govcheck.evidence import EvidenceRetriever
+from govcheck.checks.llm import f03_assessment
 from govcheck.checks.rule import (
     cross_consistency,
     f01_rules,
@@ -21,15 +21,20 @@ from govcheck.checks.rule import (
     f03_evidence_presence,
     missing_docs,
 )
-from govcheck.classify.classifier import FileClassification, classify_files, route_classifications
+from govcheck.evidence import EvidenceRetriever
 from govcheck.llm.client import ChatClient
 from govcheck.llm.config import load_llm_config
+from govcheck.llm.embedding import EmbeddingClient
 from govcheck.logging_setup import audit, get_logger
-from govcheck.models import FilePresence, Finding, ReviewReport, Severity, Submission
 from govcheck.models import (
     DecisionStatus,
     DocumentParseStatus,
+    FilePresence,
+    Finding,
+    ReviewReport,
     ReviewRunMeta,
+    Severity,
+    Submission,
     UsageSummary,
     WorkflowStage,
 )
@@ -38,25 +43,14 @@ from govcheck.parsers.f02_parser import parse_f02
 from govcheck.parsers.f03_parser import parse_f03_checklist, parse_f03_identity
 from govcheck.parsers.supporting import PARSER_SOURCE_REF, TsParserAdapter
 from govcheck.prompts import build_prompt_gateway
-from govcheck.rag.config import load_rag_config
-from govcheck.rag.embedding import EmbeddingClient
-from govcheck.rag.mapping import load_retrieval_map
-from govcheck.rag.models import RagConfig
+from govcheck.regulations.config import load_regulations_config
+from govcheck.regulations.mapping import load_retrieval_map
+from govcheck.regulations.models import RetrievalMap
 from govcheck.review.config import load_review_config
 from govcheck.scoring.f02_score import load_config as load_scoring_config
 from govcheck.scoring.f02_score import recompute
 
 log = get_logger("review")
-
-# 進度回呼：審查編排層在各階段邊界誠實回報事件（介面層據此畫進度條）。
-# 事件為純 dict，至少含 stage/label/done/total；預設 None 時所有 emit 為 no-op，
-# 既有呼叫者（Streamlit / CLI / 舊 API / 測試）行為完全不變。
-ProgressFn = Callable[[dict], None]
-
-
-def _emit(progress: ProgressFn | None, **event) -> None:
-    if progress is not None:
-        progress(event)
 
 
 def review_f02(path: str | Path, cfg: dict | None = None) -> ReviewReport:
@@ -86,16 +80,15 @@ def review_submission(
     supporting: list[str] | None = None,
     cfg: dict | None = None,
     enable_llm: bool = False,
-    progress: ProgressFn | None = None,
     supporting_paths: list[str | Path] | None = None,
     workflow_stage: WorkflowStage | str = WorkflowStage.PROPOSAL,
 ) -> ReviewReport:
     """整份送件包初步審查。
 
     files：{"f01": path, "f02": path, "f03": path}，未上傳者不放鍵（或值為 None）。
-    supporting：佐證檔名清單（Phase 2 僅看檔名做關鍵字比對，不解析內容）。
-    enable_llm：是否對 F03 兩段佐證做 LLM 判讀（預設關；端點不可用時自動降級，不影響規則檢查）。
-    progress：選用進度回呼；於 parse / rules / llm 各階段邊界 emit 事件（預設 None = no-op）。
+    supporting：佐證檔名清單（供缺件檢查做關鍵字比對）。
+    supporting_paths：佐證檔實際路徑（供解析內容做語意判讀的佐證來源）。
+    enable_llm：是否做 F03 語意判讀（端點不可用時自動降級，不影響規則檢查）。
     """
     t0 = time.perf_counter()
     present = [k for k in ("f01", "f02", "f03") if files.get(k) is not None]
@@ -104,54 +97,51 @@ def review_submission(
     review_cfg = cfg or load_review_config()
     workflow_stage = WorkflowStage(workflow_stage)
     findings: list[Finding] = []
-    sub = _build_submission(
-        files, supporting, supporting_paths, review_cfg, findings, progress
-    )
+    sub = _build_submission(files, supporting, supporting_paths, review_cfg, findings)
     assessments = []
     prompt_refs = []
     usage = sub.parser_usage.model_copy(deep=True)
 
-    # 規則階段總步數（依實際會跑的檢查動態計：缺件與跨表恆跑，其餘視表單是否存在）
     has_f03_checklist = sub.f03_checklist is not None and sub.f03_checklist.sheet_present
-    rules_total = 2 + (sub.f01 is not None) + (sub.f02 is not None) + has_f03_checklist
-    rules_done = 0
+    reg_cfg = load_regulations_config()
+    retrieval_map = _load_regulation_map(reg_cfg)
 
-    def _rule_step(result: list[Finding]) -> list[Finding]:
-        nonlocal rules_done
-        rules_done += 1
-        _emit(progress, stage="rules", label="規則檢查", done=rules_done, total=rules_total)
-        return result
-
-    # 檢查順序維持原狀（missing → f01 → f02 → f03 規則 → f03 LLM → 跨表），確保 findings 插入
-    # 順序與既有行為一致；僅在各檢查邊界 emit 進度。跨表進度事件雖在 LLM 之後 emit，前端以
-    # 單調 pct 夾制，不會回退。
-    findings += _rule_step(missing_docs.run_all(sub, review_cfg))
+    # 檢查順序：缺件 → F01 → F02 → F03 規則 → F03 語意判讀 → F02 法規查表 → 跨表一致性。
+    findings += missing_docs.run_all(sub, review_cfg)
     if sub.f01 is not None:
-        findings += _rule_step(f01_rules.run_all(sub.f01, review_cfg))
+        findings += f01_rules.run_all(sub.f01, review_cfg)
     if sub.f02 is not None:
-        findings += _rule_step(f02_rules.run_all(sub.f02))  # F02 規則用自己的 scoring config
+        findings += f02_rules.run_all(sub.f02)  # F02 規則用自己的 scoring config
     if has_f03_checklist:
-        findings += _rule_step(f03_evidence_presence.run_all(
+        findings += f03_evidence_presence.run_all(
             sub.f03_checklist, review_cfg, workflow_stage
-        ))
+        )
         if enable_llm:
             outcome = _run_f03_assessment(
                 sub.f03_checklist,
                 sub.document_artifacts,
                 workflow_stage,
-                progress,
+                retrieval_map,
+                reg_cfg,
             )
             findings += outcome.findings
             assessments = outcome.assessments
             prompt_refs = outcome.prompt_refs
             usage.add(outcome.usage)
-    # RAG 查表（Phase 3）：刻意置於 has_f03_checklist 區塊之外、cross_consistency 之前，
-    # 使 F02-only 送件包（無 F03）也能跑 F02 規則查表；未啟用或失敗一律降級，絕不 raise。
-    findings += _run_rag_checks(sub, enable_llm, progress, include_f03=False)
-    findings += _rule_step(cross_consistency.run_all(sub, review_cfg))
+    if sub.f02 is not None:
+        # 純查表、零 LLM：F02-only 送件包也會列出觸發題對應的法規條文。
+        findings += f02_reg_refs.run_all(
+            sub.f02, retrieval_map, load_scoring_config(), reg_cfg["max_items"]
+        )
+    if retrieval_map is None and (sub.f02 is not None or has_f03_checklist):
+        # 缺對照表 = 需求「專案內容是否合規」失去審查基準，必須明示，不可靜默通過。
+        findings.append(_regulation_map_unavailable())
+    findings += cross_consistency.run_all(sub, review_cfg)
 
     findings.sort(key=_severity_order)
-    if not findings:
+    # 只要沒有 ERROR/WARN 就補一筆通過紀錄——僅有 INFO（法規引用、判讀摘要）時，
+    # 報告不該讓治理人員自己推論「沒看到問題就是沒問題」。
+    if not any(f.severity in (Severity.ERROR, Severity.WARN) for f in findings):
         findings.append(_submission_ok())
     report = ReviewReport(
         form_type="送件包", subject=sub.subject, findings=findings,
@@ -199,19 +189,44 @@ def review_submission(
     return report
 
 
+def _load_regulation_map(reg_cfg: dict) -> RetrievalMap | None:
+    """載入凍結法規對照表；缺檔 / 版本不符 / 格式錯誤一律回 None（絕不 raise）。
+
+    對照表是本機資產（含法規條文，不入庫），新環境常常沒有。缺檔不該讓整份審查失敗，
+    但也不該靜默——呼叫端會補一筆 REGULATION.MAP_UNAVAILABLE。
+    """
+    try:
+        return load_retrieval_map(reg_cfg["mapping_path"])
+    except Exception as exc:  # noqa: BLE001 - 缺對照表一律降級，不逸出
+        log.warning("regulation map unavailable err=%s", type(exc).__name__)
+        return None
+
+
+def _regulation_map_unavailable() -> Finding:
+    return Finding(
+        severity=Severity.INFO,
+        code="REGULATION.MAP_UNAVAILABLE",
+        title="法規對照表未就緒，本次未做條文比對",
+        message=("找不到或無法讀取法規對照表，本次審查未引用任何法規條文，"
+                 "亦未判讀法規符合性；其餘檢查不受影響，合規性請人工覆核。"),
+        source="rule",
+    )
+
+
 def _run_f03_assessment(
     checklist,
     artifacts,
     workflow_stage: WorkflowStage,
-    progress: ProgressFn | None = None,
+    retrieval_map: RetrievalMap | None,
+    reg_cfg: dict,
 ) -> f03_assessment.AssessmentOutcome:
-    """Build the centralized prompt gateway and run the unified F03 evaluator."""
+    """建立 prompt gateway 與佐證檢索器，跑統一 F03 判讀；任何初始化失敗一律降級。"""
     try:
         llm_cfg = load_llm_config()
         client = ChatClient.from_config(llm_cfg)
         gateway = build_prompt_gateway(client, llm_cfg)
         embedding_client = (
-            EmbeddingClient.from_config(load_rag_config())
+            EmbeddingClient.from_config(llm_cfg)
             if llm_cfg.get("evidence_embedding_enabled")
             else None
         )
@@ -226,8 +241,10 @@ def _run_f03_assessment(
             workflow_stage=workflow_stage,
             max_items=llm_cfg["max_items"],
             top_k=llm_cfg.get("evidence_top_k", 4),
-            progress=progress,
             retriever=retriever,
+            retrieval_map=retrieval_map,
+            max_sections_per_item=reg_cfg["max_sections_per_item"],
+            max_excerpt_chars=reg_cfg["max_excerpt_chars"],
         )
     except Exception as exc:  # noqa: BLE001 - LLM 不可用一律降級
         log.warning("llm review skipped err=%s", type(exc).__name__)
@@ -240,153 +257,8 @@ def _run_f03_assessment(
         )], UsageSummary(), [])
 
 
-def _rag_skipped(exc_type: str) -> Finding:
-    """RAG 降級 Finding：任何 mapping 缺檔 / 未預期例外皆收斂為此單筆 INFO（絕不 raise）。"""
-    return Finding(
-        severity=Severity.INFO,
-        code="RAG.SKIPPED",
-        title="RAG 法規比對已略過",
-        message=(f"RAG 法規比對無法執行（{exc_type}），已略過；"
-                 "其餘規則檢查與報告不受影響，請人工覆核。"),
-        source="rule",
-    )
-
-
-def _run_rag_checks(
-    sub: Submission,
-    enable_llm: bool,
-    progress: ProgressFn | None = None,
-    include_f03: bool = False,
-) -> list[Finding]:
-    """RAG 查表整合：F03 LLM 符合性判讀 + F02 規則查表（p3-03 §4.4）。
-
-    - 實際啟用 = enable_llm AND rag.enabled；未啟用 → 回 []（零事件、零 Finding）。
-    - 外層 try/except：mapping 缺檔/版本不符或任何未預期例外 → 單筆 RAG.SKIPPED（INFO），絕不 raise。
-    - 內部各自判存在：sub.f03_checklist（且 sheet_present）→ 跑 f03_rag（RAG 專用 client，timeout=cfg.timeout）；
-      sub.f02 → 跑 f02_reg_refs（純規則、無 LLM；F02-only 送件包亦跑）。
-    - log 只記代碼/計數/耗時/例外型別。
-    """
-    rag_cfg = load_rag_config()
-    if not enable_llm or not rag_cfg.get("enabled", False):
-        return []  # 未啟用 → 零事件、零 Finding（回歸硬條件：預設關 = 零差異）
-
-    # mapping 載入單獨攔截：缺檔/版本不符/任何例外 → RAG.SKIPPED（絕不 raise）
-    try:
-        retrieval_map = load_retrieval_map(rag_cfg.get("mapping_path"))
-    except Exception as exc:  # noqa: BLE001 - 缺 mapping 一律降級，不逸出
-        log.warning("rag mapping load skipped: %s", type(exc).__name__)
-        return [_rag_skipped(type(exc).__name__)]
-
-    # cfg_model 建構 + f03_rag/f02_reg_refs 執行同包一層 try：任何失敗 → RAG.SKIPPED（never-raise 洞修補）
-    try:
-        # 防禦性過濾：只餵 RagConfig 已定義的鍵，避免 extra="forbid" 遇多餘鍵拋例外
-        cfg_model = RagConfig.model_validate(
-            {k: v for k, v in rag_cfg.items() if k in RagConfig.model_fields}
-        )
-        findings: list[Finding] = []
-
-        # F03 RAG 符合性判讀（需 F03 檢核表且 sheet_present；建 RAG 專用 client）
-        if include_f03 and sub.f03_checklist is not None and sub.f03_checklist.sheet_present:
-            llm_cfg = load_llm_config()
-            rag_client = ChatClient(
-                base_url=llm_cfg["base_url"],
-                model=llm_cfg["model"],
-                api_key=llm_cfg.get("api_key"),
-                timeout=cfg_model.timeout,  # RAG 獨立 120s，不沿用 chat 60s
-                temperature=llm_cfg.get("temperature", 0.0),
-            )
-            findings += f03_rag.run_all(sub.f03_checklist, retrieval_map, rag_client, cfg_model, progress)
-
-        # F02 規則查表（純規則、零 LLM；F02-only 送件包也會跑）
-        if sub.f02 is not None:
-            findings += f02_reg_refs.run_all(sub.f02, retrieval_map, load_scoring_config())
-
-        log.info("rag checks done findings=%d", len(findings))
-        return findings
-    except Exception as exc:  # noqa: BLE001 - 任何未預期例外收斂為 RAG.SKIPPED，絕不 raise
-        log.warning("rag checks skipped: %s", type(exc).__name__)
-        return [_rag_skipped(type(exc).__name__)]
-
-
-def review_routed(
-    files: dict[str, str | Path],
-    supporting: list[str] | None = None,
-    class_findings: list[Finding] | None = None,
-    cfg: dict | None = None,
-    enable_llm: bool = False,
-    progress: ProgressFn | None = None,
-    supporting_paths: list[str | Path] | None = None,
-    workflow_stage: WorkflowStage | str = WorkflowStage.PROPOSAL,
-) -> ReviewReport:
-    """已分類路由後的審查：跑既有 review_submission，再併入分類 Findings。
-
-    review_submission 行為不變；此處於其上薄薄一層，把分類產生的 Findings
-    （CLASSIFY.SUMMARY / 重複 / 無法辨識）併入，重排後僅在整體無 ERROR/WARN 時補 OK。
-    enable_llm 透傳給 review_submission（控制 F03 佐證 LLM 判讀）。
-    progress 透傳給 review_submission（介面層據此畫進度條；預設 None = no-op）。
-    """
-    review_cfg = cfg or load_review_config()
-    report = review_submission(
-        files,
-        supporting=supporting,
-        supporting_paths=supporting_paths,
-        cfg=review_cfg,
-        enable_llm=enable_llm,
-        progress=progress,
-        workflow_stage=workflow_stage,
-    )
-
-    merged = [f for f in report.findings if f.code != "SUBMISSION.OK"]
-    merged = list(class_findings or []) + merged
-    merged.sort(key=_severity_order)
-    if not any(f.severity in (Severity.ERROR, Severity.WARN) for f in merged):
-        merged.append(_submission_ok())
-    return report.model_copy(update={
-        "findings": merged,
-        "decision_status": _decision_status(
-            merged,
-            documents=report.document_statuses,
-            llm_required=(
-                report.decision_status is DecisionStatus.MANUAL_REVIEW
-                or bool(report.review_run_meta.model_deployment)
-            ),
-            llm_completed=bool(report.item_assessments),
-        ),
-    })
-
-
-def review_files(
-    paths: list[str | Path],
-    cfg: dict | None = None,
-    enable_llm: bool = False,
-    workflow_stage: WorkflowStage | str = WorkflowStage.PROPOSAL,
-) -> tuple[ReviewReport, list[FileClassification]]:
-    """批次檔案自動分類 → 路由 → 審查。
-
-    回傳 (報告, 分類結果)：分類結果是介面顯示用 metadata（檔名→判定），
-    刻意不塞進 ReviewReport，以免污染跨階段契約。
-    """
-    review_cfg = cfg or load_review_config()
-    results = classify_files(paths, review_cfg)
-    files, supporting, class_findings = route_classifications(results)
-    supporting_paths = [
-        result.path for result in results
-        if result.kind.value == "supporting" and result.path is not None
-    ]
-    report = review_routed(
-        files,
-        supporting,
-        class_findings,
-        review_cfg,
-        enable_llm=enable_llm,
-        supporting_paths=supporting_paths,
-        workflow_stage=workflow_stage,
-    )
-    return report, results
-
-
 def _submission_ok() -> Finding:
-    """送件包規則檢查全數通過的 INFO Finding（review_submission 與 review_routed 共用）。"""
+    """送件包規則檢查全數通過的 INFO Finding。"""
     return Finding(
         severity=Severity.INFO,
         code="SUBMISSION.OK",
@@ -401,7 +273,6 @@ def _build_submission(
     supporting_paths: list[str | Path] | None,
     review_cfg: dict,
     findings: list[Finding],
-    progress: ProgressFn | None = None,
 ) -> Submission:
     """逐檔解析成 Submission；每檔包 try/except，失敗加 PARSE_ERROR 並繼續（介面層不崩）。"""
     presence = FilePresence(
@@ -415,18 +286,6 @@ def _build_submission(
         supporting_paths=[str(path) for path in supporting_paths or []],
     )
 
-    # 解析是耗時大宗（openpyxl 每檔約 1–3 秒）；每解析完一張表 emit 一次進度。
-    parse_total = (
-        int(presence.f01) + int(presence.f02) + int(presence.f03)
-        + len(sub.supporting_paths)
-    )
-    parse_done = 0
-
-    def _parse_step() -> None:
-        nonlocal parse_done
-        parse_done += 1
-        _emit(progress, stage="parse", label="解析表單", done=parse_done, total=parse_total)
-
     if presence.f01:
         log.debug("parsing form=F01")
         try:
@@ -434,7 +293,6 @@ def _build_submission(
         except Exception as exc:  # noqa: BLE001 - 介面層需把解析錯誤友善呈現
             log.warning("parse failed form=F01 err=%s", type(exc).__name__)
             findings.append(_parse_error("F01", exc))
-        _parse_step()
     if presence.f02:
         log.debug("parsing form=F02")
         try:
@@ -442,7 +300,6 @@ def _build_submission(
         except Exception as exc:  # noqa: BLE001
             log.warning("parse failed form=F02 err=%s", type(exc).__name__)
             findings.append(_parse_error("F02", exc))
-        _parse_step()
     if presence.f03:
         log.debug("parsing form=F03")
         try:
@@ -463,13 +320,10 @@ def _build_submission(
                 expected="可解析的官方範本",
                 actual="解析失敗",
             ))
-        _parse_step()
 
     if sub.supporting_paths:
         adapter = TsParserAdapter()
         sub.document_artifacts, sub.parser_usage = adapter.parse_many(sub.supporting_paths)
-        for _ in sub.supporting_paths:
-            _parse_step()
 
     if sub.f02 is not None:
         # 風險分數/等級以答案重算為準（確定性真值），重算失敗才退回檔內快取；

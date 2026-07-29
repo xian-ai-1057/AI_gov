@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from govcheck.checks.rule import f02_reg_refs
 from govcheck.models import F02Form
-from govcheck.rag.models import F02QuestionRetrieval, RetrievalMap, RetrievedSection
+from govcheck.regulations.models import F02QuestionRetrieval, RetrievalMap, RetrievedSection
 
 
 # ─────────────────────────────────────────────────────────────────────────────

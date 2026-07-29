@@ -25,26 +25,26 @@ flowchart LR
 `F01`、`F02`、`F03` 主表不交給 `ts_parser`。單一佐證文件解析失敗只影響該文件，規則與其他
 文件繼續執行；`unreadable`、`not_found` 與 `contradicted` 是不同語意。
 
-## API v2
+## API
 
-`POST /api/v2/review` 必須以 multipart form 提供：
+`POST /api/review` 以 multipart form 提供：
 
-- `files`: 一或多個檔案。
-- `kinds`: 與檔案順序一致的 JSON array，例如 `["f03", "supporting"]`。
-- `workflow_stage`: `proposal`、`acceptance` 或 `production`。
+- `f01` / `f02` / `f03`: 各一份表單檔（選填；未上傳由缺件檢查列出）。
+- `supporting`: 佐證文件，可多份。
+- `workflow_stage`: `proposal`（預設）、`acceptance` 或 `production`。
 - `enable_llm`: 選填；省略時採應用設定。
 
-回應新增：
+回應欄位：
 
-- `decision_status`: `approved | changes_required | manual_review | incomplete`。
-- `item_assessments`: 每一 F03 項目的完整性、合理性、證據、衝突、信心、引用與建議。
+- `decision_status`: `approved | changes_required | manual_review | incomplete`
+  （唯一的通過訊號；刻意不回 `passed`，避免兩個訊號互相矛盾）。
+- `item_assessments`: 每一 F03 項目的完整性、合理性、證據、衝突、**法規符合性**、信心、引用與建議。
+- `checklist_roster`: 全部檢核項的涵蓋狀態（含未送判讀者）。
 - `document_statuses`: 去除內容後的 parser 狀態與版本資訊。
 - `citations`: 所有有效引用的扁平集合。
 - `usage_summary`: parser OCR/VLM、evidence embedding、review primary/escalation、tokens、延遲、快取命中。
 - `review_run_meta`: workflow、Prompt 固定版本、parser source、政策、schema 與模型版本。
-
-`POST /api/v2/review/stream` 使用相同欄位，以 SSE 回傳進度與最終 v2 報告。v1 endpoints 保留舊
-response adapter，過渡期不會暴露 v2 欄位。
+- `findings` / `markdown`: 逐筆發現與可下載的 Markdown 報告。
 
 ## Prompt 契約
 
@@ -58,7 +58,7 @@ Prompt 平台的 model 與 optional parameters 不會傳入 Chat client。模型
 重試、circuit breaker 與 JSON schema 都由應用程式控制。正式上線前呼叫：
 
 ```text
-GET /api/v2/readiness/prompts
+GET /api/readiness
 ```
 
 七個 Prompt 都必須回傳版本；任何 `unavailable:*` 都不得導入正式流量。

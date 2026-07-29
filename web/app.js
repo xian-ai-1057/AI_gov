@@ -1,6 +1,6 @@
-/* AI 治理審查小幫手 — 前端（vanilla JS，移植自 Claude Design .dc.html 的 DCLogic）。
-   三步驟：上傳送件包 → 確認自動分類 → 審查報告。狀態驅動整頁重繪。
-   後端：POST /api/classify、POST /api/v2/review/stream。資料全程地端，無外部請求。 */
+/* AI 治理審查小幫手 — 前端（vanilla JS）。
+   兩步驟：上傳送件包 → 審查報告。狀態驅動整頁重繪。
+   後端：POST /api/review。資料全程地端，無外部請求。 */
 
 (() => {
   "use strict";
@@ -20,35 +20,34 @@
     if (grade === "低") return { bg: "var(--ok-bg)", fg: "var(--ok)", border: "var(--ok-bg)" };
     return SEV.info;
   }
-  const STEP_LABELS = ["上傳送件包", "確認分類", "審查報告"];
-  const CHECKLIST = [
-    { tag: "F1", name: "F01 系統資訊表", note: "系統基本資訊與必填欄位" },
-    { tag: "F2", name: "F02 風險評鑑", note: "固有風險計分與分級" },
-    { tag: "F3", name: "F03 上線檢核表", note: "上線前檢核項目" },
-    { tag: "＋", name: "佐證文件", note: "模型卡、測試報告等（非 Excel）" },
+  const STEP_LABELS = ["上傳送件包", "審查報告"];
+  // 上傳欄位（表單各一份，佐證可多份）；value 對應 /api/review 的 form field 名稱。
+  const SLOTS = [
+    { key: "f01", tag: "F1", name: "F01 系統資訊表", note: "系統基本資訊與必填欄位", multiple: false },
+    { key: "f02", tag: "F2", name: "F02 風險評鑑", note: "固有風險計分與分級", multiple: false },
+    { key: "f03", tag: "F3", name: "F03 上線檢核表", note: "上線前檢核項目", multiple: false },
+    { key: "supporting", tag: "＋", name: "佐證文件", note: "模型卡、測試報告等（可多檔）", multiple: true },
   ];
 
   // 只有 F03 檢核項 finding 的 location 會長這樣（見 f03.py F03ChecklistItem.loc）：
-  // 「項次 1-1」或「項次 1-1（管理議題）」。F01/F02/DOC/CROSS/CLASSIFY 一律不會命中。
+  // 「項次 1-1」或「項次 1-1（管理議題）」。F01/F02/DOC/CROSS 一律不會命中。
   const ITEM_LOC_RE = /^項次\s*(\d+-\d+)(?:（([^）]*)）)?/;
 
-  // 兩張 F03 彙整表（LLM_TABLE / RAG_TABLE）的儲存格前導符號 → 狀態種類。
-  const CELL_MARKER_KIND = [["✅", "ok"], ["🟡", "warn"], ["❓", "undet"], ["⚠️", "err"]];
-
-  // 彙整參考分頁：順序即 defaultRefTab 的優先序（原始彙整 → 法規對應 → 通過紀錄 → 全部）。
+  // 彙整參考分頁：順序即 defaultRefTab 的優先序（判讀摘要 → 法規對應 → 通過紀錄 → 全部）。
   const REF_TAB_ORDER = ["aggregate", "regref", "passlog", "all"];
-  const REF_TAB_LABELS = { aggregate: "原始彙整", regref: "法規對應", passlog: "通過紀錄", all: "全部" };
+  const REF_TAB_LABELS = { aggregate: "判讀摘要", regref: "法規對應", passlog: "通過紀錄", all: "全部" };
 
-  // 非項次 info finding 的分桶依據（見 f03_evidence.py / f03_rag.py / f02_reg_refs.py 產出代碼）。
-  const AGGREGATE_CODES = new Set(["F03.LLM_TABLE", "F03.LLM_SUMMARY", "F03.RAG_TABLE", "F03.RAG_SUMMARY"]);
-  function isRegRefCode(code) { return code === "F02.REG_REF_SUMMARY" || code === "F02.REG_REF_NOTE"; }
+  // 非項次 info finding 的分桶依據（見 f03_assessment.py / f02_reg_refs.py 產出代碼）。
+  const AGGREGATE_CODES = new Set(["F03.ASSESSMENT_SUMMARY"]);
+  function isRegRefCode(code) {
+    return code === "F02.REG_REF_SUMMARY" || code === "F02.REG_REF_NOTE"
+      || code === "REGULATION.MAP_UNAVAILABLE";
+  }
 
-  // 整段 AI 判讀降級訊號（端點連不上而略過，或連續失敗而中止）：非合規判讀結果，
-  // 代表「這次 LLM/RAG 判讀未完整跑」。須在主視圖顯著提示，不可埋進單一項次列或收合的彙整參考。
-  // 只有在 LLM/RAG 原本應執行時才會由 engine/checks 產生（刻意停用不會出現），故出現即為真降級。
+  // 整段判讀降級訊號：非合規結論，代表「這次語意判讀沒完整跑」。須在主視圖顯著提示，
+  // 不可埋進單一項次列或收合的彙整參考。
   const NOTICE_CODES = new Set([
-    "F03.LLM_SKIPPED", "F03.PROMPT_UNAVAILABLE", "RAG.SKIPPED", "RAG.DISABLED",
-    "F03.LLM_ERROR", "F03.RAG_ERROR", "F03.RAG_DISABLED",
+    "F03.LLM_SKIPPED", "F03.PROMPT_UNAVAILABLE",
     // 超過上限而未送審的檢核項不會出現在任何列，只能靠這條主視圖提示讓人看見。
     "F03.ASSESSMENT_TRUNCATED",
   ]);
@@ -56,24 +55,23 @@
   // 總覽表「主因」欄位的問題欄 → 顯示字樣；CAUSE_CODE_MAP 讓「無彙整表」時仍能由個別
   // finding 代碼推出主因（見 buildMatrix 的 no-LLM fallback 說明）。
   const CAUSE_LABELS = {
-    golive: "上線階段佐證不足",
-    prop: "提案階段佐證不足",
-    diff: "提案與上線差異",
-    rag: "法規符合性缺口",
+    golive: "上線階段內容不足",
+    prop: "提案階段內容不足",
+    evidence: "佐證文件不足",
+    diff: "佐證彼此衝突",
+    reg: "法規符合性缺口",
   };
   const CAUSE_CODE_MAP = {
     "F03.EVIDENCE_MISSING_PROPOSAL": "prop",
-    "F03.LLM_VAGUE_PROPOSAL": "prop",
     "F03.EVIDENCE_MISSING_GOLIVE": "golive",
-    "F03.LLM_VAGUE_GOLIVE": "golive",
-    "F03.LLM_DIFF": "diff",
-    "F03.RAG_GAP": "rag",
     "F03.ASSESSMENT_INCOMPLETE": "prop",
     "F03.ASSESSMENT_VAGUE": "prop",
     "F03.ASSESSMENT_UNREASONABLE": "prop",
-    "F03.EVIDENCE_NOT_SUPPORTED": "rag",
-    "F03.EVIDENCE_CONTRADICTED": "rag",
-    "F03.EVIDENCE_SOURCE_CONFLICT": "rag",
+    "F03.EVIDENCE_NOT_SUPPORTED": "evidence",
+    "F03.EVIDENCE_CONTRADICTED": "diff",
+    "F03.EVIDENCE_SOURCE_CONFLICT": "diff",
+    "F03.REGULATION_GAP": "reg",
+    "F03.TEMPLATE_REF_MODIFIED": "reg",
   };
   // 未進入語意判讀的檢核項（見 F03Checklist.roster）：狀態格與摘要的字樣。
   // 這些列刻意不算「需人工確認」（kind "skip" 不在 attnKinds 內）——它們是「本次沒判」，
@@ -103,9 +101,7 @@
   // ── 狀態 ───────────────────────────────────────────────────────
   const state = {
     step: 1,
-    files: [],          // 真實 File 物件
-    classify: null,     // /api/classify 回應 { kinds, files:[...] }
-    kinds: {},          // index -> 使用者選定 kind（覆寫預設）
+    slots: { f01: null, f02: null, f03: null, supporting: [] },  // 真實 File 物件
     review: null,       // /api/review 回應
     role: "proposer",  // proposer | reviewer
     workflowStage: "proposal",
@@ -116,25 +112,12 @@
     refOpen: false,     // 【彙整參考】卡片是否展開
     refTab: null,       // 【彙整參考】目前分頁 key（aggregate/regref/passlog/all）
     reviewing: false,
-    progress: null,     // { label, pct, detail } — SSE 串流的階段進度
     error: null,
   };
 
-  // 進度條階段權重：把後端 (stage, done/total) 事件換算成 0–100% 的單調進度。
-  // LLM 判讀是總等待時間大宗，分到最大的尾段；未啟用 LLM 時規則完成後直接由 done 收 100%。
-  const PROGRESS_BANDS = {
-    upload: [0, 10],
-    parse:  [10, 35],
-    rules:  [35, 70],
-    llm:    [70, 98],
-  };
-
-  function progressPct(ev) {
-    const band = PROGRESS_BANDS[ev.stage];
-    if (!band) return null;
-    const total = ev.total > 0 ? ev.total : 1;
-    const frac = Math.max(0, Math.min(1, (ev.done || 0) / total));
-    return Math.round(band[0] + (band[1] - band[0]) * frac);
+  function chosenFiles() {
+    return [state.slots.f01, state.slots.f02, state.slots.f03, ...state.slots.supporting]
+      .filter(Boolean);
   }
 
   const app = document.getElementById("app");
@@ -173,15 +156,7 @@
     return { header, rows, next: j };
   }
 
-  // 給 buildMatrix 用：F03.LLM_TABLE / F03.RAG_TABLE 的 message 恆「以表格開頭、無其餘文字」，
-  // 故直接從第 0 行找表格即可；非表格（或 message 為空）回 null。
-  function parseGfmTable(msg) {
-    if (!msg) return null;
-    const t = parseGfmTableAt(String(msg).split("\n"), 0);
-    return t ? { header: t.header, rows: t.rows } : null;
-  }
-
-  // 極簡 GFM 表格渲染（給 F03 LLM 佐證彙整表的多行訊息）；非表格純文字保留換行。
+  // 極簡 GFM 表格渲染；finding message 目前多為純文字，非表格內容保留換行。
   function renderMessage(msg) {
     if (!msg) return "";
     const lines = String(msg).split("\n");
@@ -241,17 +216,6 @@
     return best;
   }
 
-  // 彙整表儲存格文字 → {kind, note}：kind 由「前導符號」決定，note 為符號後剩餘文字（trim）。
-  // 空白或「—」→ none；不含已知符號的文字（理論上不會發生）也回 none，並把全文塞進 note。
-  function cellStatus(cellText) {
-    const text = (cellText == null ? "" : String(cellText)).trim();
-    if (!text || text === "—") return { kind: "none", note: "" };
-    for (const [marker, kind] of CELL_MARKER_KIND) {
-      if (text.startsWith(marker)) return { kind, note: text.slice(marker.length).trim() };
-    }
-    return { kind: "none", note: text };
-  }
-
   // 彙整參考預設分頁：依 REF_TAB_ORDER 找第一個非空桶；理論上 all 恆非空，僅作保底。
   function defaultRefTab(reference) {
     for (const key of REF_TAB_ORDER) { if (reference[key] && reference[key].length) return key; }
@@ -268,24 +232,25 @@
       naReason: null,     // 不適用理由（提案單位填在佐證欄時）
       findings: [],
       cells: {
-        prop: { kind: "none", note: "" },
-        golive: { kind: "none", note: "" },
-        diff: { kind: "none", note: "" },
-        rag: { kind: "none", note: "" },
+        prop: { kind: "none", note: "" },      // 提案階段內容品質
+        golive: { kind: "none", note: "" },    // 上線階段內容品質
+        evidence: { kind: "none", note: "" },  // 佐證文件是否支持敘述
+        reg: { kind: "none", note: "" },       // 法規條文符合性
       },
       refs: "",
       assessment: null,
     };
   }
 
-  // 摘要欄：優先序為「兩段差異摘要 → 上線佐證草率原因 → 法規缺口 → 首個附掛 finding 標題」。
-  // 後備取 title 而非 message：no-LLM 模式下 message 是整句規則說明文，塞進摘要欄變雜訊；
+  // 摘要欄：優先序為「法規缺口 → 佐證問題 → 內容問題 → 首個附掛 finding 標題」。
+  // 後備取 title 而非 message：message 是整句說明文，塞進摘要欄變雜訊；
   // title 本來就是精煉字樣（如「上線階段佐證空白」）。
-  // 注意：須在 applyRuleCellFallback 之前呼叫，讓儲存格 note 只反映彙整表判讀結果。
+  // 注意：須在 applyRuleCellFallback 之前呼叫，讓儲存格 note 只反映判讀結果。
   function rowGist(row) {
-    if (row.cells.diff.note) return row.cells.diff.note;
+    if (row.cells.reg.kind === "warn" && row.cells.reg.note) return row.cells.reg.note;
+    if (row.cells.evidence.kind === "warn" && row.cells.evidence.note) return row.cells.evidence.note;
     if (row.cells.golive.note) return row.cells.golive.note;
-    if (row.cells.rag.kind === "warn" && row.cells.rag.note) return row.cells.rag.note;
+    if (row.cells.prop.note) return row.cells.prop.note;
     if (row.findings.length) return row.findings[0].title;
     return "—";
   }
@@ -302,29 +267,31 @@
   function applyCoverageCells(row) {
     const cell = COVERAGE_CELL[row.coverage];
     if (!cell) return;
-    ["prop", "golive", "diff", "rag"].forEach((k) => {
+    ["prop", "golive", "evidence", "reg"].forEach((k) => {
       if (row.cells[k].kind === "none") row.cells[k] = { ...cell };
     });
   }
 
-  // 這一列「問題出在哪一欄」的集合：優先看彙整表儲存格狀態，再補上個別 finding 代碼
-  // （沒有彙整表時，個別 finding 代碼是唯一線索，讓 no-LLM fallback 也能算出主因）。
+  // 這一列「問題出在哪一欄」的集合：先看狀態格，再補上個別 finding 代碼
+  // （關閉語意判讀時，規則式 finding 代碼是唯一線索）。
+  const CAUSE_KEYS = ["golive", "prop", "evidence", "diff", "reg"];
+
   function rowCauses(row) {
     const causes = new Set();
     if (row.cells.golive.kind === "warn") causes.add("golive");
     if (row.cells.prop.kind === "warn") causes.add("prop");
-    if (row.cells.diff.kind === "warn" || row.cells.diff.kind === "err") causes.add("diff");
-    if (row.cells.rag.kind === "warn") causes.add("rag");
+    if (row.cells.evidence.kind === "warn") causes.add("evidence");
+    if (row.cells.reg.kind === "warn") causes.add("reg");
     row.findings.forEach((f) => { const c = CAUSE_CODE_MAP[f.code]; if (c) causes.add(c); });
     return causes;
   }
 
   function computePrimaryCause(attentionRows) {
-    const tally = { golive: 0, prop: 0, diff: 0, rag: 0 };
+    const tally = Object.fromEntries(CAUSE_KEYS.map((k) => [k, 0]));
     attentionRows.forEach((row) => { row.causes.forEach((c) => { tally[c] += 1; }); });
     let best = null;
     let bestN = 0;
-    ["golive", "prop", "diff", "rag"].forEach((k) => { if (tally[k] > bestN) { best = k; bestN = tally[k]; } });
+    CAUSE_KEYS.forEach((k) => { if (tally[k] > bestN) { best = k; bestN = tally[k]; } });
     return best ? CAUSE_LABELS[best] : "—";
   }
 
@@ -370,38 +337,10 @@
     });
     reference.all = [...report.findings].sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity]);
 
-    const llmTableFinding = reference.aggregate.find((f) => f.code === "F03.LLM_TABLE");
-    const ragTableFinding = reference.aggregate.find((f) => f.code === "F03.RAG_TABLE");
-    const llmTable = llmTableFinding ? parseGfmTable(llmTableFinding.message) : null;
-    const ragTable = ragTableFinding ? parseGfmTable(ragTableFinding.message) : null;
     const assessments = report.item_assessments || [];
-    const noTables = !llmTable && !ragTable && assessments.length === 0;
+    // 關閉語意判讀（或判讀整段失敗）時，規則式 finding 是總覽表唯一的內容來源。
+    const noAssessments = assessments.length === 0;
 
-    if (llmTable) {
-      llmTable.rows.forEach((cells) => {
-        const [itemId, topic, diffCell, propCell, golCell] = cells;
-        if (!itemId) return;
-        let row = rowMap.get(itemId);
-        if (!row) { row = newMatrixRow(itemId, topic); rowMap.set(itemId, row); }
-        if (topic && topic !== "—") row.topic = topic; // 表格 topic 優先
-        row.cells.diff = cellStatus(diffCell);
-        row.cells.prop = cellStatus(propCell);
-        row.cells.golive = cellStatus(golCell);
-      });
-    }
-    if (ragTable) {
-      ragTable.rows.forEach((cells) => {
-        const [itemId, topic, verdictCell, refsCell] = cells;
-        if (!itemId) return;
-        let row = rowMap.get(itemId);
-        if (!row) { row = newMatrixRow(itemId, topic); rowMap.set(itemId, row); }
-        if (topic && topic !== "—") row.topic = topic;
-        row.cells.rag = cellStatus(verdictCell);
-        row.refs = refsCell && refsCell !== "—" ? refsCell : "";
-      });
-    }
-
-    // API v2 的結構化 assessment 是正式資料契約；舊 Markdown 表僅保留作過渡顯示。
     assessments.forEach((assessment) => {
       let row = rowMap.get(assessment.item_id);
       if (!row) {
@@ -414,8 +353,8 @@
       if (assessment.assessed === false) {
         const unknown = { kind: "undet", note: "未判讀" };
         row.cells[report.workflow_stage === "proposal" ? "prop" : "golive"] = unknown;
-        row.cells.diff = unknown;
-        row.cells.rag = unknown;
+        row.cells.evidence = unknown;
+        row.cells.reg = unknown;
         return;
       }
       const contentBad = assessment.completeness === "incomplete" ||
@@ -430,23 +369,31 @@
       const stageColumn = report.workflow_stage === "proposal" ? "prop" : "golive";
       row.cells[stageColumn] = contentCell;
 
-      if (["contradicted", "conflicting_sources"].includes(assessment.conflict_status)) {
-        row.cells.diff = { kind: "warn", note: "佐證有衝突" };
-      } else if (assessment.conflict_status === "consistent") {
-        row.cells.diff = { kind: "ok", note: "一致" };
+      if (assessment.evidence_status === "supported") {
+        row.cells.evidence = { kind: "ok", note: "有佐證" };
+      } else if (assessment.evidence_status === "unreadable") {
+        row.cells.evidence = { kind: "undet", note: "文件無法解析" };
+      } else if (["contradicted", "conflicting_sources"].includes(assessment.conflict_status)) {
+        // 佐證衝突比「找不到佐證」更值得看，故蓋過 evidence_status 的字樣。
+        row.cells.evidence = { kind: "warn", note: "佐證有衝突" };
       } else {
-        row.cells.diff = { kind: "undet", note: "未知" };
+        row.cells.evidence = {
+          kind: "warn",
+          note: assessment.evidence_status === "partial" ? "部分佐證" : "未找到佐證",
+        };
       }
 
-      if (assessment.evidence_status === "supported") {
-        row.cells.rag = { kind: "ok", note: "有佐證" };
-      } else if (assessment.evidence_status === "unreadable") {
-        row.cells.rag = { kind: "undet", note: "文件無法解析" };
+      if (assessment.regulation_gap === "covered") {
+        row.cells.reg = { kind: "ok", note: "已涵蓋" };
+      } else if (assessment.regulation_gap === "gap") {
+        row.cells.reg = { kind: "warn", note: "條文缺口" };
       } else {
-        row.cells.rag = { kind: "warn", note: assessment.evidence_status === "partial" ? "部分佐證" : "未找到佐證" };
+        row.cells.reg = { kind: "undet", note: "無條文對照" };
       }
-      row.refs = (assessment.citations || []).map((citation) =>
-        `${citation.document_id} ${citation.locator_type}:${citation.locator_value}`).join("、");
+      // 引用欄同時放法規條號與佐證出處：治理人員要的是「依據在哪」，兩者都是依據。
+      const citationRefs = (assessment.citations || []).map((citation) =>
+        `${citation.document_id} ${citation.locator_type}:${citation.locator_value}`);
+      row.refs = [...(assessment.regulation_refs || []), ...citationRefs].join("、");
     });
 
     const rows = [...rowMap.values()];
@@ -457,16 +404,16 @@
       applyRuleCellFallback(row);
       applyCoverageCells(row);
       if (row.gist === "—" && COVERAGE_GIST[row.coverage]) row.gist = COVERAGE_GIST[row.coverage];
-      const cellKeys = ["prop", "golive", "diff", "rag"];
+      const cellKeys = ["prop", "golive", "evidence", "reg"];
       // warn（有問題）、err（⚠️ 判讀失敗）、undet（❓ 無法判定）三種儲存格都代表「需人工確認」：
       // err/undet 是「AI 判不了，請人看」，同樣不能在預設「只看有問題」濾鏡下被藏掉。
       const attnKinds = { warn: 1, err: 1, undet: 1 };
       const anyCellAttn = cellKeys.some((k) => attnKinds[row.cells[k].kind]);
       const findingSev = maxSeverity(row.findings);
       const anyFindingWarnErr = findingSev === "error" || findingSev === "warn";
-      // 有需注意的儲存格／有 warn+ 的附掛 finding／或彙整表完全缺席時任何附掛 finding 都算數
-      // （no-LLM fallback：規則式的佐證空白 finding 是唯一線索，不能被漏掉）。
-      row.hasAttention = anyCellAttn || anyFindingWarnErr || (noTables && row.findings.length > 0);
+      // 有需注意的儲存格／有 warn+ 的附掛 finding／或完全沒有判讀結果時任何附掛 finding 都算數
+      // （關閉判讀時，規則式的佐證空白 finding 是唯一線索，不能被漏掉）。
+      row.hasAttention = anyCellAttn || anyFindingWarnErr || (noAssessments && row.findings.length > 0);
       // 嚴重度（紅底＋自動展開）只由真正 error 級的附掛 finding 決定；⚠️/❓ 在後端皆為 INFO
       // （判讀失敗/無法判定 ≠ 合規違規），不可染成紅色錯誤、搶走治理人員對真違規的 triage 注意力。
       row.rowSeverity = findingSev === "error" ? "error" : (row.hasAttention ? "warn" : "info");
@@ -494,107 +441,59 @@
   }
 
   function reachableStep() {
-    if (state.review) return 3;
-    if (state.classify) return 2;
-    return 1;
+    return state.review ? 2 : 1;
   }
 
   // ── 動作 ───────────────────────────────────────────────────────
-  function onFilesChosen(fileList) {
+  function onFilesChosen(slotKey, fileList) {
     const files = Array.from(fileList || []);
     if (!files.length) return;
-    state.files = files;
-    state.classify = null;
-    state.kinds = {};
+    if (slotKey === "supporting") {
+      // 佐證可分次選取，累加而非覆蓋（同名檔以後選的為準）。
+      const byName = new Map(state.slots.supporting.map((f) => [f.name, f]));
+      files.forEach((f) => byName.set(f.name, f));
+      state.slots.supporting = [...byName.values()];
+    } else {
+      state.slots[slotKey] = files[0];
+    }
     state.error = null;
     render();
   }
 
-  async function goClassify() {
-    if (!state.files.length) return;
-    state.error = null;
-    const fd = new FormData();
-    state.files.forEach((f) => fd.append("files", f, f.name));
-    try {
-      const data = await postForm("/api/classify", fd);
-      state.classify = data;
-      state.kinds = {};
-      data.files.forEach((f) => { state.kinds[f.index] = f.kind; });
-      state.step = 2;
-    } catch (e) {
-      state.error = e.message;
+  function clearSlot(slotKey, name) {
+    if (slotKey === "supporting") {
+      state.slots.supporting = name
+        ? state.slots.supporting.filter((f) => f.name !== name)
+        : [];
+    } else {
+      state.slots[slotKey] = null;
     }
+    state.error = null;
     render();
   }
 
   async function startReview() {
+    if (!chosenFiles().length) return;
     state.error = null;
     state.reviewing = true;
-    state.progress = null;
     render();
     const fd = new FormData();
-    state.files.forEach((f) => fd.append("files", f, f.name));
-    // 依 classify.files 順序（與 state.files 上傳順序一致）逐檔取確認後的 kind，
-    // 一律以伺服器指派的 f.index 為鍵，與 goClassify / set-kind 的寫入鍵保持一致。
-    const confirmed = state.classify.files.map((f) =>
-      state.kinds[f.index] != null ? state.kinds[f.index] : f.kind);
-    fd.append("kinds", JSON.stringify(confirmed));
+    ["f01", "f02", "f03"].forEach((key) => {
+      const file = state.slots[key];
+      if (file) fd.append(key, file, file.name);
+    });
+    state.slots.supporting.forEach((f) => fd.append("supporting", f, f.name));
     fd.append("workflow_stage", state.workflowStage);
     try {
-      // SSE 串流：邊審查邊推進度，最後一筆事件帶完整報告。
-      const res = await fetch("/api/v2/review/stream", { method: "POST", body: fd });
-      if (!res.ok || !res.body) {
-        let detail = `伺服器錯誤（${res.status}）`;
-        try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (_) { /* ignore */ }
-        throw new Error(detail);
-      }
-      await consumeReviewStream(res.body);  // 收到 done 事件時套用報告並跳第 3 步
+      applyReport(await postForm("/api/review", fd));
     } catch (e) {
       state.error = e.message;
       state.reviewing = false;
-      state.progress = null;
       render();
     }
   }
 
-  // 讀 text/event-stream：逐 frame 解析進度事件，更新進度條；done 套報告、error 拋出。
-  async function consumeReviewStream(body) {
-    const reader = body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    let maxPct = 0;
-    try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let sep;
-        while ((sep = buf.indexOf("\n\n")) !== -1) {
-          const frame = buf.slice(0, sep);
-          buf = buf.slice(sep + 2);
-          const line = frame.split("\n").find((l) => l.startsWith("data:"));
-          if (!line) continue;
-          let ev;
-          try { ev = JSON.parse(line.slice(5).trim()); } catch (_) { continue; }
-          if (ev.stage === "error") throw new Error(ev.message || "審查失敗。");
-          if (ev.stage === "done") { applyReport(ev.report); return; }
-          const pct = progressPct(ev);
-          // 僅在百分比實際前進時更新＋重繪（單調遞增、永不回退），避免同 pct 的冗餘整頁重繪。
-          if (pct != null && pct > maxPct) {
-            maxPct = pct;
-            const detail = ev.total ? `${ev.done}/${ev.total}` : "";
-            state.progress = { label: ev.label || "審查中", pct: maxPct, detail };
-            render();
-          }
-        }
-      }
-      throw new Error("審查串流中斷，未取得完整報告。");
-    } finally {
-      reader.cancel().catch(() => { /* 已關閉/已取消 → 忽略 */ });
-    }
-  }
-
-  // 套用最終報告 → 跳第 3 步（單次/串流共用；錯誤項預設展開對應設計 componentDidMount）。
+  // 套用最終報告 → 跳報告頁（錯誤項預設展開）。
   function applyReport(data) {
     state.review = data;
     const open = {};
@@ -613,25 +512,21 @@
     state.refTab = defaultRefTab(m.reference);
 
     state.reviewing = false;
-    state.progress = null;
-    state.step = 3;
+    state.step = 2;
     render();
   }
 
   function reset() {
     state.step = 1;
-    state.files = [];
-    state.classify = null;
-    state.kinds = {};
+    state.slots = { f01: null, f02: null, f03: null, supporting: [] };
     state.review = null;
-    state.filter = "info";  // 與初始預設一致（落地分頁在 startReview 依紀錄數再決定）
+    state.filter = "info";  // 與初始預設一致（落地分頁在 applyReport 依紀錄數再決定）
     state.open = {};
     state.rowOpen = {};
     state.matrixFilter = "attention";
     state.refOpen = false;
     state.refTab = null;
     state.reviewing = false;  // 防禦性清空：正常路徑 applyReport/錯誤處理已先清，這裡保持完整
-    state.progress = null;
     state.error = null;
     fileInput.value = "";
     render();
@@ -663,7 +558,7 @@
       const cls = n === cur ? "cur" : n < cur ? "done" : "todo";
       const can = n <= reach;
       const num = n < cur ? "✓" : String(n);
-      const sep = n < 3 ? `<span class="gv-step-sep">›</span>` : "";
+      const sep = n < STEP_LABELS.length ? `<span class="gv-step-sep">›</span>` : "";
       return `<button class="gv-step ${cls}${can ? "" : " disabled"}" data-action="goto" data-step="${n}">
         <span class="num">${num}</span><span>${esc(label)}</span></button>${sep}`;
     }).join("");
@@ -678,7 +573,7 @@
         <div class="brand">
           <span class="logo">🛡️</span>
           <div><div class="title">AI 治理審查小幫手</div>
-            <div class="sub">批次上傳自動分類 · 送件包初步審查</div></div>
+            <div class="sub">送件包初步審查 · 規則檢查與語意判讀</div></div>
         </div>
         <div class="pill"><span class="dot"></span>地端執行 · 資料不外送</div>
       </div>
@@ -691,72 +586,27 @@
   }
 
   // ── 渲染：Step 1 上傳 ──────────────────────────────────────────
-  function renderStep1() {
-    const loaded = state.files.length > 0;
-    let body;
-    if (!loaded) {
-      body = `<div class="gv-upload-grid">
-        <button class="gv-drop" id="dropzone" data-action="pick">
-          <span class="ic">⤓</span>
-          <div><div class="big">拖入送件包所有檔案</div>
-            <div class="small">支援 F01/F02/F03 與佐證（可多檔）· 或點此選擇檔案</div></div>
-          <span class="cta">選擇檔案</span>
-        </button>
-        <div class="gv-aside"><h3>送件包應包含</h3>
-          ${CHECKLIST.map((c) => `<div class="item"><span class="tag">${esc(c.tag)}</span>
-            <div><div class="name">${esc(c.name)}</div><div class="note">${esc(c.note)}</div></div></div>`).join("")}
-        </div></div>`;
-    } else {
-      const rows = state.files.map((f) => `<div class="gv-row">
-        <span class="ic">${fileIcon(f.name)}</span>
-        <div class="meta"><div class="fname">${esc(f.name)}</div></div>
-        <span class="fsize">${fmtSize(f.size)}</span></div>`).join("");
-      body = `<div class="gv-filelist">
-        <div class="head"><span>已選擇 ${state.files.length} 個檔案</span>
-          <button class="btn-small" data-action="reset">重新選擇</button></div>
-        ${rows}</div>
-        <div class="row-end"><button class="btn-primary" data-action="classify">下一步：確認分類　→</button></div>`;
-    }
-    return `<div>
-      <h1 class="gv-h1">上傳送件包</h1>
-      <p class="gv-lead">一次拖入提案單位提交的所有檔案，系統會自動辨識 F01 / F02 / F03 與佐證文件。你可以在審查前確認或修正每個檔案的判定。</p>
-      ${renderError()}${body}</div>`;
+  function renderSlot(slot) {
+    const picked = slot.multiple ? state.slots.supporting : state.slots[slot.key];
+    const filled = slot.multiple ? picked.length > 0 : !!picked;
+    const files = slot.multiple ? picked : (picked ? [picked] : []);
+    const rows = files.map((f) => `<div class="gv-slot-file">
+      <span class="ic">${fileIcon(f.name)}</span>
+      <span class="fname">${esc(f.name)}</span>
+      <span class="fsize">${fmtSize(f.size)}</span>
+      <button class="btn-small" data-action="clear-slot" data-slot="${slot.key}" data-name="${esc(f.name)}">移除</button>
+    </div>`).join("");
+    return `<div class="gv-slot${filled ? " filled" : ""}">
+      <div class="head">
+        <span class="tag">${esc(slot.tag)}</span>
+        <div class="meta"><div class="name">${esc(slot.name)}</div><div class="note">${esc(slot.note)}</div></div>
+        <button class="btn-small" data-action="pick" data-slot="${slot.key}">${filled && !slot.multiple ? "更換" : "選擇檔案"}</button>
+      </div>
+      ${rows}</div>`;
   }
 
-  // ── 渲染：Step 2 分類 ──────────────────────────────────────────
-  function renderStep2() {
-    const cf = state.classify;
-    const opts = cf.kinds;
-    const counts = { f01: 0, f02: 0, f03: 0, supporting: 0, ignore: 0 };
-    cf.files.forEach((f) => { const k = state.kinds[f.index] ?? f.kind; counts[k] = (counts[k] || 0) + 1; });
-    const flagged = cf.files.filter((f) => f.flag).length;
-
-    const chip = (label, fg, bg, border) =>
-      `<span class="gv-chip" style="color:${fg};background:${bg};border-color:${border};">${esc(label)}</span>`;
-    const chips = [
-      chip(`共 ${cf.files.length} 個檔案`, "var(--text)", "var(--surface)", "var(--border)"),
-      chip(`表單 ${counts.f01 + counts.f02 + counts.f03} 份`, "var(--accent)", "var(--accent-soft)", "var(--accent-soft)"),
-      chip(`佐證 ${counts.supporting} 份`, "var(--muted)", "var(--bg)", "var(--border)"),
-    ];
-    if (flagged) chips.push(chip(`需確認 ${flagged} 項`, "var(--warn-fg)", "var(--warn-bg)", "var(--warn-border)"));
-
-    const optionHtml = (selected) =>
-      opts.map((o) => `<option value="${esc(o.value)}"${o.value === selected ? " selected" : ""}>${esc(o.label)}</option>`).join("");
-
-    const rows = cf.files.map((f) => {
-      const kind = state.kinds[f.index] ?? f.kind;
-      const flag = f.flag === "dup" ? "重複" : f.flag === "unknown" ? "無法辨識" : "";
-      const flagHtml = flag ? `<span class="gv-flag">${flag}</span>` : "";
-      return `<div class="gv-classify-row${f.flag ? " flagged" : ""}">
-        <div class="line">
-          <span class="ic">${fileIcon(f.filename)}</span>
-          <div class="body"><div class="top"><span class="fname">${esc(f.filename)}</span>${flagHtml}</div>
-            <div class="reason">${esc(f.reason)}</div></div>
-          <select class="gv-select" data-action="set-kind" data-index="${f.index}">${optionHtml(kind)}</select>
-        </div></div>`;
-    }).join("");
-
-    const reviewOptions = `<div class="gv-review-options">
+  function renderStep1() {
+    const stagePicker = `<div class="gv-review-options">
       <label>使用角色
         <select class="gv-select" data-action="set-role">
           <option value="proposer"${state.role === "proposer" ? " selected" : ""}>提案者</option>
@@ -771,18 +621,18 @@
         </select>
       </label>
     </div>`;
-
+    const count = chosenFiles().length;
+    const actions = `<div class="row-split">
+      <button class="btn-ghost" data-action="reset">清空</button>
+      <button class="btn-primary${count ? "" : " disabled"}" data-action="start-review">開始審查　→</button>
+    </div>`;
     return `<div>
-      <h1 class="gv-h1">① 自動分類<span class="light">（可修正）</span></h1>
-      <p class="gv-lead">分類依工作表名稱判定，屬確定性規則。請逐一確認；標記為「重複」或「無法辨識」的項目特別需要你的判斷。</p>
+      <h1 class="gv-h1">上傳送件包</h1>
+      <p class="gv-lead">依欄位放入提案單位提交的檔案。未上傳的表單會由缺件檢查列出，不影響其餘檢查。</p>
       ${renderError()}
-      <div class="gv-chips">${chips.join("")}</div>
-      ${reviewOptions}
-      <div class="gv-filelist">${rows}</div>
-      <div class="row-split">
-        <button class="btn-ghost" data-action="goto" data-step="1">←　返回上傳</button>
-        <button class="btn-primary" data-action="start-review">② 開始審查　→</button>
-      </div></div>`;
+      ${stagePicker}
+      <div class="gv-slots">${SLOTS.map(renderSlot).join("")}</div>
+      ${actions}</div>`;
   }
 
   // ── 渲染：finding 卡片共用（扁平清單 / 彙整參考 / 其他待處理 共用）────
@@ -985,8 +835,8 @@
       <td>${topic}</td>
       <td>${matrixCellHtml("prop", row.cells.prop)}</td>
       <td>${matrixCellHtml("golive", row.cells.golive)}</td>
-      <td>${matrixCellHtml("diff", row.cells.diff)}</td>
-      <td>${matrixCellHtml("rag", row.cells.rag)}</td>
+      <td>${matrixCellHtml("evidence", row.cells.evidence)}</td>
+      <td>${matrixCellHtml("reg", row.cells.reg)}</td>
       <td class="gv-mgist" title="${gist}">${gist}</td>
       <td class="gv-mcaret"><span class="fcaret">⌄</span></td>
     </tr>`;
@@ -1019,8 +869,8 @@
       <div class="gv-matrix-card">
         <table>
           <thead><tr>
-            <th>項次</th><th>管理議題</th><th>提案佐證</th><th>上線佐證</th>
-            <th>兩段差異</th><th>法規符合</th><th>摘要</th><th></th>
+            <th>項次</th><th>管理議題</th><th>提案內容</th><th>上線內容</th>
+            <th>佐證支持</th><th>法規符合</th><th>摘要</th><th></th>
           </tr></thead>
           <tbody>${shown.map(renderMatrixRow).join("")}</tbody>
         </table>
@@ -1055,7 +905,7 @@
       passlog: ref.passlog.length,
       all: ref.all.length,
     };
-    const teaserSummary = `原始彙整 ${counts.aggregate}　法規對應 ${counts.regref}　通過紀錄 ${counts.passlog}`;
+    const teaserSummary = `判讀摘要 ${counts.aggregate}　法規對應 ${counts.regref}　通過紀錄 ${counts.passlog}`;
     const teaser = `<button class="gv-ref-teaser" data-action="ref-toggle">
       <span class="badge">②</span>
       <div class="body"><div class="title">彙整參考</div><div class="sum">${esc(teaserSummary)}</div></div>
@@ -1085,7 +935,7 @@
     </div>`;
   }
 
-  function renderStep3() {
+  function renderReport() {
     const r = state.review;
     const m = buildMatrix(r);
     return `<div>
@@ -1123,51 +973,28 @@
 
   function renderOverlay() {
     if (!state.reviewing) return "";
-    const p = state.progress;
-    // 尚未收到首個事件 → 退回 spinner 文案，避免進度條空白閃爍。
-    if (!p) {
-      return `<div class="gv-overlay"><div class="box">
-        <div class="spin"></div><div class="t">審查中…</div>
-        <div class="s">缺件 · F01 必填 · F02 規則 · 跨表一致性</div></div></div>`;
-    }
+    // 啟用語意判讀時，本機小模型可能要跑數分鐘；文案先講清楚，免得使用者以為當掉。
     return `<div class="gv-overlay"><div class="box">
-      <div class="t">審查中…${esc(p.label)}</div>
-      <div class="bar"><i style="width:${p.pct}%"></i></div>
-      <div class="s">${p.pct}%${p.detail ? " · " + esc(p.detail) : ""}</div></div></div>`;
+      <div class="spin"></div><div class="t">審查中…</div>
+      <div class="s">規則檢查隨即完成；若已啟用語意判讀，依模型與檢核項數可能需要數分鐘。</div>
+      </div></div>`;
   }
 
   // ── 主渲染 ─────────────────────────────────────────────────────
   function render() {
-    let content = "";
-    if (state.step === 1) content = renderStep1();
-    else if (state.step === 2) content = renderStep2();
-    else if (state.step === 3) content = renderStep3();
+    let content;
+    content = state.step === 1 ? renderStep1() : renderReport();
     app.innerHTML = `${renderHeader()}<div class="gv-main">${content}</div>${renderOverlay()}`;
-    bindDynamic();
   }
 
   // ── 事件（委派）────────────────────────────────────────────────
-  function bindDynamic() {
-    const dz = document.getElementById("dropzone");
-    if (dz) {
-      ["dragover", "dragenter"].forEach((ev) =>
-        dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("dragover"); }));
-      ["dragleave", "dragend"].forEach((ev) =>
-        dz.addEventListener(ev, () => dz.classList.remove("dragover")));
-      dz.addEventListener("drop", (e) => {
-        e.preventDefault(); dz.classList.remove("dragover");
-        if (e.dataTransfer && e.dataTransfer.files) onFilesChosen(e.dataTransfer.files);
-      });
-    }
-  }
-
   app.addEventListener("click", (e) => {
     const el = e.target.closest("[data-action]");
     if (!el) return;
     const action = el.dataset.action;
-    if (action === "pick") fileInput.click();
+    if (action === "pick") pickInto(el.dataset.slot);
+    else if (action === "clear-slot") clearSlot(el.dataset.slot, el.dataset.name);
     else if (action === "reset") reset();
-    else if (action === "classify") goClassify();
     else if (action === "start-review") startReview();
     else if (action === "goto") gotoStep(Number(el.dataset.step));
     else if (action === "toggle") { const id = el.dataset.id; state.open[id] = !state.open[id]; render(); }
@@ -1182,14 +1009,24 @@
   app.addEventListener("change", (e) => {
     const el = e.target.closest("[data-action]");
     if (!el) return;
-    if (el.dataset.action === "set-kind") state.kinds[Number(el.dataset.index)] = el.value;
-    else if (el.dataset.action === "set-role") state.role = el.value;
+    if (el.dataset.action === "set-role") state.role = el.value;
     else if (el.dataset.action === "set-stage") state.workflowStage = el.value;
     else return;
     render();
   });
 
-  fileInput.addEventListener("change", (e) => onFilesChosen(e.target.files));
+  // 隱藏的 <input type=file> 由各欄位共用：點擊時記下目標欄位，change 時再分派回該欄位。
+  let pendingSlot = null;
+  function pickInto(slotKey) {
+    pendingSlot = slotKey;
+    fileInput.multiple = slotKey === "supporting";
+    fileInput.value = "";
+    fileInput.click();
+  }
+
+  fileInput.addEventListener("change", (e) => {
+    if (pendingSlot) onFilesChosen(pendingSlot, e.target.files);
+  });
 
   render();
 })();

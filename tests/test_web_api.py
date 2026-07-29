@@ -1,18 +1,15 @@
 """Web API（FastAPI）契約測試。
 
-分兩類（比照 test_classify.py）：
-  - 無須官方範本（PDF / 空 xlsx / 純路由錯誤）→ 恆可跑，無網路確定性基線。
-  - 須官方範本（F01/F02/F03 真檔端到端 + 重複偵測）→ data/original 未連結時 skip。
+分兩類：
+  - 無須官方範本（PDF / 純路由錯誤）→ 恆可跑，無網路確定性基線。
+  - 須官方範本（F01/F02/F03 真檔端到端）→ data/original 未連結時 skip。
 
 LLM 一律不啟用（enable_llm 預設關，確定性）；介面層只驗證契約，不重造 ground truth。
+法規對照表一律視為缺席，讓結果不受本機是否有 data/rag/retrieval_map.json 影響。
 """
 
 from __future__ import annotations
 
-import io
-import json
-
-import openpyxl
 import pytest
 from fastapi.testclient import TestClient
 
@@ -33,123 +30,77 @@ requires_templates = pytest.mark.skipif(
     reason="官方範本不存在（data/original 未連結）",
 )
 
+# 報告 payload 的頂層契約：前端會直接讀這些鍵，少任一個 UI 就顯示 undefined。
+REPORT_KEYS = {
+    "form_type", "subject", "decision_status", "workflow_stage",
+    "error_count", "warn_count", "info_count",
+    "risk_score", "risk_grade", "findings",
+    "item_assessments", "checklist_roster", "document_statuses",
+    "citations", "usage_summary", "review_run_meta", "markdown",
+}
+
+
+@pytest.fixture(autouse=True)
+def _no_regulation_map(monkeypatch):
+    monkeypatch.setenv("GOVCHECK_REGULATIONS_MAPPING_PATH", "/nonexistent/retrieval_map.json")
+
 
 def _pdf(name: str = "佐證.pdf") -> tuple:
-    return ("files", (name, b"%PDF-1.4 fake", "application/pdf"))
+    return ("supporting", (name, b"%PDF-1.4 fake", "application/pdf"))
 
 
-def _blank_xlsx(name: str = "其他.xlsx") -> tuple:
-    buf = io.BytesIO()
-    openpyxl.Workbook().save(buf)
-    return ("files", (name, buf.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
-
-
-def _path_file(path, name: str | None = None) -> tuple:
-    data = path.read_bytes()
-    return ("files", (name or path.name, data, "application/octet-stream"))
-
-
-# ── /api/classify：無須官方範本 ──────────────────────────────────────
-
-
-def test_classify_pdf_is_supporting():
-    res = client.post("/api/classify", files=[_pdf()])
-    assert res.status_code == 200
-    body = res.json()
-    assert {o["value"] for o in body["kinds"]} == {"f01", "f02", "f03", "supporting", "ignore"}
-    f = body["files"][0]
-    assert f["kind"] == "supporting"
-    assert f["flag"] is None
-    assert "佐證" in f["reason"]
-
-
-def test_classify_blank_xlsx_is_unknown_flag():
-    res = client.post("/api/classify", files=[_blank_xlsx()])
-    assert res.status_code == 200
-    f = res.json()["files"][0]
-    # 無法辨識 → 旗標 unknown，預設判定「忽略此檔」，逼使用者人工指定
-    assert f["flag"] == "unknown"
-    assert f["kind"] == "ignore"
-
-
-def test_classify_preserves_index_and_order():
-    res = client.post("/api/classify", files=[_pdf("a.pdf"), _blank_xlsx("b.xlsx"), _pdf("c.docx")])
-    files = res.json()["files"]
-    assert [f["index"] for f in files] == [0, 1, 2]
-    assert [f["filename"] for f in files] == ["a.pdf", "b.xlsx", "c.docx"]
-
-
-def test_classify_no_files_rejected():
-    res = client.post("/api/classify", files=[])
-    assert res.status_code in (400, 422)  # 無檔案 → 友善錯誤 / 驗證錯誤
+def _form_file(field: str, path, name: str | None = None) -> tuple:
+    return (field, (name or path.name, path.read_bytes(), "application/octet-stream"))
 
 
 # ── /api/review：無須官方範本 ────────────────────────────────────────
 
 
 def test_review_supporting_only_missing_core_forms():
-    res = client.post(
-        "/api/review",
-        data={"kinds": json.dumps(["supporting"])},
-        files=[_pdf()],
-    )
+    res = client.post("/api/review", files=[_pdf()])
     assert res.status_code == 200
     body = res.json()
     codes = {f["code"] for f in body["findings"]}
     assert "DOC.MISSING_F01" in codes
     assert "DOC.MISSING_F03" in codes
-    assert "CLASSIFY.SUMMARY" in codes
-    assert body["passed"] is False
+    assert body["decision_status"] == "changes_required"
     assert body["error_count"] > 0
-    # info_count 由端點計算，至少含 CLASSIFY.SUMMARY
-    assert body["info_count"] >= 1
     assert body["markdown"].startswith("#")
     assert "初步審查報告" in body["markdown"]
 
 
 def test_review_finding_shape():
-    body = client.post(
-        "/api/review", data={"kinds": json.dumps(["supporting"])}, files=[_pdf()]
-    ).json()
+    body = client.post("/api/review", files=[_pdf()]).json()
     f = body["findings"][0]
-    assert set(f) == {"id", "severity", "code", "title", "message", "location", "expected", "actual", "source"}
+    assert set(f) == {
+        "id", "severity", "code", "title", "message",
+        "location", "expected", "actual", "source",
+    }
     assert f["severity"] in {"error", "warn", "info"}
 
 
 def test_review_response_contract_keys():
-    # 前端會直接讀這些頂層鍵；少任一個都會造成 UI 顯示 undefined（鎖定契約）。
-    body = client.post(
-        "/api/review", data={"kinds": json.dumps(["supporting"])}, files=[_pdf()]
-    ).json()
-    assert set(body) == {
-        "form_type", "subject", "passed",
-        "error_count", "warn_count", "info_count",
-        "risk_score", "risk_grade", "findings", "markdown",
-    }
+    body = client.post("/api/review", files=[_pdf()]).json()
+    assert set(body) == REPORT_KEYS
+    # v1 的 passed 只看 error_count，會與 decision_status 互相矛盾；只給一個通過訊號。
+    assert "passed" not in body
     # 無 F02 的送件包：風險欄位為 None（前端據此不渲染風險 tile）
     assert body["risk_score"] is None
     assert body["risk_grade"] is None
 
 
-def test_v2_review_requires_stage_and_returns_structured_metadata():
-    missing = client.post(
-        "/api/v2/review", data={"kinds": json.dumps(["supporting"])}, files=[_pdf()]
+def test_review_returns_structured_metadata():
+    res = client.post(
+        "/api/review",
+        data={"workflow_stage": "proposal"},
+        files=[("supporting", ("evidence.txt", "佐證內容".encode(), "text/plain"))],
     )
-    assert missing.status_code == 422
-
-    response = client.post(
-        "/api/v2/review",
-        data={"kinds": json.dumps(["supporting"]), "workflow_stage": "proposal"},
-        files=[("files", ("evidence.txt", "佐證內容".encode(), "text/plain"))],
-    )
-    assert response.status_code == 200
-    body = response.json()
+    assert res.status_code == 200
+    body = res.json()
     assert body["workflow_stage"] == "proposal"
     assert body["decision_status"] in {
         "approved", "changes_required", "manual_review", "incomplete"
     }
-    # v1 的 passed 只看 error_count，會與 decision_status 互相矛盾；v2 只給一個通過訊號。
-    assert "passed" not in body
     assert body["document_statuses"][0]["status"] == "parsed"
     assert "source_units" not in body["document_statuses"][0]
     assert set(body["usage_summary"]) >= {
@@ -157,116 +108,35 @@ def test_v2_review_requires_stage_and_returns_structured_metadata():
     }
 
 
-def test_prompt_readiness_is_false_when_provider_disabled():
-    body = client.get("/api/v2/readiness/prompts").json()
-    assert body["ready"] is False
-    assert set(body["prompts"]) >= {
-        "govcheck.f03.fairness", "govcheck.f03.escalation"
-    }
+def test_review_default_stage_is_proposal():
+    body = client.post("/api/review", files=[_pdf()]).json()
+    assert body["workflow_stage"] == "proposal"
 
 
-def test_review_kinds_not_list_rejected():
-    # 合法 JSON 但非陣列（如 "null"）須回 400，不可變成未處理的 500。
-    res = client.post("/api/review", data={"kinds": "null"}, files=[_pdf()])
-    assert res.status_code == 400
+def test_review_rejects_bad_stage():
+    res = client.post("/api/review", data={"workflow_stage": "nope"}, files=[_pdf()])
+    assert res.status_code == 422
+
+
+def test_review_no_files_rejected():
+    assert client.post("/api/review").status_code == 400
 
 
 def test_review_unsafe_and_duplicate_filenames():
-    # 惡意/重複檔名：basename 化擋逃逸、索引前綴避免覆蓋；兩個同名佐證皆不應導致崩潰。
+    # 惡意/重複檔名：basename 化擋逃逸、欄位前綴避免覆蓋；兩個同名佐證皆不應導致崩潰。
     files = [
-        ("files", ("../../etc/passwd", b"%PDF-1.4 a", "application/pdf")),
-        ("files", ("../../etc/passwd", b"%PDF-1.4 b", "application/pdf")),
+        ("supporting", ("../../etc/passwd", b"%PDF-1.4 a", "application/pdf")),
+        ("supporting", ("../../etc/passwd", b"%PDF-1.4 b", "application/pdf")),
     ]
-    res = client.post(
-        "/api/review", data={"kinds": json.dumps(["supporting", "supporting"])}, files=files
-    )
+    res = client.post("/api/review", files=files)
     assert res.status_code == 200
-    # 缺核心表單 → 仍正常出報告，未發生路徑逃逸或覆蓋錯誤
     assert "DOC.MISSING_F01" in {f["code"] for f in res.json()["findings"]}
 
 
-def test_review_all_ignored_rejected():
-    res = client.post("/api/review", data={"kinds": json.dumps(["ignore"])}, files=[_pdf()])
-    assert res.status_code == 400
-    assert "忽略" in res.json()["detail"]
-
-
-def test_review_kinds_length_mismatch_rejected():
-    res = client.post(
-        "/api/review",
-        data={"kinds": json.dumps(["supporting", "supporting"])},
-        files=[_pdf()],
-    )
-    assert res.status_code == 400
-
-
-def test_review_bad_kinds_json_rejected():
-    res = client.post("/api/review", data={"kinds": "not-json"}, files=[_pdf()])
-    assert res.status_code == 400
-
-
-# ── /api/review/stream：SSE 逐階段進度（無須官方範本）────────────────────
-
-
-def _sse_events(res) -> list[dict]:
-    """把 text/event-stream 回應切成事件 dict 清單。"""
-    return [json.loads(line[5:].strip()) for line in res.text.splitlines() if line.startswith("data:")]
-
-
-def test_review_stream_emits_progress_then_done():
-    res = client.post(
-        "/api/review/stream", data={"kinds": json.dumps(["supporting"])}, files=[_pdf()]
-    )
-    assert res.status_code == 200
-    assert res.headers["content-type"].startswith("text/event-stream")
-    events = _sse_events(res)
-    stages = [e["stage"] for e in events]
-    assert "upload" in stages and "rules" in stages       # 至少含落地與規則階段進度
-    assert stages[-1] == "done"                            # 最後一筆為完成事件
-    # done 事件帶完整報告，且頂層契約與 /api/review 一致（前端直接讀這些鍵）
-    report = events[-1]["report"]
-    assert set(report) == {
-        "form_type", "subject", "passed",
-        "error_count", "warn_count", "info_count",
-        "risk_score", "risk_grade", "findings", "markdown",
-    }
-    assert "DOC.MISSING_F01" in {f["code"] for f in report["findings"]}
-
-
-def test_review_stream_progress_monotonic_within_stage():
-    res = client.post(
-        "/api/review/stream", data={"kinds": json.dumps(["supporting"])}, files=[_pdf()]
-    )
-    rules = [e for e in _sse_events(res) if e["stage"] == "rules"]
-    assert [e["done"] for e in rules] == sorted(e["done"] for e in rules)  # done 不回退
-    assert all(0 < e["done"] <= e["total"] for e in rules)
-
-
-def test_review_stream_matches_review_findings():
-    """串流端點與舊端點對同輸入應產出相同 findings（契約不漂移）。"""
-    payload = {"data": {"kinds": json.dumps(["supporting"])}, "files": [_pdf()]}
-    plain = client.post("/api/review", **payload).json()
-    stream_report = _sse_events(client.post("/api/review/stream", **payload))[-1]["report"]
-    assert {f["code"] for f in plain["findings"]} == {f["code"] for f in stream_report["findings"]}
-    assert plain["passed"] == stream_report["passed"]
-
-
-def test_review_stream_validation_errors_are_http_status():
-    # 入參錯誤一律在串流開始前回正規 HTTP 4xx（而非藏在 SSE error 事件裡），與 /api/review 對齊
-    assert client.post("/api/review/stream", files=[]).status_code in (400, 422)
-    assert client.post(
-        "/api/review/stream", data={"kinds": "not-json"}, files=[_pdf()]
-    ).status_code == 400
-    assert client.post(
-        "/api/review/stream", data={"kinds": json.dumps(["supporting", "supporting"])}, files=[_pdf()]
-    ).status_code == 400
-    # 全部「忽略此檔」→ 前置 400（與 /api/review 同契約），不進串流
-    res = client.post("/api/review/stream", data={"kinds": json.dumps(["ignore"])}, files=[_pdf()])
-    assert res.status_code == 400 and "忽略" in res.json()["detail"]
-    # 不可指派的判定（如 unknown）→ 前置 400
-    assert client.post(
-        "/api/review/stream", data={"kinds": json.dumps(["unknown"])}, files=[_pdf()]
-    ).status_code == 400
+def test_readiness_is_false_when_provider_disabled():
+    body = client.get("/api/readiness").json()
+    assert body["ready"] is False
+    assert set(body["prompts"]) >= {"govcheck.f03.fairness", "govcheck.f03.escalation"}
 
 
 # ── 靜態前端 ────────────────────────────────────────────────────────
@@ -281,18 +151,7 @@ def test_index_served():
     assert "http://" not in res.text and "https://" not in res.text
 
 
-# ── 須官方範本：真檔端到端 + 重複偵測 ──────────────────────────────────
-
-
-@requires_templates
-def test_classify_duplicate_f02_flag(tmp_path):
-    from tests.test_f02_rules import BASELINE
-    a = build_f02_fixture(tmp_path / "f02_a.xlsm", answers=BASELINE, cached_grade="低")
-    b = build_f02_fixture(tmp_path / "f02_b.xlsm", answers=BASELINE, cached_grade="低")
-    res = client.post("/api/classify", files=[_path_file(a), _path_file(b)])
-    files = res.json()["files"]
-    assert files[0]["kind"] == "f02" and files[0]["flag"] is None
-    assert files[1]["flag"] == "dup"  # 第二份 F02 標記重複
+# ── 須官方範本：真檔端到端 ────────────────────────────────────────────
 
 
 @requires_templates
@@ -301,17 +160,14 @@ def test_review_full_bundle_passes(tmp_path):
     f01 = build_f01_fixture(tmp_path / "f01.xlsx")
     f02 = build_f02_fixture(tmp_path / "f02.xlsm", answers=BASELINE, cached_grade="低")
     f03 = build_f03_fixture(tmp_path / "f03.xlsx")
-    pdf = _pdf("模型卡.pdf")
-    res = client.post(
-        "/api/review",
-        data={"kinds": json.dumps(["f01", "f02", "f03", "supporting"])},
-        files=[_path_file(f01), _path_file(f02), _path_file(f03), pdf],
-    )
+    res = client.post("/api/review", files=[
+        _form_file("f01", f01), _form_file("f02", f02), _form_file("f03", f03),
+        _pdf("模型卡.pdf"),
+    ])
     assert res.status_code == 200
     body = res.json()
     codes = {f["code"] for f in body["findings"]}
     assert "SUBMISSION.OK" in codes
-    assert body["passed"] is True
     assert body["error_count"] == 0 and body["warn_count"] == 0
     assert body["subject"]  # F01 帶出受審對象
     # 含 F02 → 報告頂端風險欄位有值（前端據此渲染風險 tile）
@@ -321,44 +177,19 @@ def test_review_full_bundle_passes(tmp_path):
 
 
 @requires_templates
-def test_v2_roster_covers_every_item_with_llm_off(tmp_path):
+def test_roster_covers_every_item_with_llm_off(tmp_path):
     """關掉 LLM 時名冊是總覽表唯一的完整項次來源，不可為空或漏項。"""
     f03 = build_f03_fixture(tmp_path / "f03.xlsx", items=[
         {"row": 5, "state": "不適用", "proposal": "本系統不涉及該情境"},
     ])
-    res = client.post(
-        "/api/v2/review",
-        data={"kinds": json.dumps(["f03"]), "use_llm": "false", "workflow_stage": "proposal"},
-        files=[_path_file(f03)],
-    )
+    res = client.post("/api/review", data={"workflow_stage": "proposal"}, files=[
+        _form_file("f03", f03),
+    ])
     assert res.status_code == 200
     body = res.json()
     roster = body["checklist_roster"]
-    # 名冊涵蓋整份檢核表，而非只有被判讀的項次
     assert len(roster) > len(body["item_assessments"])
     first = roster[0]
     assert first["coverage"] == "not_applicable"
     assert first["reason"] == "本系統不涉及該情境"
     assert {row["coverage"] for row in roster} <= {"assessable", "not_applicable", "no_evidence"}
-
-
-@requires_templates
-def test_review_stream_full_bundle_emits_parse_and_passes(tmp_path):
-    from tests.test_f02_rules import BASELINE
-    f01 = build_f01_fixture(tmp_path / "f01.xlsx")
-    f02 = build_f02_fixture(tmp_path / "f02.xlsm", answers=BASELINE, cached_grade="低")
-    f03 = build_f03_fixture(tmp_path / "f03.xlsx")
-    res = client.post(
-        "/api/review/stream",
-        data={"kinds": json.dumps(["f01", "f02", "f03", "supporting"])},
-        files=[_path_file(f01), _path_file(f02), _path_file(f03), _pdf("模型卡.pdf")],
-    )
-    assert res.status_code == 200
-    events = _sse_events(res)
-    parse = [e for e in events if e["stage"] == "parse"]
-    assert [e["done"] for e in parse] == [1, 2, 3, 4]  # 三表 + 一份佐證文件
-    report = events[-1]["report"]
-    assert "SUBMISSION.OK" in {f["code"] for f in report["findings"]} and report["passed"] is True
-    # 含 F02 → 串流 done 事件報告也帶風險欄位（與 /api/review 契約一致）
-    assert report["risk_grade"] in {"低", "中", "高"}
-    assert isinstance(report["risk_score"], (int, float))

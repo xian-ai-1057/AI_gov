@@ -17,17 +17,15 @@ prompt_label: production             # 每次 review 開始時解析並固定成
 evidence_embedding_enabled: false    # 開啟後每個 review 以單次 embedding 請求做混合檢索
 evidence_lexical_weight: 0.7         # BM25-like 權重；其餘為 cosine embedding 權重
 evidence_top_k: 4                    # 每個 F03 項目最多送入模型的佐證片段數
+embedding_base_url: null             # 佐證檢索的 embeddings 端點；null = 沿用上面的 base_url
+embedding_model: bge-m3              # embeddings 模型；api_key 走 GOVCHECK_EMBEDDING_API_KEY
+embedding_timeout: 120               # embeddings 請求逾時（秒）
 
-# Phase 3 RAG 法規比對（一體啟停；實際啟用 = enable_llm AND rag.enabled）。
-# 缺此區段時 load_rag_config() 全用硬碼預設，行為一致。機密（EMBEDDING_API_KEY / MILVUS_TOKEN）只走環境變數。
-# 環境變數可覆寫任一鍵：GOVCHECK_RAG_ENABLED / _MAPPING_PATH / _BATCH_SIZE / _MAX_SECTIONS_PER_ITEM / _MAX_EXCERPT_CHARS / _TIMEOUT / _MAX_ITEMS ...
-rag:
-  enabled: false                     # 舊 RAG 檢查預設關閉；F03 已由統一 assessment 取代
-  mapping_path: data/rag/retrieval_map.json  # build-time 產物（gitignored；runtime 只讀查表）
-  batch_size: 2                      # RAG 判讀批次（canonical 摘錄使 prompt 較長，保守起步）
+# 法規對照表（凍結的靜態資產；建置管線已封存於 _Archive/rag_build/）。
+# 缺此區段時 load_regulations_config() 全用硬碼預設，行為一致。
+# 環境變數可覆寫任一鍵：GOVCHECK_REGULATIONS_MAPPING_PATH / _MAX_SECTIONS_PER_ITEM / _MAX_EXCERPT_CHARS / _MAX_ITEMS
+regulations:
+  mapping_path: data/rag/retrieval_map.json  # 凍結產物（gitignored；runtime 只讀查表）
   max_sections_per_item: 3           # 每檢核項最多引用條文段數
   max_excerpt_chars: 300             # 每段摘錄字數上限（prompt 預算防護）
-  timeout: 120                       # RAG 判讀獨立逾時（秒）；不沿用 chat 的 60s
-  max_items: 30                      # 單次送 RAG 判讀的檢核項上限（安全閥）
-  # 暫定保守值；curated（L 欄）為主檢索路徑，semantic 為輔，recall@4≈79%；可經 --eval 重新校準
-  score_threshold: 0.08
+  max_items: 30                      # F02 觸發題查表引用上限（安全閥）
