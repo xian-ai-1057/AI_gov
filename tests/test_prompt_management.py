@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import pytest
@@ -7,6 +8,7 @@ import requests
 
 from govcheck.llm.client import ChatResult
 from govcheck.prompts import (
+    FilePromptProvider,
     LiteLLMPromptProvider,
     NullPromptProvider,
     PromptCatalog,
@@ -14,6 +16,7 @@ from govcheck.prompts import (
     PromptTemplate,
     PromptUnavailable,
     StaticPromptProvider,
+    build_prompt_gateway,
     profile_for_item,
 )
 
@@ -143,7 +146,127 @@ def test_null_provider_is_explicitly_unavailable():
         NullPromptProvider().resolve("govcheck.f03.fairness")
 
 
+def _write_prompt_file(directory, prompt_id: str, *, version: str = "1", body: str = "hi") -> None:
+    (directory / f"{prompt_id}.yaml").write_text(
+        "prompt_id: {}\nversion: \"{}\"\nmessages:\n"
+        "  - role: system\n    content: |\n      {}\n"
+        "  - role: user\n    content: |\n"
+        "      {{{{items_json}}}}|{{{{evidence_json}}}}|{{{{workflow_stage}}}}|"
+        "{{{{policy_version}}}}|{{{{output_schema_version}}}}\n".format(
+            prompt_id, version, body
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_file_provider_pins_declared_version_and_satisfies_contract(tmp_path):
+    prompt_id = "govcheck.f03.privacy"
+    _write_prompt_file(tmp_path, prompt_id, version="3")
+    gateway = PromptGateway(
+        provider=FilePromptProvider(directory=tmp_path), client=FakeClient()
+    )
+
+    run = gateway.begin_run({prompt_id})
+
+    assert run.refs[0].prompt_version == "3"
+    assert run.refs[0].schema_version == "f03-assessment-v2"
+
+
+def test_file_provider_reloads_after_edit(tmp_path):
+    """本機調 prompt 不必重啟；改檔後下一次 review 必須拿到新版本與新雜湊。"""
+    prompt_id = "govcheck.f03.security"
+    _write_prompt_file(tmp_path, prompt_id, version="1", body="first")
+    provider = FilePromptProvider(directory=tmp_path)
+    first = provider.resolve(prompt_id)
+    assert provider.resolve(prompt_id) is first  # 未改檔沿用快取
+
+    _write_prompt_file(tmp_path, prompt_id, version="2", body="second")
+    path = tmp_path / f"{prompt_id}.yaml"
+    os.utime(path, (0, path.stat().st_mtime + 10))
+
+    reloaded = provider.resolve(prompt_id)
+    assert reloaded.version == "2"
+    assert reloaded.content_hash != first.content_hash
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "prompt_id: govcheck.f03.privacy\nmessages:\n  - role: user\n    content: x\n",  # 缺 version
+        "prompt_id: wrong.id\nversion: \"1\"\nmessages:\n  - role: user\n    content: x\n",
+        "prompt_id: govcheck.f03.privacy\nversion: \"1\"\nmessages: not-a-list\n",
+        "- just\n- a\n- list\n",
+    ],
+    ids=["no_version", "id_mismatch", "messages_not_list", "not_a_mapping"],
+)
+def test_file_provider_rejects_malformed_files(tmp_path, content):
+    (tmp_path / "govcheck.f03.privacy.yaml").write_text(content, encoding="utf-8")
+    provider = FilePromptProvider(directory=tmp_path)
+    with pytest.raises(PromptUnavailable):
+        provider.resolve("govcheck.f03.privacy")
+
+
+def test_file_provider_missing_file_is_unavailable(tmp_path):
+    with pytest.raises(PromptUnavailable, match="不存在"):
+        FilePromptProvider(directory=tmp_path).resolve("govcheck.f03.fairness")
+
+
+def test_build_gateway_wires_file_provider(tmp_path, monkeypatch):
+    monkeypatch.delenv("GOVCHECK_PROMPT_PROVIDER", raising=False)
+    monkeypatch.delenv("GOVCHECK_PROMPT_DIR", raising=False)
+    gateway = build_prompt_gateway(
+        FakeClient(), {"prompt_provider": "file", "prompt_dir": str(tmp_path)}
+    )
+
+    assert isinstance(gateway.provider, FilePromptProvider)
+    assert gateway.cache_namespace  # 目錄進入 namespace，換來源不會沿用舊判讀快取
+
+
 def test_catalog_contains_all_required_prompt_ids():
     ids = set(PromptCatalog().required_prompt_ids())
     assert "govcheck.f03.escalation" in ids
     assert len(ids) == 7
+
+
+def test_relative_prompt_dir_survives_other_working_directory(tmp_path, monkeypatch):
+    """從 repo root 以外啟動（IDE launch config 未指定 cwd）不得讓 prompt 整批降級為未判讀。"""
+    monkeypatch.chdir(tmp_path)
+
+    provider = FilePromptProvider(directory="prompts")
+
+    assert provider.directory.is_absolute()
+    assert provider.directory.name == "prompts"
+
+
+def test_label_subdirectory_overrides_and_falls_back(tmp_path):
+    """label 子目錄優先、退回目錄根；嚴格版與寬鬆版共用 prompt_id 靠 label 區分。"""
+    prompt_id = "govcheck.f03.fairness"
+    _write_prompt_file(tmp_path, prompt_id, version="strict-1")
+    (tmp_path / "lenient").mkdir()
+    _write_prompt_file(tmp_path / "lenient", prompt_id, version="lenient-1")
+    provider = FilePromptProvider(directory=tmp_path)
+
+    assert provider.resolve(prompt_id, label="lenient").version == "lenient-1"
+    assert provider.resolve(prompt_id, label="production").version == "strict-1"  # 無子目錄 → 退回
+    assert provider.resolve(prompt_id).version == "strict-1"
+
+
+def test_label_sets_do_not_share_cache(tmp_path):
+    """兩套 prompt 是不同檔案，快取必須以 label 區隔，否則會拿到另一套的判準。"""
+    prompt_id = "govcheck.f03.privacy"
+    _write_prompt_file(tmp_path, prompt_id, version="strict-1", body="strict")
+    (tmp_path / "lenient").mkdir()
+    _write_prompt_file(tmp_path / "lenient", prompt_id, version="lenient-1", body="lenient")
+    provider = FilePromptProvider(directory=tmp_path)
+
+    strict = provider.resolve(prompt_id, label="production")
+    lenient = provider.resolve(prompt_id, label="lenient")
+
+    assert strict.content_hash != lenient.content_hash
+    assert provider.resolve(prompt_id, label="production").content_hash == strict.content_hash
+
+
+@pytest.mark.parametrize("label", ["..", "../..", "a/b", "a\\b"])
+def test_label_cannot_escape_prompt_directory(tmp_path, label):
+    with pytest.raises(PromptUnavailable, match="不合法|不存在"):
+        FilePromptProvider(directory=tmp_path).resolve("govcheck.f03.fairness", label=label)

@@ -3,6 +3,7 @@
 from govcheck.prompts.catalog import PromptCatalog, PromptContract, profile_for_item
 from govcheck.prompts.gateway import PromptGateway, PromptRun, build_prompt_gateway
 from govcheck.prompts.providers import (
+    FilePromptProvider,
     LiteLLMPromptProvider,
     NullPromptProvider,
     PromptProvider,
@@ -12,6 +13,7 @@ from govcheck.prompts.providers import (
 )
 
 __all__ = [
+    "FilePromptProvider",
     "LiteLLMPromptProvider",
     "NullPromptProvider",
     "PromptCatalog",

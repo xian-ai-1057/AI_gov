@@ -77,6 +77,7 @@ def load_llm_config(path: str | None = None) -> dict:
             "GOVCHECK_PROMPT_PROVIDER", raw.get("prompt_provider", "disabled")
         ),
         "prompt_base_url": os.environ.get("GOVCHECK_PROMPT_BASE_URL") or raw.get("prompt_base_url"),
+        "prompt_dir": os.environ.get("GOVCHECK_PROMPT_DIR") or raw.get("prompt_dir") or "prompts",
         "prompt_label": os.environ.get("GOVCHECK_PROMPT_LABEL", raw.get("prompt_label", "production")),
         "evidence_embedding_enabled": _as_bool(
             os.environ.get("GOVCHECK_EVIDENCE_EMBEDDING_ENABLED"),

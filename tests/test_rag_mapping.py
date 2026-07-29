@@ -148,3 +148,14 @@ def test_load_retrieval_map_minimal_ok():
     mapping = load_retrieval_map(MINIMAL_JSON)
     assert mapping.f03_items == {}
     assert mapping.f02_questions == {}
+
+
+def test_relative_mapping_path_survives_other_working_directory(tmp_path, monkeypatch):
+    """相對路徑 mapping 從其他 cwd 載入時，應錨定 repo root 而非誤報缺檔。"""
+    from govcheck.paths import REPO_ROOT, resolve_data_path
+
+    monkeypatch.chdir(tmp_path)
+    resolved = resolve_data_path("data/rag/retrieval_map.json")
+
+    assert resolved == REPO_ROOT / "data/rag/retrieval_map.json"
+    assert resolve_data_path("/tmp/absolute.json") == Path("/tmp/absolute.json")

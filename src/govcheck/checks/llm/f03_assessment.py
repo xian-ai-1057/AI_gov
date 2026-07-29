@@ -572,6 +572,12 @@ def _findings(assessment: F03ItemAssessment) -> list[Finding]:
         output.append(_finding("F03.ASSESSMENT_INCOMPLETE", "內容不完整", assessment, location))
     if assessment.reasonableness == "vague":
         output.append(_finding("F03.ASSESSMENT_VAGUE", "內容過於空泛", assessment, location))
+    if assessment.reasonableness == "unreasonable":
+        # 比 vague 更嚴重（敘述不相干／自相矛盾／做法無法達成控制目的）。狀態總覽表已把它
+        # 標成「內容需補強」，若這裡不發 finding，治理人員會看到警示格卻查無原因。
+        output.append(_finding(
+            "F03.ASSESSMENT_UNREASONABLE", "內容與檢核項要求不符", assessment, location
+        ))
     if assessment.evidence_status in {EvidenceStatus.PARTIAL, EvidenceStatus.NOT_FOUND, EvidenceStatus.UNREADABLE}:
         output.append(_finding("F03.EVIDENCE_NOT_SUPPORTED", "佐證不足或無法讀取", assessment, location))
     if assessment.conflict_status is ConflictStatus.CONTRADICTED:

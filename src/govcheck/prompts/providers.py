@@ -6,9 +6,13 @@ import hashlib
 import json
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 import requests
+import yaml
+
+from govcheck.paths import resolve_data_path
 
 
 class PromptUnavailable(RuntimeError):
@@ -90,6 +94,82 @@ class StaticPromptProvider:
         if version is not None and version != template.version:
             raise PromptUnavailable(f"Static prompt 版本不存在：{prompt_id}@{version}")
         return template
+
+
+class FilePromptProvider:
+    """地端檔案 Prompt 來源。
+
+    佈局（label 子目錄優先，找不到才退回目錄根，故既有扁平佈局不受影響）：
+
+        <dir>/<label>/<prompt_id>.yaml   例：prompts/lenient/govcheck.f03.fairness.yaml
+        <dir>/<prompt_id>.yaml           預設集（label=production 時即用此份）
+
+    正式 Prompt 內含治理辦法衍生的判準文字，依專案守則不入庫，故目錄由設定指向
+    gitignored 位置。以 mtime 快取：檔案未變更時沿用已解析的 template，改檔後
+    下一次 review 自動重讀，本機調 prompt 不必重啟服務。
+    """
+
+    def __init__(self, *, directory: str | Path) -> None:
+        # 同 rag mapping：設定給的相對路徑錨定 repo root，否則從其他 cwd 啟動會整批降級為未判讀
+        self.directory = resolve_data_path(directory)
+        self._cache: dict[tuple[str, str | None], tuple[float, PromptTemplate]] = {}
+        self._lock = threading.Lock()
+
+    def resolve(
+        self,
+        prompt_id: str,
+        *,
+        label: str | None = None,
+        version: str | None = None,
+    ) -> PromptTemplate:
+        path = self._path_for(prompt_id, label)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError as exc:
+            raise PromptUnavailable(f"Prompt 檔案不存在：{prompt_id}") from exc
+        # label 進入快取鍵：嚴格版與寬鬆版是不同檔案，不得互相污染
+        key = (prompt_id, label)
+        with self._lock:
+            cached = self._cache.get(key)
+        if cached is not None and cached[0] == mtime:
+            template = cached[1]
+        else:
+            template = self._load(prompt_id, path)
+            with self._lock:
+                self._cache[key] = (mtime, template)
+        if version is not None and version != template.version:
+            raise PromptUnavailable(f"Prompt 版本不符：{prompt_id}@{version}")
+        return template
+
+    def _path_for(self, prompt_id: str, label: str | None) -> Path:
+        filename = f"{prompt_id}.yaml"
+        if label:
+            # label 只當單層目錄名；'..' 或路徑分隔字元不得逸出 prompt 目錄
+            if "/" in label or "\\" in label or label in {".", ".."}:
+                raise PromptUnavailable(f"Prompt label 不合法：{label}")
+            labelled = self.directory / label / filename
+            if labelled.exists():
+                return labelled
+        return self.directory / filename
+
+    def _load(self, prompt_id: str, path: Path) -> PromptTemplate:
+        try:
+            body = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if not isinstance(body, dict):
+                raise TypeError("prompt 檔案必須是 mapping")
+            if body.get("prompt_id") != prompt_id:
+                raise ValueError("prompt_id 與檔名不符")
+            declared_version = body.get("version")
+            if declared_version in (None, ""):
+                raise ValueError("prompt 檔案必須宣告 version")
+            messages = body["messages"]
+            if not isinstance(messages, list):
+                raise TypeError("messages 必須是 list")
+            return PromptTemplate.create(prompt_id, str(declared_version), messages)
+        except (OSError, yaml.YAMLError, ValueError, KeyError, TypeError) as exc:
+            raise PromptUnavailable(
+                f"Prompt 檔案格式不符契約：{prompt_id}（{type(exc).__name__}）"
+            ) from exc
 
 
 class LiteLLMPromptProvider:
