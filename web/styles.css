@@ -364,12 +364,14 @@ button { font-family: inherit; cursor: pointer; }
 .gv-mrow.open .fcaret { transform: rotate(180deg); }
 
 /* 狀態格：小色塊 label，依 kind 上色；white-space:nowrap 避免欄位內折行。 */
-.st-ok, .st-warn, .st-undet, .st-err, .st-none { font-weight: 600; font-size: 12px; white-space: nowrap; }
+.st-ok, .st-warn, .st-undet, .st-err, .st-none, .st-skip { font-weight: 600; font-size: 12px; white-space: nowrap; }
 .st-ok { color: var(--ok); }
 .st-warn { color: var(--warn-fg); }
 .st-undet { color: var(--muted); }
 .st-err { color: var(--err-fg); }
 .st-none { color: var(--muted); }
+/* 本次未判讀（不適用／佐證空白）：字重與飽和度都壓低，不與 ✓/▲/？ 爭取 triage 注意力。 */
+.st-skip { color: var(--muted); font-weight: 500; opacity: .75; }
 
 /* 摘要欄：單行省略號，完整內容在展開列 / title 屬性。 */
 .gv-mgist {

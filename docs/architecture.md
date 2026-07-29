@@ -165,6 +165,13 @@ stateDiagram-v2
 Markdown 彙整表只保留為 v1 fallback。提案者看到缺漏、修改建議與佐證問題，審查者另看到文件狀態、
 Prompt 版本、信心、引用與使用量。
 
+**檢核項名冊**（`checklist_roster`，`F03Checklist.roster()`）：`item_assessments` 只涵蓋送進語意判讀
+的項次 —— 標示「不適用」或佐證欄空白者不在其中。名冊獨立於 LLM 是否啟用，把**每一個**檢核項
+都帶進報告，總覽表才據以鋪滿列（未判讀者標灰、預設不計入「只看有問題」）。
+沒有名冊時，這些項次會整列從報告消失：實測某份送件包 20 項中有 9 項標示不適用，
+治理人員從報告上看不到自己該去認定這 9 個不適用主張。名冊的 `assessable` 與
+`f03_assessment._targets()` 共用 `coverage_for_stage()` 判斷，不得各自為政。
+
 ---
 
 ## 參考

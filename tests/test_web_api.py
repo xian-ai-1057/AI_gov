@@ -321,6 +321,28 @@ def test_review_full_bundle_passes(tmp_path):
 
 
 @requires_templates
+def test_v2_roster_covers_every_item_with_llm_off(tmp_path):
+    """關掉 LLM 時名冊是總覽表唯一的完整項次來源，不可為空或漏項。"""
+    f03 = build_f03_fixture(tmp_path / "f03.xlsx", items=[
+        {"row": 5, "state": "不適用", "proposal": "本系統不涉及該情境"},
+    ])
+    res = client.post(
+        "/api/v2/review",
+        data={"kinds": json.dumps(["f03"]), "use_llm": "false", "workflow_stage": "proposal"},
+        files=[_path_file(f03)],
+    )
+    assert res.status_code == 200
+    body = res.json()
+    roster = body["checklist_roster"]
+    # 名冊涵蓋整份檢核表，而非只有被判讀的項次
+    assert len(roster) > len(body["item_assessments"])
+    first = roster[0]
+    assert first["coverage"] == "not_applicable"
+    assert first["reason"] == "本系統不涉及該情境"
+    assert {row["coverage"] for row in roster} <= {"assessable", "not_applicable", "no_evidence"}
+
+
+@requires_templates
 def test_review_stream_full_bundle_emits_parse_and_passes(tmp_path):
     from tests.test_f02_rules import BASELINE
     f01 = build_f01_fixture(tmp_path / "f01.xlsx")

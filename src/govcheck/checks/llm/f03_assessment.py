@@ -268,17 +268,11 @@ def _truncation_findings(dropped: int, max_items: int) -> list[Finding]:
 def _targets(checklist: F03Checklist, stage: WorkflowStage) -> list[F03ChecklistItem]:
     if checklist is None or not checklist.sheet_present:
         return []
-    output = []
-    for item in checklist.items:
-        if item.check_state == "不適用":
-            continue
-        relevant = item.evidence_proposal if stage is WorkflowStage.PROPOSAL else (
-            item.evidence_proposal or item.evidence_golive
-        )
-        if not relevant:
-            continue
-        output.append(item)
-    return output
+    # 送審條件與 F03Checklist.roster() 共用同一組判斷，避免名冊說「可判讀」卻查無 assessment。
+    return [
+        item for item in checklist.items
+        if item.coverage_for_stage(stage).coverage == "assessable"
+    ]
 
 
 def _deduplicate_targets(
