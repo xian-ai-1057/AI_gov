@@ -13,6 +13,7 @@ from govcheck.llm.client import ChatClient, ChatResult
 from govcheck.models import PromptRunRef, UsageSummary
 from govcheck.prompts.catalog import PromptCatalog
 from govcheck.prompts.providers import (
+    FilePromptProvider,
     LiteLLMPromptProvider,
     NullPromptProvider,
     PromptProvider,
@@ -131,23 +132,27 @@ def build_prompt_gateway(client: ChatClient, cfg: dict | None = None) -> PromptG
     cfg = cfg or {}
     provider_name = os.environ.get("GOVCHECK_PROMPT_PROVIDER", cfg.get("prompt_provider", "disabled"))
     label = os.environ.get("GOVCHECK_PROMPT_LABEL", cfg.get("prompt_label", "production"))
+    provider: PromptProvider = NullPromptProvider()
+    # 進入 cache namespace 的 prompt 來源識別；換來源即換 namespace，避免沿用舊判讀
+    provider_source = "disabled"
     if provider_name == "litellm":
         base_url = os.environ.get("GOVCHECK_PROMPT_BASE_URL") or cfg.get("prompt_base_url")
-        if not base_url:
-            provider: PromptProvider = NullPromptProvider()
-        else:
+        if base_url:
             api_key = os.environ.get("GOVCHECK_PROMPT_API_KEY")
             timeout = float(os.environ.get("GOVCHECK_PROMPT_TIMEOUT", "10"))
             provider = _shared_litellm_provider(
                 base_url=base_url, api_key=api_key, timeout=timeout
             )
-    else:
-        provider = NullPromptProvider()
+            provider_source = base_url
+    elif provider_name == "file":
+        directory = os.environ.get("GOVCHECK_PROMPT_DIR") or cfg.get("prompt_dir") or "prompts"
+        provider = FilePromptProvider(directory=directory)
+        provider_source = str(directory)
     namespace_source = "|".join([
         provider_name,
         str(cfg.get("base_url") or ""),
         str(cfg.get("model") or ""),
-        str(base_url if provider_name == "litellm" else "disabled"),
+        provider_source,
         str(label),
     ])
     namespace = hashlib.sha256(namespace_source.encode()).hexdigest()[:16]

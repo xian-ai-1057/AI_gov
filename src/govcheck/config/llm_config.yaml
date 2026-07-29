@@ -10,8 +10,9 @@ temperature: 0                       # 判讀求穩定，預設 0
 max_items: 30                        # 單次審查送 LLM 的檢核項上限（安全閥；F03 實際約 20 項）
 max_output_tokens: 4096              # 由應用程式控制，不採用 Prompt Manager 的 optional params
 batch_size: 8                        # 舊版檢查相容值；新版依 profile 與 token budget 動態組批
-prompt_provider: disabled            # disabled / litellm；正式 Prompt 不存放在 Git
+prompt_provider: disabled            # disabled / file / litellm；正式 Prompt 不存放在 Git
 prompt_base_url: null                # LiteLLM Prompt Management base URL
+prompt_dir: prompts                  # provider=file 時的 prompt 目錄（gitignored，地端維護）
 prompt_label: production             # 每次 review 開始時解析並固定成版本
 evidence_embedding_enabled: false    # 開啟後每個 review 以單次 embedding 請求做混合檢索
 evidence_lexical_weight: 0.7         # BM25-like 權重；其餘為 cosine embedding 權重

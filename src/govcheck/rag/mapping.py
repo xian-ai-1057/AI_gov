@@ -16,6 +16,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from govcheck.logging_setup import get_logger
+from govcheck.paths import resolve_data_path
 from govcheck.rag.models import SCHEMA_VERSION, RetrievalMap
 
 log = get_logger("rag_mapping")
@@ -29,7 +30,8 @@ class RetrievalMapError(RuntimeError):
 
 def load_retrieval_map(path: str | Path | None = None) -> RetrievalMap:
     """從磁碟載入 retrieval_map.json；任何失敗一律丟 RetrievalMapError（訊息含路徑，不含內容）。"""
-    p = Path(path) if path is not None else _DEFAULT_PATH
+    # 設定值多為相對路徑；錨定 repo root 才不會因啟動位置不同而誤判成「缺檔」
+    p = resolve_data_path(path if path is not None else _DEFAULT_PATH)
     log.debug("load_retrieval_map path=%s", p)
 
     if not p.exists():

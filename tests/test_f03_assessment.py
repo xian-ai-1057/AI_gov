@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from govcheck.checks.llm import f03_assessment
 from govcheck.llm.client import ChatResult, LLMError
 from govcheck.review import engine
@@ -73,11 +75,13 @@ def _checklist() -> F03Checklist:
     )])
 
 
-def _response(*, confidence=0.9, citation=True, evidence="supported") -> str:
+def _response(
+    *, confidence=0.9, citation=True, evidence="supported", reasonableness="sufficient"
+) -> str:
     return json.dumps({"results": [{
         "item_id": "1-1",
         "completeness": "complete",
-        "reasonableness": "sufficient",
+        "reasonableness": reasonableness,
         "evidence_status": evidence,
         "conflict_status": "consistent",
         "confidence": confidence,
@@ -106,6 +110,32 @@ def test_supported_without_allowed_citation_is_downgraded():
         workflow_stage=WorkflowStage.PROPOSAL,
     )
     assert outcome.assessments[0].evidence_status is EvidenceStatus.PARTIAL
+
+
+@pytest.mark.parametrize(
+    ("reasonableness", "expected_code"),
+    [
+        ("unreasonable", "F03.ASSESSMENT_UNREASONABLE"),
+        ("vague", "F03.ASSESSMENT_VAGUE"),
+        ("sufficient", None),
+        ("reasonable", None),
+    ],
+)
+def test_reasonableness_verdicts_reach_the_report(reasonableness, expected_code):
+    """狀態總覽表把 unreasonable 標成需補強，findings 就必須說得出原因，否則警示格查無理由。"""
+    outcome = f03_assessment.run_all(
+        _checklist(), [_artifact()],
+        _gateway([_response(reasonableness=reasonableness)]),
+        workflow_stage=WorkflowStage.PROPOSAL,
+    )
+
+    codes = {finding.code for finding in outcome.findings}
+    problem_codes = codes & {"F03.ASSESSMENT_UNREASONABLE", "F03.ASSESSMENT_VAGUE"}
+    assert problem_codes == ({expected_code} if expected_code else set())
+    if expected_code:
+        finding = next(f for f in outcome.findings if f.code == expected_code)
+        assert finding.severity is Severity.WARN
+        assert finding.location == "項次 1-1"
 
 
 def test_low_confidence_runs_single_escalation():

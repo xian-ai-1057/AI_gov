@@ -39,6 +39,11 @@ output/
 # 執行期 log（技術維運 + 治理稽核；稽核檔含識別資訊，禁止入庫）
 logs/
 
+# 正式 Prompt（含治理辦法衍生的審查判準文字，僅本機/內部 Prompt 服務留存，不入庫）
+# 格式與變數契約見 docs/prompts.md；實際內容由治理人員維護
+# 注意：同 models/，必須錨定在 repo root（前置 /），否則會誤排除 src/govcheck/prompts/ 核心套件
+/prompts/
+
 # 作業系統
 .DS_Store
 
