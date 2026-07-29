@@ -20,7 +20,7 @@ F03 上線檢核表** + 佐證文件），自動分類 → 跑規則與 LLM 判�
   F01 .xlsx                 依工作表名稱判定          缺件→必填→規則            錯誤/提醒/紀錄
   F02 .xlsm                 F01/F02/F03/佐證          →跨表→F03佐證LLM          + 固有風險分級
   F03 .xlsx                 重複/無法辨識會標示                                 + 下載 Markdown
-  佐證 PDF/Word
+ 佐證 PDF/Word/Excel          安全預檢→ts_parser→來源定位
 ```
 
 ---
@@ -63,7 +63,8 @@ uv run streamlit run app.py                      # Streamlit 介面
 - 每個檔可手動**改判定**或設為「**忽略此檔**」排除。
 - 無法辨識者預設為「忽略此檔」，逼使用者明確指定，不靜默誤路由。
 
-確認無誤後按「**開始審查**」。
+確認使用角色（提案者／審查者）與流程階段（提案／驗收／正式營運）後按「**開始審查**」。
+提案階段不會因尚未填寫上線驗收欄位而誤報。
 
 ### ③ 審查報告
 審查時 Web 介面會顯示**逐階段進度**（落地 → 解析各表 → 規則檢查 →（選用）F03 LLM）。
@@ -77,7 +78,7 @@ uv run streamlit run app.py                      # Streamlit 介面
 
 **頂端摘要（Hero）**
 
-- **通過 / 待處理**徽章（顯示文字為「規則通過」／「待處理」）：只要有任一「錯誤」即為待處理。
+- **通過 / 待處理**徽章依 `decision_status` 顯示；解析或語意判讀未完成時不會被誤判為合規。
 - **結論條**：一句話帶出重點，例如「0 錯誤 · 15/20 檢核項需人工確認 · 主因：上線階段佐證不足」——
   「主因」由前端依各檢核項的問題欄位確定性統計出來，非 LLM 生成。
 - 四個 tile：**固有風險分級**（有 F02 才顯示；低=綠／中=琥珀／高=紅，來源為 F02 第一頁
@@ -87,12 +88,12 @@ uv run streamlit run app.py                      # Streamlit 介面
 
 **① 檢核項狀態總覽表**（核心視覺）
 
-把 F03 每個檢核項次的 LLM/RAG 彙整表**依項次合併**成一列，欄位為
+把 API v2 的 F03 `item_assessments` **依項次**呈現成一列，欄位為
 `項次 | 管理議題 | 提案佐證 | 上線佐證 | 兩段差異 | 法規符合 | 摘要`：
 
 - 每欄狀態以顏色/符號標示（✓充分／▲有問題／？無法判定／✕判讀失敗／—無資料），有問題的列整列淺色標示。
 - 頂部切換【只看有問題】（預設）／【全部】——「全部」會連同已通過的項次一起列出。
-- 點列展開可看該項次**完整細節**：期望/實際對照、LLM/RAG 判讀原文、法規條文引用、規則代碼。
+- 點列展開可看該項次**完整細節**與可驗證的文件定位引用。
 - 沒有跑 LLM/RAG 時（規則式模式），狀態欄改由對應規則 finding（如佐證缺漏）推導，不會開天窗。
 
 **② 彙整參考**（預設收合，展開後為分頁）
@@ -125,33 +126,38 @@ F02 的固有風險分數/分級**不採信檔內填的值**，而是依答案**
 
 ---
 
-## 啟用 F03 LLM 佐證審查（預設開啟）
+## 啟用 F03 智慧審查與 Prompt Management（預設關閉）
 
-F03 的 **LLM 兩段佐證比較**——比對「提案規劃階段」與「上線階段」佐證差異、標示過於草率/不明確的說明，
-彙整成一張總覽表（餵進【① 檢核項狀態總覽】的狀態欄，原始表格收在【② 彙整參考】）。
-`src/govcheck/config/llm_config.yaml` 已將預設值改為開啟，**不放 `.env` 也會跑 LLM**（只要本機 ollama 或設定的端點可連上）。
+新版 F03 pipeline 依固定的 `item_id → review_profile → prompt_id` 路由，將內容完整性、合理性、
+佐證支持度與衝突狀態合併在一次主要模型呼叫。只有低信心或來源互相衝突才執行 escalation。
+正式 Prompt 不存放於 Git；所有模板都必須經 `PromptGateway` 從受控環境取得。
 
-`.env` 會在啟動時自動載入（`app.py`／`web/api.py` 皆已呼叫 `load_dotenv()`），可用它覆寫端點/模型或關閉：
+正式流量前須同時設定核准的 Chat endpoint 與 LiteLLM-compatible Prompt Management endpoint：
 
 ```bash
 # .env（不存在則新建；此檔已 gitignore，機密只放這裡）
-GOVCHECK_LLM_BASE_URL=http://localhost:11434/v1   # 內部/正式端點請覆寫
-GOVCHECK_LLM_MODEL=gemma3:4b                       # 依端點可用模型調整
-GOVCHECK_LLM_ENABLED=false                         # 想暫時關閉才需要這行
+GOVCHECK_LLM_ENABLED=true
+GOVCHECK_LLM_BASE_URL=http://localhost:11434/v1
+GOVCHECK_LLM_MODEL=gemma3:4b
+GOVCHECK_PROMPT_PROVIDER=litellm
+GOVCHECK_PROMPT_BASE_URL=https://prompt.internal
+GOVCHECK_PROMPT_API_KEY=...
+GOVCHECK_PROMPT_LABEL=production
 ```
 
-> 注意：專案自帶的 [`.env.example`](.env.example) 為求「複製即安全」，範例值刻意寫
-> `GOVCHECK_LLM_ENABLED=false` / `GOVCHECK_RAG_ENABLED=false`——**若直接 `cp .env.example .env` 不改動，
-> 會蓋掉 YAML 的預設開啟、變成關閉**。要維持預設開啟，複製後把這兩行刪掉或改成 `true`，或乾脆不建立 `.env`。
+每次 review 開始會把 label 解析成固定版本；審查途中更新 label 不影響該次結果。Prompt 無法取得且
+沒有相同固定版本快取時，評估標示為未完成並轉人工覆核，不會回退到硬編碼或過期 Prompt。
+可用 `GET /api/v2/readiness/prompts` 驗證七個 Prompt 的就緒狀態。
 
-本機可用 **ollama** 起地端模型測試；**端點不可用時自動略過，不影響規則檢查**。
-資料僅送上述設定端點，不外送公有雲。
+佐證文件只走 `TsParserAdapter`；設定見 `src/govcheck/config/parser_config.yaml`。OCR/VLM 預設關閉，
+且 `MODEL_HOST` 必須在核准清單內，否則回傳 `parser_unavailable`。詳細契約與 API 範例見
+[F03 review v2](docs/f03_review_v2.md)。
 
 ---
 
-## 啟用 RAG 法規檢索（Phase 3，預設開啟）
+## 舊版法規 RAG（Phase 3，預設關閉）
 
-F03 LLM 判讀時動態檢索相關 R01–R07 條文輔助判斷，F02 觸發題也會查表提示對應條文（`F02.REG_REF_NOTE`）。
+舊版 F03 RAG 已由統一 assessment 取代；這組設定目前只保留 F02 觸發題的法規查表提示與相容路徑。
 **一體啟停**：實際生效需 `enable_llm` **且** `rag.enabled` 同時為真；缺 `rag:` 設定區段時全用硬碼預設，行為不變。
 
 ```bash
@@ -160,7 +166,7 @@ uv run python scripts/build_regulation_index.py             # 建置一次：法
 uv run python scripts/build_regulation_index.py --eval      # 檢索品質 recall@k 報告（校準 score_threshold 用）
 ```
 
-同樣已在 `llm_config.yaml` 預設開啟（`rag.enabled: true`），不放 `.env` 也會生效。
+`llm_config.yaml` 預設關閉。
 `.env` 可用來覆寫 embedding 端點/模型，或關閉（提醒：見上節 `.env.example` 的「複製即安全」注意事項）：
 
 ```bash
@@ -175,7 +181,7 @@ GOVCHECK_RAG_ENABLED=false                                  # 想暫時關閉才
 
 ---
 
-## 現況（Phase 1–3 完成）
+## 現況（F03 review v2 已完成）
 
 端到端可跑：**批次上傳 → 自動分類 → 缺件 / 必填 / 規則 / 跨表一致 / F03 佐證 LLM + RAG 檢索 → 報告**。
 
@@ -184,9 +190,11 @@ GOVCHECK_RAG_ENABLED=false                                  # 想暫時關閉才
 - **F01 系統資訊表**：必填欄位、資料列、附屬表內部一致性。
 - **F02 風險評鑑**：重算固有風險分數並與檔內快取比對 → 規則檢查（單選唯一、複選非空、系列題完整、
   條件依賴、中/高風險續填）+ 義務條文提示（RAG 檢索）。
-- **F03 上線檢核表**：規則層（佐證欄位完整性）＋ LLM 層（兩段佐證比較 + 法規符合性判讀，預設開、端點不可用時自動降級）。
+- **F03 上線檢核表**：階段感知規則 + 六種 review profile + 統一內容／佐證判讀 + 選擇性 escalation。
+- **佐證文件**：安全預檢、格式 feature flag、`ts_parser` source snapshot、來源定位與單檔隔離失敗。
+- **Prompt 管理**：集中式 catalog/gateway/provider、label 發布、固定版本執行、嚴格 JSON schema。
 - **跨表一致性**：F01 ↔ F02 ↔ F03 的系統負責人、填表單位等欄位比對。
-- **RAG（Phase 3）**：Build-time 法規索引（R01–R07 PDF 分塊 + embedding）+ canonical 檢索映射，F03 判讀時動態檢索相關條文。
+- **證據檢索**：保留來源位置的 chunks，以 BM25-like 關鍵字排序並支援 embedding 分數融合，只傳 top-k。
 - **結構化報告**：Web 介面以**檢核項狀態總覽表**呈現（依項次合併 LLM/RAG 判讀，問題列一眼可辨），
   固有風險分級 + 錯誤/提醒/紀錄計數，彙整參考另收合展示，皆可下載 Markdown。
 
@@ -198,9 +206,8 @@ GOVCHECK_RAG_ENABLED=false                                  # 想暫時關閉才
 
 - **技術維運**（`logs/govcheck.log`，並同時輸出 console）：管線各階段、解析與 LLM 降級、
   錯誤堆疊，供除錯與維運。
-- **治理稽核**（`logs/audit.log`，每次審查一行 JSON）：`subject`（系統名）、`filing_unit`
-  （送件單位）、`error`/`warn` 計數、`passed`、`duration_ms`、`operator`、`enable_llm` 等，
-  供合規 / 三遵事後查核。
+- **治理稽核**（`logs/audit.log`，每次審查一行 JSON）：只記表單類型、計數、`decision_status`、
+  parser／模型呼叫數、耗時與操作者等非內容欄位。
 
 兩條以 `request_id` 串連同一次審查。**維運日誌的細節程度可調**：以 `GOVCHECK_LOG_PROFILE`
 一個友善開關切換——
@@ -221,8 +228,8 @@ export GOVCHECK_OPERATOR=alice       # 稽核「操作者」欄（目前無登�
 # 其餘可調：GOVCHECK_LOG_CONSOLE / GOVCHECK_LOG_MAX_BYTES / GOVCHECK_LOG_BACKUP_COUNT
 ```
 
-**隱私**：日誌只記識別資訊與數量（系統名／送件單位／Finding 代碼／計數／耗時／例外型別），
-**絕不**記原始檔內容、F03 佐證全文、LLM prompt／回應全文、api_key。
+**隱私**：所有 profile 都**不記**系統名、送件單位、真實檔名、原始文件、儲存格、Prompt 變數、
+模型回應、API key 或 Authorization header；舊 `llm_raw` 寫檔入口已成為 no-op。
 
 ## 架構
 
@@ -239,13 +246,17 @@ src/govcheck/
 ├── models/       F01/F02/F03 表單、Finding、ReviewReport 等契約
 ├── scoring/      還原 F02 Excel 計分公式 → 分數/分級
 ├── classify/     依工作表名稱自動分類送件包
+├── evidence/     來源定位 chunk 的混合檢索
+├── prompts/      PromptCatalog / Provider / Gateway（無正式 Prompt 文字）
 ├── rag/          Build-time RAG：pdf_text/chunker/refs/embedding/store/mapping
 ├── checks/
 │   ├── rule/     確定性規則（缺件/F01/F02/跨表/F03佐證存在性/F02觸發題條文查表）
-│   └── llm/      F03 兩段佐證 LLM 比較 + RAG 檢索輔助判讀
+│   └── llm/      F03 統一 assessment + 相容期舊檢查
 ├── review/       engine：編排 parse → checks → 匯總
 ├── report/       Finding → Markdown
-└── web/          FastAPI（/api/classify、/api/review、/api/review/stream）+ 靜態前端掛載
+└── web/          FastAPI v1/v2 + 靜態前端
+
+src/ts_parser/                    # 上游 parser 原始碼整合邊界
 
 scripts/build_regulation_index.py   # Phase 3：R01–R07 PDF 分塊 + embedding → 索引 + canonical 映射
 specs/                              # SDD spec：p3-01 法規索引 / p3-02 canonical 映射 / p3-03 RAG 判讀
@@ -259,5 +270,6 @@ docs/milvus_migration.md            # Milvus Lite → Milvus Server 遷移手冊
 - Phase 1 ✅ F02 風險評鑑規則
 - Phase 2 ✅ 缺件 + F01 必填 + F01/F02/F03 跨表一致 + 批次上傳自動分類
 - Phase 3 ✅ F03 兩段佐證 LLM 比較 + 彙整表 + RAG 法規檢索（build-time 索引 + canonical 映射，預設開）
-- Phase 4 ⏳ 佐證充分性（解析佐證文件內容並評估是否支持檢核項）
-- Phase 5 ⏳ Agent 協助提案者填寫
+- Phase 4 ✅ 佐證文件解析、來源定位、支持／衝突結構化判讀
+- Phase 5 ✅ 提案者／審查者共用 engine 與角色化呈現
+- 上線校準 ⏳ 10 組去識別案例雙人標註、shadow mode 品質／成本門檻驗收

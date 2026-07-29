@@ -52,7 +52,8 @@ def load_llm_config(path: str | None = None) -> dict:
     """回傳正規化後的 LLM 設定 dict。
 
     環境變數覆寫鍵：GOVCHECK_LLM_ENABLED / _BASE_URL / _MODEL / _API_KEY /
-    _TIMEOUT / _TEMPERATURE / _MAX_ITEMS / _BATCH_SIZE。api_key 一律由環境變數提供。
+    _TIMEOUT / _TEMPERATURE / _MAX_ITEMS / _MAX_OUTPUT_TOKENS / _BATCH_SIZE。
+    api_key 一律由環境變數提供。
     """
     raw = _load_yaml(str(Path(path) if path else CONFIG_PATH))
     base_url = os.environ.get("GOVCHECK_LLM_BASE_URL", raw.get("base_url") or "http://localhost:11434/v1")
@@ -65,5 +66,32 @@ def load_llm_config(path: str | None = None) -> dict:
         "timeout": _as_number(os.environ.get("GOVCHECK_LLM_TIMEOUT"), raw.get("timeout"), float, 60.0),
         "temperature": _as_number(os.environ.get("GOVCHECK_LLM_TEMPERATURE"), raw.get("temperature"), float, 0.0),
         "max_items": _as_number(os.environ.get("GOVCHECK_LLM_MAX_ITEMS"), raw.get("max_items"), int, 30),
+        "max_output_tokens": _as_number(
+            os.environ.get("GOVCHECK_LLM_MAX_OUTPUT_TOKENS"),
+            raw.get("max_output_tokens"),
+            int,
+            4096,
+        ),
         "batch_size": _as_number(os.environ.get("GOVCHECK_LLM_BATCH_SIZE"), raw.get("batch_size"), int, 8),
+        "prompt_provider": os.environ.get(
+            "GOVCHECK_PROMPT_PROVIDER", raw.get("prompt_provider", "disabled")
+        ),
+        "prompt_base_url": os.environ.get("GOVCHECK_PROMPT_BASE_URL") or raw.get("prompt_base_url"),
+        "prompt_label": os.environ.get("GOVCHECK_PROMPT_LABEL", raw.get("prompt_label", "production")),
+        "evidence_embedding_enabled": _as_bool(
+            os.environ.get("GOVCHECK_EVIDENCE_EMBEDDING_ENABLED"),
+            raw.get("evidence_embedding_enabled", False),
+        ),
+        "evidence_lexical_weight": _as_number(
+            os.environ.get("GOVCHECK_EVIDENCE_LEXICAL_WEIGHT"),
+            raw.get("evidence_lexical_weight"),
+            float,
+            0.7,
+        ),
+        "evidence_top_k": _as_number(
+            os.environ.get("GOVCHECK_EVIDENCE_TOP_K"),
+            raw.get("evidence_top_k"),
+            int,
+            4,
+        ),
     }

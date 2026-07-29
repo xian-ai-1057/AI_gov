@@ -178,6 +178,14 @@ button { font-family: inherit; cursor: pointer; }
 
 /* Step 2 分類 */
 .gv-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+.gv-review-options { display: flex; flex-wrap: wrap; gap: 16px; margin: 0 0 18px; }
+.gv-review-options label { display: grid; gap: 6px; color: var(--muted); font-size: 13px; font-weight: 600; }
+.gv-review-meta { margin: 22px 0; padding: 20px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; }
+.gv-meta-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 20px; }
+.gv-meta-grid > div { display: grid; gap: 4px; min-width: 0; }
+.gv-meta-grid strong { color: var(--muted); font-size: 12px; }
+.gv-meta-grid span { overflow-wrap: anywhere; font-size: 13px; }
+@media (max-width: 720px) { .gv-meta-grid { grid-template-columns: 1fr; } }
 .gv-chip {
   display: inline-flex; align-items: center; gap: 7px; padding: 6px 13px; border-radius: 999px;
   font-size: 12.5px; font-weight: 500; border: 1px solid var(--border);

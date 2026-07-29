@@ -131,6 +131,40 @@ def test_review_response_contract_keys():
     assert body["risk_grade"] is None
 
 
+def test_v2_review_requires_stage_and_returns_structured_metadata():
+    missing = client.post(
+        "/api/v2/review", data={"kinds": json.dumps(["supporting"])}, files=[_pdf()]
+    )
+    assert missing.status_code == 422
+
+    response = client.post(
+        "/api/v2/review",
+        data={"kinds": json.dumps(["supporting"]), "workflow_stage": "proposal"},
+        files=[("files", ("evidence.txt", "佐證內容".encode(), "text/plain"))],
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["workflow_stage"] == "proposal"
+    assert body["decision_status"] in {
+        "approved", "changes_required", "manual_review", "incomplete"
+    }
+    # v1 的 passed 只看 error_count，會與 decision_status 互相矛盾；v2 只給一個通過訊號。
+    assert "passed" not in body
+    assert body["document_statuses"][0]["status"] == "parsed"
+    assert "source_units" not in body["document_statuses"][0]
+    assert set(body["usage_summary"]) >= {
+        "parser_vlm_calls", "review_llm_primary_calls", "cache_hits"
+    }
+
+
+def test_prompt_readiness_is_false_when_provider_disabled():
+    body = client.get("/api/v2/readiness/prompts").json()
+    assert body["ready"] is False
+    assert set(body["prompts"]) >= {
+        "govcheck.f03.fairness", "govcheck.f03.escalation"
+    }
+
+
 def test_review_kinds_not_list_rejected():
     # 合法 JSON 但非陣列（如 "null"）須回 400，不可變成未處理的 500。
     res = client.post("/api/review", data={"kinds": "null"}, files=[_pdf()])
@@ -300,7 +334,7 @@ def test_review_stream_full_bundle_emits_parse_and_passes(tmp_path):
     assert res.status_code == 200
     events = _sse_events(res)
     parse = [e for e in events if e["stage"] == "parse"]
-    assert [e["done"] for e in parse] == [1, 2, 3]   # F01/F02/F03 三表逐一解析
+    assert [e["done"] for e in parse] == [1, 2, 3, 4]  # 三表 + 一份佐證文件
     report = events[-1]["report"]
     assert "SUBMISSION.OK" in {f["code"] for f in report["findings"]} and report["passed"] is True
     # 含 F02 → 串流 done 事件報告也帶風險欄位（與 /api/review 契約一致）

@@ -10,6 +10,14 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from govcheck.models.evidence import (
+    DecisionStatus,
+    DocumentArtifact,
+    F03ItemAssessment,
+    ReviewRunMeta,
+    UsageSummary,
+)
+
 
 class Severity(str, Enum):
     ERROR = "error"  # 明確違規 / 缺漏，必須處理
@@ -39,6 +47,13 @@ class ReviewReport(BaseModel):
     findings: list[Finding] = Field(default_factory=list)
     risk_score: float | None = None         # F02 固有風險百分比（overall 0–100）；無 F02 則 None
     risk_grade: str | None = None           # F02 固有風險分級：低/中/高；無 F02 則 None
+    # exclude=True keeps the legacy ``model_dump``/golden contract stable. API v2 projects these
+    # fields explicitly; v1 callers continue seeing the original response shape.
+    decision_status: DecisionStatus = Field(default=DecisionStatus.MANUAL_REVIEW, exclude=True)
+    item_assessments: list[F03ItemAssessment] = Field(default_factory=list, exclude=True)
+    document_statuses: list[DocumentArtifact] = Field(default_factory=list, exclude=True)
+    usage_summary: UsageSummary = Field(default_factory=UsageSummary, exclude=True)
+    review_run_meta: ReviewRunMeta = Field(default_factory=ReviewRunMeta, exclude=True)
     banner: str = "⚠️ 本報告為 AI 初判草稿，需治理人員與三遵人工覆核，最終判定權不在 AI。"
 
     @property
@@ -51,4 +66,5 @@ class ReviewReport(BaseModel):
 
     @property
     def passed(self) -> bool:
+        """v1 相容欄位；新介面應使用 decision_status。"""
         return self.error_count == 0

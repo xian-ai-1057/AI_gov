@@ -44,4 +44,11 @@ logs/
 
 # 備份壓縮檔（非原始碼）
 *.zip
+
+# 本機試打外部模型 API 的臨時腳本（會外送公有雲，絕不可入庫或當成專案程式執行）
+/gemini.py
+
+# Claude Code 本機設定（含機器專屬路徑與個人授權清單）；launch.json 團隊共用故不忽略
+.claude/settings.local.json
+.claude/worktrees/
 .gstack/
