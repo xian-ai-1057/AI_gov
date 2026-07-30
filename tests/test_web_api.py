@@ -10,9 +10,16 @@ LLM 一律不啟用（enable_llm 預設關，確定性）；介面層只驗證�
 
 from __future__ import annotations
 
+import io
+import json
+
+import openpyxl
 import pytest
 from fastapi.testclient import TestClient
 
+import govcheck.web.api as api_module
+from govcheck.parsers.f02_parser import ASSESS_SHEET
+from govcheck.review.config import load_review_config
 from govcheck.web.api import app
 from tests.fixture_builder import (
     OFFICIAL,
@@ -39,6 +46,10 @@ REPORT_KEYS = {
     "citations", "usage_summary", "review_run_meta", "markdown",
 }
 
+_REVIEW_CFG = load_review_config()
+F01_SHEET = _REVIEW_CFG["f01"]["main_sheet"]
+F03_SHEET = _REVIEW_CFG["f03"]["sheet"]
+
 
 @pytest.fixture(autouse=True)
 def _no_regulation_map(monkeypatch):
@@ -51,6 +62,96 @@ def _pdf(name: str = "佐證.pdf") -> tuple:
 
 def _form_file(field: str, path, name: str | None = None) -> tuple:
     return (field, (name or path.name, path.read_bytes(), "application/octet-stream"))
+
+
+def _batch_file(name: str, data: bytes, media_type: str = "application/octet-stream") -> tuple:
+    return ("files", (name, data, media_type))
+
+
+def _xlsx_bytes(*sheet_names: str) -> bytes:
+    workbook = openpyxl.Workbook()
+    workbook.remove(workbook.active)
+    for sheet_name in sheet_names:
+        worksheet = workbook.create_sheet(sheet_name)
+        worksheet["A1"] = "合成測試內容"
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+# ── /api/classify：批次分類預覽 ──────────────────────────────────────
+
+
+def test_classify_rejects_empty_upload():
+    res = client.post("/api/classify")
+
+    assert res.status_code == 400
+
+
+def test_classify_response_contract_and_input_order():
+    res = client.post(
+        "/api/classify",
+        files=[
+            _batch_file("看似F02.xlsx", _xlsx_bytes(F01_SHEET)),
+            _batch_file("佐證.pdf", b"%PDF", "application/pdf"),
+            _batch_file("其他.xlsx", _xlsx_bytes("Sheet1")),
+        ],
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    assert set(body) == {"kinds", "files"}
+    assert [option["value"] for option in body["kinds"]] == [
+        "f01",
+        "f02",
+        "f03",
+        "supporting",
+        "ignore",
+    ]
+    assert [item["filename"] for item in body["files"]] == [
+        "看似F02.xlsx",
+        "佐證.pdf",
+        "其他.xlsx",
+    ]
+    assert [item["kind"] for item in body["files"]] == [
+        "f01",
+        "supporting",
+        "ignore",
+    ]
+    assert [item["flag"] for item in body["files"]] == [None, None, "unknown"]
+    assert all(
+        set(item) == {"index", "filename", "kind", "reason", "flag"}
+        for item in body["files"]
+    )
+
+
+def test_classify_flags_duplicate_core_form():
+    f03 = _xlsx_bytes(F03_SHEET)
+
+    body = client.post(
+        "/api/classify",
+        files=[
+            _batch_file("first.xlsx", f03),
+            _batch_file("second.xlsx", f03),
+        ],
+    ).json()
+
+    assert [item["kind"] for item in body["files"]] == ["f03", "f03"]
+    assert [item["flag"] for item in body["files"]] == [None, "dup"]
+
+
+def test_classify_uses_f02_priority_for_ambiguous_workbook():
+    body = client.post(
+        "/api/classify",
+        files=[
+            _batch_file(
+                "mixed.xlsx",
+                _xlsx_bytes(F03_SHEET, F01_SHEET, ASSESS_SHEET),
+            )
+        ],
+    ).json()
+
+    assert body["files"][0]["kind"] == "f02"
 
 
 # ── /api/review：無須官方範本 ────────────────────────────────────────
@@ -122,6 +223,209 @@ def test_review_no_files_rejected():
     assert client.post("/api/review").status_code == 400
 
 
+def test_review_batch_supporting_only_uses_current_report_contract():
+    files = [_batch_file("evidence.txt", "佐證內容".encode(), "text/plain")]
+    res = client.post(
+        "/api/review",
+        data={
+            "kinds": json.dumps(["supporting"]),
+            "workflow_stage": "acceptance",
+        },
+        files=files,
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    assert set(body) == REPORT_KEYS
+    assert body["workflow_stage"] == "acceptance"
+    assert body["decision_status"] == "changes_required"
+    assert "passed" not in body
+    assert {
+        "CLASSIFY.SUMMARY",
+        "DOC.MISSING_F01",
+        "DOC.MISSING_F03",
+    } <= {finding["code"] for finding in body["findings"]}
+
+
+def test_review_batch_allows_unknown_xlsx_to_be_confirmed_as_supporting():
+    files = [_batch_file("佐證試算表.xlsx", _xlsx_bytes("測試結果"))]
+    res = client.post(
+        "/api/review",
+        data={
+            "kinds": json.dumps(["supporting"]),
+        },
+        files=files,
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    assert len(body["document_statuses"]) == 1
+    assert body["document_statuses"][0]["status"] == "parsed"
+    summary = next(
+        finding for finding in body["findings"] if finding["code"] == "CLASSIFY.SUMMARY"
+    )
+    assert "佐證試算表.xlsx → 佐證文件" in summary["message"]
+
+
+def test_review_batch_keeps_ignored_file_in_report_and_decision():
+    files = [
+        _batch_file("evidence.txt", "佐證內容".encode(), "text/plain"),
+        _batch_file("unknown.xlsx", _xlsx_bytes("Sheet1")),
+    ]
+    res = client.post(
+        "/api/review",
+        data={
+            "kinds": json.dumps(["supporting", "ignore"]),
+        },
+        files=files,
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    codes = {finding["code"] for finding in body["findings"]}
+    assert "CLASSIFY.IGNORED" in codes
+    assert body["decision_status"] == "changes_required"
+    summary = next(finding for finding in body["findings"] if finding["code"] == "CLASSIFY.SUMMARY")
+    assert "共 2 個檔案" in summary["message"]
+    assert "unknown.xlsx → 忽略（未納入審查）" in summary["message"]
+
+
+def test_review_batch_duplicate_form_returns_classification_finding():
+    files = [
+        _batch_file("first.xlsm", b"not excel"),
+        _batch_file("second.xlsm", b"not excel"),
+    ]
+    res = client.post(
+        "/api/review",
+        data={
+            "kinds": json.dumps(["f02", "f02"]),
+        },
+        files=files,
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    codes = {finding["code"] for finding in body["findings"]}
+    assert "CLASSIFY.SUMMARY" in codes
+    assert "CLASSIFY.DUPLICATE_F02" in codes
+    assert body["decision_status"] == "changes_required"
+    assert body["warn_count"] >= 1
+
+
+def test_review_rejects_mixed_batch_and_routed_uploads():
+    res = client.post(
+        "/api/review",
+        data={"kinds": json.dumps(["supporting"])},
+        files=[
+            _batch_file("batch.pdf", b"%PDF", "application/pdf"),
+            _pdf("routed.pdf"),
+        ],
+    )
+
+    assert res.status_code == 400
+    assert "不可混用" in res.json()["detail"]
+
+
+def test_review_batch_requires_kinds():
+    res = client.post(
+        "/api/review",
+        files=[_batch_file("evidence.pdf", b"%PDF", "application/pdf")],
+    )
+
+    assert res.status_code == 400
+    assert "kinds" in res.json()["detail"]
+
+
+@pytest.mark.parametrize("kinds", ["not json", json.dumps("supporting")])
+def test_review_batch_rejects_malformed_or_non_array_kinds(kinds):
+    res = client.post(
+        "/api/review",
+        data={"kinds": kinds},
+        files=[_batch_file("evidence.pdf", b"%PDF", "application/pdf")],
+    )
+
+    assert res.status_code == 400
+    assert "kinds" in res.json()["detail"]
+
+
+def test_review_batch_rejects_kinds_length_mismatch():
+    res = client.post(
+        "/api/review",
+        data={"kinds": json.dumps(["supporting", "ignore"])},
+        files=[_batch_file("evidence.pdf", b"%PDF", "application/pdf")],
+    )
+
+    assert res.status_code == 400
+    assert "數量" in res.json()["detail"]
+
+
+@pytest.mark.parametrize("kind", ["unknown", "bogus", 123, None])
+def test_review_batch_rejects_illegal_kind(kind):
+    res = client.post(
+        "/api/review",
+        data={"kinds": json.dumps([kind])},
+        files=[_batch_file("evidence.pdf", b"%PDF", "application/pdf")],
+    )
+
+    assert res.status_code == 400
+    assert "判定" in res.json()["detail"]
+
+
+def test_review_batch_rejects_all_ignored():
+    files = [
+        _batch_file("one.xlsx", _xlsx_bytes("Sheet1")),
+        _batch_file("two.xlsx", _xlsx_bytes("Sheet2")),
+    ]
+    res = client.post(
+        "/api/review",
+        data={
+            "kinds": json.dumps(["ignore", "ignore"]),
+        },
+        files=files,
+    )
+
+    assert res.status_code == 400
+    assert "忽略" in res.json()["detail"]
+
+
+def test_classify_enforces_single_file_size_before_classification(monkeypatch):
+    monkeypatch.setattr(api_module, "MAX_UPLOAD_BYTES", 4)
+
+    res = client.post(
+        "/api/classify",
+        files=[_batch_file("large.pdf", b"12345", "application/pdf")],
+    )
+
+    assert res.status_code == 413
+    assert "large.pdf" in res.json()["detail"]
+
+
+def test_classify_enforces_batch_total_size(monkeypatch):
+    monkeypatch.setattr(api_module, "MAX_BATCH_UPLOAD_BYTES", 5)
+
+    res = client.post(
+        "/api/classify",
+        files=[
+            _batch_file("one.pdf", b"123", "application/pdf"),
+            _batch_file("two.pdf", b"456", "application/pdf"),
+        ],
+    )
+
+    assert res.status_code == 413
+    assert "整批" in res.json()["detail"]
+
+
+def test_review_routed_mode_rejects_batch_kinds():
+    res = client.post(
+        "/api/review",
+        data={"kinds": json.dumps(["supporting"])},
+        files=[_pdf()],
+    )
+
+    assert res.status_code == 400
+    assert "分欄" in res.json()["detail"]
+
+
 def test_review_unsafe_and_duplicate_filenames():
     # 惡意/重複檔名：basename 化擋逃逸、欄位前綴避免覆蓋；兩個同名佐證皆不應導致崩潰。
     files = [
@@ -151,6 +455,18 @@ def test_index_served():
     assert "http://" not in res.text and "https://" not in res.text
 
 
+def test_frontend_includes_batch_classification_flow():
+    script = client.get("/app.js")
+
+    assert script.status_code == 200
+    assert 'postForm("/api/classify"' in script.text
+    assert 'fd.append("kinds", JSON.stringify(confirmed))' in script.text
+    assert "renderStep2" in script.text
+    assert "currentClassifications" in script.text
+    assert "invalidateReport" in script.text
+    assert 'data-action="set-kind"' in script.text
+
+
 # ── 須官方範本：真檔端到端 ────────────────────────────────────────────
 
 
@@ -174,6 +490,38 @@ def test_review_full_bundle_passes(tmp_path):
     assert body["risk_grade"] in {"低", "中", "高"}
     assert isinstance(body["risk_score"], (int, float))
     assert "固有風險分級" in body["markdown"]
+
+
+@requires_templates
+def test_review_batch_full_bundle_contract_and_decision_status(tmp_path):
+    from tests.test_f02_rules import BASELINE
+
+    f01 = build_f01_fixture(tmp_path / "f01.xlsx")
+    f02 = build_f02_fixture(tmp_path / "f02.xlsm", answers=BASELINE, cached_grade="低")
+    f03 = build_f03_fixture(tmp_path / "f03.xlsx")
+    files = [
+        _form_file("files", f03),
+        _form_file("files", f01),
+        _form_file("files", f02),
+    ]
+    res = client.post(
+        "/api/review",
+        data={
+            "kinds": json.dumps(["f03", "f01", "f02"]),
+            "workflow_stage": "proposal",
+        },
+        files=files,
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    assert set(body) == REPORT_KEYS
+    assert body["error_count"] == 0
+    assert body["warn_count"] == 0
+    assert body["decision_status"] == "manual_review"
+    assert {"CLASSIFY.SUMMARY", "SUBMISSION.OK"} <= {
+        finding["code"] for finding in body["findings"]
+    }
 
 
 @requires_templates

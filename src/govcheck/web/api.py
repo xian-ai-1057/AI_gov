@@ -1,15 +1,17 @@
-"""FastAPI 後端：一個審查 API + 一個就緒查詢 + 靜態前端掛載。
+"""FastAPI 後端：批次分類、送件包審查、就緒查詢與靜態前端掛載。
 
-對應前端兩步驟：
-  1) 上傳送件包（F01 / F02 / F03 各一份 + 佐證多份）
-  2) 審查報告 → POST /api/review（temp 用後即刪 → 結構化報告）
+對應前端三步驟：
+  1) 一次上傳整批送件包
+  2) POST /api/classify 預覽並確認自動分類
+  3) POST /api/review 審查（temp 用後即刪 → 結構化報告）
 
-介面層零判讀邏輯：只負責落地檔案、呼叫 review_submission、把 ReviewReport 轉成 JSON。
-暫存檔於 TemporaryDirectory 結束時一併清除（最小足跡、地端不外送）。
+`/api/review` 也保留 f01/f02/f03/supporting 分欄參數，供既有呼叫端使用。
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -20,13 +22,20 @@ from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from govcheck.classify import (
+    KIND_LABEL,
+    FileClassification,
+    FileKind,
+    classify_fileobj,
+    route_classifications,
+)
 from govcheck.llm.client import ChatClient
 from govcheck.llm.config import load_llm_config
 from govcheck.logging_setup import get_logger, new_request_id, set_request_id, setup_logging
 from govcheck.models import ReviewReport, Severity, WorkflowStage
 from govcheck.prompts import build_prompt_gateway
 from govcheck.report.builder import to_markdown
-from govcheck.review.engine import review_submission
+from govcheck.review.engine import review_routed, review_submission
 
 log = get_logger("api")
 
@@ -35,6 +44,15 @@ WEB_DIR = Path(__file__).resolve().parents[3] / "web"
 
 # 單檔上限（50 MB）：防止記憶體耗盡或磁碟塞滿
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_BATCH_UPLOAD_BYTES = 200 * 1024 * 1024
+MAX_UPLOAD_FILES = 100
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+# UNKNOWN 不可直接送審；使用者須明確改判為一種可路由類別，或選擇忽略。
+IGNORE = FileKind.IGNORED.value
+_ASSIGNABLE = (FileKind.F01, FileKind.F02, FileKind.F03, FileKind.SUPPORTING)
+KIND_OPTIONS = [{"value": kind.value, "label": KIND_LABEL[kind]} for kind in _ASSIGNABLE]
+KIND_OPTIONS.append({"value": IGNORE, "label": "忽略此檔"})
 
 
 @asynccontextmanager
@@ -109,8 +127,57 @@ def _report_dict(report: ReviewReport) -> dict:
     }
 
 
+@app.post("/api/classify")
+async def classify(files: list[UploadFile] | None = None) -> JSONResponse:
+    """預覽批次分類；應用不持久化內容，request 暫存由框架在結束後清除。"""
+    uploads = [upload for upload in (files or []) if upload.filename]
+    if not uploads:
+        raise HTTPException(status_code=400, detail="請上傳至少一個檔案。")
+    _validate_uploads(uploads)
+
+    results: list[dict] = []
+    seen_form_kinds: set[FileKind] = set()
+    for index, upload in enumerate(uploads):
+        name = upload.filename or f"file_{index}"
+        await upload.seek(0)
+        classification = await asyncio.to_thread(
+            classify_fileobj,
+            upload.file,
+            name,
+        )
+        await upload.seek(0)
+
+        flag: str | None = None
+        if classification.kind is FileKind.UNKNOWN:
+            flag = "unknown"
+        elif classification.kind is not FileKind.SUPPORTING:
+            if classification.kind in seen_form_kinds:
+                flag = "dup"
+            else:
+                seen_form_kinds.add(classification.kind)
+
+        default_kind = (
+            classification.kind.value
+            if classification.kind in _ASSIGNABLE
+            else IGNORE
+        )
+        results.append(
+            {
+                "index": index,
+                "filename": name,
+                "kind": default_kind,
+                "reason": classification.reason,
+                "flag": flag,
+            }
+        )
+
+    return JSONResponse({"kinds": KIND_OPTIONS, "files": results})
+
+
 @app.post("/api/review")
 async def review(
+    files: list[UploadFile] | None = None,
+    kinds: str | None = Form(default=None),
     f01: UploadFile | None = None,
     f02: UploadFile | None = None,
     f03: UploadFile | None = None,
@@ -118,16 +185,45 @@ async def review(
     workflow_stage: WorkflowStage = Form(default=WorkflowStage.PROPOSAL),
     enable_llm: bool | None = Form(default=None),
 ) -> JSONResponse:
-    """上傳送件包 → 審查 → 回報告 JSON（含 Markdown 版供下載）。
+    """審查送件包並回傳報告 JSON（含 Markdown）。
 
-    F01/F02/F03 各一份（未上傳者由缺件檢查報出），佐證可多份。
+    批次模式使用 repeated `files` + 與其等長的 `kinds` JSON 陣列；既有分欄模式仍可使用
+    `f01`、`f02`、`f03` 與 repeated `supporting`。兩種模式不可混用。
     """
+    batch_uploads = [upload for upload in (files or []) if upload.filename]
     forms = {"f01": f01, "f02": f02, "f03": f03}
     supporting = [up for up in (supporting or []) if up.filename]
-    if not any(up is not None and up.filename for up in forms.values()) and not supporting:
+    has_routed_uploads = (
+        any(upload is not None and upload.filename for upload in forms.values())
+        or bool(supporting)
+    )
+    if batch_uploads and has_routed_uploads:
+        raise HTTPException(status_code=400, detail="批次上傳與分欄上傳不可混用。")
+    if not batch_uploads and not has_routed_uploads:
         raise HTTPException(status_code=400, detail="請至少上傳一份表單或佐證檔案。")
 
     use_llm = bool(load_llm_config()["enabled"]) if enable_llm is None else bool(enable_llm)
+
+    if batch_uploads:
+        if kinds is None:
+            raise HTTPException(status_code=400, detail="批次上傳缺少分類確認結果 kinds。")
+        confirmed_kinds = _parse_confirmed_kinds(kinds, len(batch_uploads))
+        report = await _review_batch_uploads(
+            batch_uploads,
+            confirmed_kinds,
+            use_llm,
+            workflow_stage,
+        )
+        return JSONResponse(_report_dict(report))
+    if kinds is not None:
+        raise HTTPException(status_code=400, detail="分欄上傳不應提供 kinds。")
+
+    routed_uploads = [
+        upload
+        for upload in [*forms.values(), *supporting]
+        if upload is not None and upload.filename
+    ]
+    _validate_uploads(routed_uploads)
 
     # 用後即刪：暫存檔在 TemporaryDirectory 結束時一併清除（最小足跡、地端不外送）
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -159,18 +255,149 @@ async def review(
     return JSONResponse(_report_dict(report))
 
 
+async def _review_batch_uploads(
+    uploads: list[UploadFile],
+    confirmed_kinds: list[str],
+    use_llm: bool,
+    workflow_stage: WorkflowStage,
+) -> ReviewReport:
+    """落地使用者確認後的批次分類，路由至現行審查引擎。"""
+    _validate_uploads(uploads)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        confirmed: list[FileClassification] = []
+        for index, (upload, kind_value) in enumerate(zip(uploads, confirmed_kinds)):
+            try:
+                kind = FileKind(kind_value)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=f"未知判定 {kind_value!r}") from exc
+            if kind not in {*_ASSIGNABLE, FileKind.IGNORED}:
+                raise HTTPException(status_code=400, detail=f"不可指派的判定 {kind_value!r}")
+
+            name = upload.filename or f"file_{index}"
+            if kind is FileKind.IGNORED:
+                confirmed.append(
+                    FileClassification(
+                        filename=name,
+                        kind=kind,
+                        reason="使用者確認忽略",
+                    )
+                )
+                continue
+
+            path = await _persist(upload, Path(tmpdir), f"batch{index}")
+            confirmed.append(
+                FileClassification(
+                    path=path,
+                    filename=name,
+                    kind=kind,
+                    reason="使用者確認/修正",
+                )
+            )
+
+        if all(item.kind is FileKind.IGNORED for item in confirmed):
+            raise HTTPException(
+                status_code=400,
+                detail="所有檔案都被標記為「忽略此檔」，沒有可審查的內容。",
+            )
+
+        routed_files, supporting_names, class_findings = route_classifications(confirmed)
+        supporting_paths = [
+            item.path
+            for item in confirmed
+            if item.kind is FileKind.SUPPORTING and item.path is not None
+        ]
+        try:
+            return review_routed(
+                routed_files,
+                supporting=supporting_names,
+                class_findings=class_findings,
+                enable_llm=use_llm,
+                supporting_paths=supporting_paths,
+                workflow_stage=workflow_stage,
+            )
+        except Exception as exc:  # noqa: BLE001 - 介面層需友善呈現解析／審查錯誤
+            log.error("batch review failed: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=400,
+                detail=f"解析或審查失敗：{type(exc).__name__}",
+            ) from exc
+
+
+def _parse_confirmed_kinds(kinds: str, file_count: int) -> list[str]:
+    """解析並驗證前端送來的 kinds JSON 陣列。"""
+    try:
+        confirmed = json.loads(kinds)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=f"kinds 格式錯誤：{exc}") from exc
+    if not isinstance(confirmed, list):
+        raise HTTPException(status_code=400, detail="kinds 應為陣列。")
+    if len(confirmed) != file_count:
+        raise HTTPException(status_code=400, detail="kinds 數量與檔案數不符。")
+    allowed = {kind.value for kind in _ASSIGNABLE} | {IGNORE}
+    invalid = next(
+        (value for value in confirmed if not isinstance(value, str) or value not in allowed),
+        None,
+    )
+    if invalid is not None or any(value is None for value in confirmed):
+        raise HTTPException(status_code=400, detail=f"未知判定 {invalid!r}")
+    return confirmed
+
+
 async def _persist(up: UploadFile, tmpdir: Path, prefix: str) -> str:
     """把上傳檔寫入暫存目錄，回傳落地路徑。
 
     檔名一律取 basename（擋掉 ../ 與絕對路徑逃逸），並加前綴避免同名覆蓋。
     """
     name = up.filename or "file"
-    data = await up.read()
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"上傳檔案超過大小限制（上限 50 MB）：{name}")
     dest = tmpdir / f"{prefix}_{Path(name).name or 'file'}"
-    dest.write_bytes(data)
+    written = 0
+    await up.seek(0)
+    try:
+        with dest.open("wb") as target:
+            while chunk := await up.read(UPLOAD_CHUNK_BYTES):
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"上傳檔案超過大小限制（上限 50 MB）：{name}",
+                    )
+                target.write(chunk)
+    finally:
+        await up.seek(0)
     return str(dest)
+
+
+def _validate_uploads(uploads: list[UploadFile]) -> None:
+    """驗證檔案數、單檔與整批大小。"""
+    if len(uploads) > MAX_UPLOAD_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"上傳檔案數超過限制（上限 {MAX_UPLOAD_FILES} 個）。",
+        )
+
+    total = 0
+    for upload in uploads:
+        size = upload.size
+        if size is None:
+            position = upload.file.tell()
+            upload.file.seek(0, 2)
+            size = upload.file.tell()
+            upload.file.seek(position)
+        if size > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "上傳檔案超過大小限制（上限 50 MB）："
+                    f"{upload.filename or 'file'}"
+                ),
+            )
+        total += size
+    if total > MAX_BATCH_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="整批上傳超過大小限制（上限 200 MB）。",
+        )
 
 
 @app.get("/api/readiness")

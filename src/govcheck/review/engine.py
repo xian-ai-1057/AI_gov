@@ -21,6 +21,12 @@ from govcheck.checks.rule import (
     f03_evidence_presence,
     missing_docs,
 )
+from govcheck.classify import (
+    FileClassification,
+    FileKind,
+    classify_files,
+    route_classifications,
+)
 from govcheck.evidence import EvidenceRetriever
 from govcheck.llm.client import ChatClient
 from govcheck.llm.config import load_llm_config
@@ -82,6 +88,7 @@ def review_submission(
     enable_llm: bool = False,
     supporting_paths: list[str | Path] | None = None,
     workflow_stage: WorkflowStage | str = WorkflowStage.PROPOSAL,
+    initial_findings: list[Finding] | None = None,
 ) -> ReviewReport:
     """整份送件包初步審查。
 
@@ -89,6 +96,7 @@ def review_submission(
     supporting：佐證檔名清單（供缺件檢查做關鍵字比對）。
     supporting_paths：佐證檔實際路徑（供解析內容做語意判讀的佐證來源）。
     enable_llm：是否做 F03 語意判讀（端點不可用時自動降級，不影響規則檢查）。
+    initial_findings：上游分類或路由階段已產生、須一併納入判定與稽核的 findings。
     """
     t0 = time.perf_counter()
     present = [k for k in ("f01", "f02", "f03") if files.get(k) is not None]
@@ -96,7 +104,7 @@ def review_submission(
 
     review_cfg = cfg or load_review_config()
     workflow_stage = WorkflowStage(workflow_stage)
-    findings: list[Finding] = []
+    findings = list(initial_findings or [])
     sub = _build_submission(files, supporting, supporting_paths, review_cfg, findings)
     assessments = []
     prompt_refs = []
@@ -168,8 +176,13 @@ def review_submission(
     )
 
     dur_ms = round((time.perf_counter() - t0) * 1000)
-    log.info("review_done error=%d warn=%d passed=%s dur=%dms",
-             report.error_count, report.warn_count, report.passed, dur_ms)
+    log.info(
+        "review_done error=%d warn=%d decision=%s dur=%dms",
+        report.error_count,
+        report.warn_count,
+        report.decision_status.value,
+        dur_ms,
+    )
     # 稽核軌跡：只記識別資訊與計數（不記檔內容/佐證全文）；任何 profile 都落檔。
     audit(
         "review_done",
@@ -187,6 +200,54 @@ def review_submission(
         duration_ms=dur_ms,
     )
     return report
+
+
+def review_routed(
+    files: dict[str, str | Path],
+    supporting: list[str] | None = None,
+    class_findings: list[Finding] | None = None,
+    cfg: dict | None = None,
+    enable_llm: bool = False,
+    supporting_paths: list[str | Path] | None = None,
+    workflow_stage: WorkflowStage | str = WorkflowStage.PROPOSAL,
+) -> ReviewReport:
+    """審查已分類的送件包，並把分類摘要與警告併入最終報告。"""
+    return review_submission(
+        files,
+        supporting=supporting,
+        cfg=cfg,
+        enable_llm=enable_llm,
+        supporting_paths=supporting_paths,
+        workflow_stage=workflow_stage,
+        initial_findings=class_findings,
+    )
+
+
+def review_files(
+    paths: list[str | Path],
+    cfg: dict | None = None,
+    enable_llm: bool = False,
+    workflow_stage: WorkflowStage | str = WorkflowStage.PROPOSAL,
+) -> tuple[ReviewReport, list[FileClassification]]:
+    """批次分類檔案後自動路由並審查，回傳報告與逐檔分類結果。"""
+    review_cfg = cfg or load_review_config()
+    classifications = classify_files(paths, review_cfg)
+    files, supporting, class_findings = route_classifications(classifications)
+    supporting_paths = [
+        result.path
+        for result in classifications
+        if result.kind is FileKind.SUPPORTING and result.path is not None
+    ]
+    report = review_routed(
+        files,
+        supporting=supporting,
+        class_findings=class_findings,
+        cfg=review_cfg,
+        enable_llm=enable_llm,
+        supporting_paths=supporting_paths,
+        workflow_stage=workflow_stage,
+    )
+    return report, classifications
 
 
 def _load_regulation_map(reg_cfg: dict) -> RetrievalMap | None:
