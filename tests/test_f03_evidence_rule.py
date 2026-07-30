@@ -27,7 +27,7 @@ def test_done_but_proposal_blank_warns():
 
 def test_done_but_golive_blank_is_info():
     cl = F03Checklist(items=[_item(check_state="是", evidence_proposal="具體佐證說明", evidence_golive=None)])
-    fs = f03_evidence_presence.run_all(cl, workflow_stage=WorkflowStage.ACCEPTANCE)
+    fs = f03_evidence_presence.run_all(cl, workflow_stage=WorkflowStage.GOLIVE)
     assert "F03.EVIDENCE_MISSING_GOLIVE" in _codes(fs)
     assert "F03.EVIDENCE_MISSING_PROPOSAL" not in _codes(fs)
     info = next(f for f in fs if f.code == "F03.EVIDENCE_MISSING_GOLIVE")
@@ -78,7 +78,7 @@ def test_not_applicable_never_requires_golive_evidence():
     cl = F03Checklist(items=[
         _item(item_id="2-1", check_state="不適用", evidence_proposal="無此議題"),
     ])
-    fs = f03_evidence_presence.run_all(cl, workflow_stage=WorkflowStage.PRODUCTION)
+    fs = f03_evidence_presence.run_all(cl, workflow_stage=WorkflowStage.GOLIVE)
     assert fs == []
 
 

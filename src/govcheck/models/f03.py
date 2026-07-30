@@ -15,6 +15,14 @@ from govcheck.models.evidence import WorkflowStage
 
 # 不適用理由帶進報告供治理人員判斷「主張是否成立」；截斷避免整段長文灌進 API payload。
 _REASON_MAX_CHARS = 200
+# 檢查項目與佐證說明原文帶進報告供人工對照 AI 判讀；同樣截斷，避免長文灌爆 payload。
+_TEXT_MAX_CHARS = 600
+
+
+def _clip(text: str | None, limit: int = _TEXT_MAX_CHARS) -> str | None:
+    """去頭尾空白後截斷；空字串與 None 一律回 None（報告端才好判斷「有沒有填」）。"""
+    stripped = (text or "").strip()
+    return stripped[:limit] or None
 
 
 class F03Identity(BaseModel):
@@ -57,18 +65,42 @@ class F03ChecklistItem(BaseModel):
             return self.evidence_proposal or None
         return self.evidence_proposal or self.evidence_golive or None
 
+    def golive_diff_for_stage(self, stage: WorkflowStage) -> str | None:
+        """上線佐證與提案佐證的差異（規則式文字比對，非語意判讀）。
+
+        提案階段不看 J 欄，故回 None。比對前把所有空白去掉，避免排版差異被誤判成內容差異。
+        """
+        if stage is WorkflowStage.PROPOSAL:
+            return None
+        golive = "".join((self.evidence_golive or "").split())
+        if not golive:
+            return "missing"
+        return "same" if golive == "".join((self.evidence_proposal or "").split()) else "changed"
+
     def coverage_for_stage(self, stage: WorkflowStage) -> F03ItemCoverage:
         """本項在該階段的涵蓋狀態（供報告列出**每一個**檢核項）。"""
+        # 原文一律帶進報告供人工對照 AI 判讀；提案階段不帶 J 欄，與 evidence_for_stage 一致
+        # ——該階段的 J 欄尚未進入審查範圍，帶出來會讓人以為 AI 看過了。
+        texts = {
+            "description": _clip(self.description),
+            "evidence_proposal_text": _clip(self.evidence_proposal),
+            "evidence_golive_text": (
+                None if stage is WorkflowStage.PROPOSAL else _clip(self.evidence_golive)
+            ),
+            "golive_diff": self.golive_diff_for_stage(stage),
+        }
         if self.check_state == "不適用":
             reason = (self.evidence_proposal or "").strip()
             return F03ItemCoverage(
                 item_id=self.item_id, topic=self.topic, check_state=self.check_state,
                 coverage="not_applicable", reason=reason[:_REASON_MAX_CHARS] or None,
+                **texts,
             )
         coverage = "assessable" if self.evidence_for_stage(stage) else "no_evidence"
         return F03ItemCoverage(
             item_id=self.item_id, topic=self.topic,
             check_state=self.check_state, coverage=coverage,
+            **texts,
         )
 
 
@@ -85,6 +117,12 @@ class F03ItemCoverage(BaseModel):
     check_state: str | None = None                # 是 / 否 / 不適用 / None（未勾選）
     coverage: Literal["assessable", "not_applicable", "no_evidence"]
     reason: str | None = None                     # 不適用理由（提案單位填在佐證欄時）
+    # 以下四欄供治理人員「對照原文看 AI 判讀」；皆為提案單位填寫內容，截斷後帶進報告。
+    description: str | None = None                # D 檢查項目
+    evidence_proposal_text: str | None = None     # I 前項佐證說明(提案規劃階段)
+    evidence_golive_text: str | None = None       # J 前項佐證說明(上線階段)；提案階段為 None
+    # 上線佐證相對提案佐證的差異；提案階段為 None（該階段不看 J 欄）。
+    golive_diff: Literal["missing", "same", "changed"] | None = None
 
 
 class F03Checklist(BaseModel):

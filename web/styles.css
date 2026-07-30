@@ -394,6 +394,20 @@ button { font-family: inherit; cursor: pointer; }
 .gv-mdetail-empty { font-size: 13px; color: var(--muted); padding: 4px 0; }
 .gv-mdetail-refs { margin-top: 10px; font-size: 12px; color: var(--muted); }
 
+/* 文件內容（參考）：提案單位填寫原文與佐證引用片段。原文保留斷行，過長時區塊內捲動，
+   不讓一段長文把整列撐開。 */
+.gv-src { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
+.gv-src-label { font-size: 12px; font-weight: 600; color: var(--muted); }
+.gv-src-note { font-size: 12px; color: var(--muted); margin: 2px 0; }
+.gv-src-text {
+  margin-top: 3px; padding: 8px 10px; border-left: 3px solid var(--border);
+  background: var(--bg); border-radius: 4px;
+  font-size: 13px; line-height: 1.65; white-space: pre-wrap; word-break: break-word;
+  max-height: 220px; overflow-y: auto;
+}
+/* 上線內容中「提案沒寫過」的句子；用底色標示而非改字色，維持原文可讀性。 */
+.gv-src-text mark { background: var(--warn-bg); color: inherit; padding: 0 2px; border-radius: 2px; }
+
 /* 總覽表 / 分頁清單的空狀態：虛線框，與資料卡明顯區隔。 */
 .gv-matrix-empty {
   border: 1px dashed var(--border); border-radius: var(--rad); background: var(--drop-bg);

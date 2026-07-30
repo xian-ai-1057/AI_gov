@@ -35,14 +35,14 @@ flowchart LR
 
 - `files`: 原順序的整批檔案，可多份。
 - `kinds`: 與 `files` 等長的 JSON 陣列，值為 `f01 | f02 | f03 | supporting | ignore`。
-- `workflow_stage`: `proposal`（預設）、`acceptance` 或 `production`。
+- `workflow_stage`: `proposal`（預設，提案送審）或 `golive`（上線送審）。
 - `enable_llm`: 選填；省略時採應用設定。
 
 為相容既有呼叫端，`POST /api/review` 也接受預先分欄模式：
 
 - `f01` / `f02` / `f03`: 各一份表單檔（選填；未上傳由缺件檢查列出）。
 - `supporting`: 佐證文件，可多份。
-- `workflow_stage`: `proposal`（預設）、`acceptance` 或 `production`。
+- `workflow_stage`: `proposal`（預設，提案送審）或 `golive`（上線送審）。
 - `enable_llm`: 選填；省略時採應用設定。
 
 批次與預先分欄模式不可混用。忽略項目會寫入最終 findings，但不會送入 parser。

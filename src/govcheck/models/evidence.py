@@ -9,9 +9,14 @@ from pydantic import BaseModel, Field
 
 
 class WorkflowStage(str, Enum):
+    """治理流程只有兩段：提案送審、上線送審。
+
+    上線階段＝提案內容已核可、系統實際要上線前的複審，因此除了提案內容外還要看
+    上線階段佐證（F03 J 欄）與「上線後跟提案差了什麼」。
+    """
+
     PROPOSAL = "proposal"
-    ACCEPTANCE = "acceptance"
-    PRODUCTION = "production"
+    GOLIVE = "golive"
 
 
 class DocumentParseStatus(str, Enum):
