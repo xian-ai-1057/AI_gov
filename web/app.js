@@ -72,6 +72,24 @@
     "F03.REGULATION_GAP": "reg",
     "F03.TEMPLATE_REF_MODIFIED": "reg",
   };
+  // 流程階段：治理流程只有提案、上線兩段（見 models/evidence.WorkflowStage）。
+  // 值必須與後端 enum 一致；下拉選單與「審查執行資訊」的中文字樣都由此表推出。
+  const STAGE_LABELS = { proposal: "提案", golive: "上線" };
+  const isGoliveStage = (stage) => stage === "golive";
+
+  // 上線佐證相對提案佐證的差異（後端規則式比對，見 F03ChecklistItem.golive_diff_for_stage）。
+  // 「相同」也要明講：照抄提案內容等於沒有交代上線後的實況，是治理人員要看見的事實。
+  // 不含 missing：上線佐證空白已由規則式 F03.EVIDENCE_MISSING_GOLIVE 標成「空白」，不重複警示。
+  const DIFF_CELL = {
+    same: { kind: "skip", note: "同提案" },
+    changed: { kind: "skip", note: "有差異" },
+  };
+  const DIFF_LABELS = {
+    missing: "未填寫上線階段佐證說明。",
+    same: "上線階段佐證與提案內容完全相同（未列出上線後的差異）。",
+    changed: "上線階段佐證與提案內容不同，下方以標示標出上線內容中新增／改寫的段落。",
+  };
+
   // 未進入語意判讀的檢核項（見 F03Checklist.roster）：狀態格與摘要的字樣。
   // 這些列刻意不算「需人工確認」（kind "skip" 不在 attnKinds 內）——它們是「本次沒判」，
   // 不是「判出問題」；但必須存在於表中，否則「全部 N」會少掉整批項次而無人察覺。
@@ -227,6 +245,11 @@
       topic: topic || null,
       coverage: null,     // "assessable" | "not_applicable" | "no_evidence"（來自名冊）
       naReason: null,     // 不適用理由（提案單位填在佐證欄時）
+      // 提案單位填寫的原文（來自名冊）：治理人員要拿它對照 AI 判讀，不是拿來重新判讀。
+      description: null,      // D 檢查項目
+      propText: null,         // I 提案階段佐證說明
+      goliveText: null,       // J 上線階段佐證說明（提案階段為 null）
+      goliveDiff: null,       // "missing" | "same" | "changed"（提案階段為 null）
       findings: [],
       cells: {
         prop: { kind: "none", note: "" },      // 提案階段內容品質
@@ -269,9 +292,41 @@
     });
   }
 
+  // 上線階段兩欄都要有內容：語意判讀只會落在其中一欄（見 buildMatrix 的 stageColumn），
+  // 另一欄若留空，治理人員會看到整欄「—」而以為表壞了。補的是**事實**（有沒有填、與提案差在哪），
+  // 不是判讀結果，故僅填 kind === "none" 的格，且排在名冊灰字之後（見 buildMatrix 的呼叫順序）。
+  function applyStageTextCells(row, stage) {
+    if (!isGoliveStage(stage)) return;
+    if (row.cells.prop.kind === "none" && row.propText) {
+      row.cells.prop = { kind: "ok", note: "已填寫" };
+    }
+    const diff = DIFF_CELL[row.goliveDiff];
+    if (row.cells.golive.kind === "none" && diff) row.cells.golive = { ...diff };
+  }
+
+  // 需求：內容、法規都通過，只是沒找到佐證文件時，佐證欄用通過色（字樣仍寫「未找到佐證」）。
+  // 「沒附佐證」與「內容有問題」是兩件事，混用同一個琥珀警示會讓治理人員每列都得點開才知道沒事。
+  // 只在「其他欄位都乾淨」時放行；後端 finding 與 decision_status 不動，明細仍看得到原因。
+  const EVIDENCE_RELAXABLE_NOTE = "未找到佐證";
+
+  function relaxEvidenceCell(row) {
+    const ev = row.cells.evidence;
+    if (ev.kind !== "warn" || ev.note !== EVIDENCE_RELAXABLE_NOTE) return;
+    const othersClean = ["prop", "golive", "reg"]
+      .every((k) => row.cells[k].kind === "ok" || row.cells[k].kind === "none");
+    if (!othersClean) return;
+    if (row.findings.some((f) => f.severity === "error")) return;
+    row.cells.evidence = { kind: "okinfo", note: EVIDENCE_RELAXABLE_NOTE };
+    row.evidenceRelaxed = true;
+  }
+
   // 這一列「問題出在哪一欄」的集合：先看狀態格，再補上個別 finding 代碼
   // （關閉語意判讀時，規則式 finding 代碼是唯一線索）。
   const CAUSE_KEYS = ["golive", "prop", "evidence", "diff", "reg"];
+
+  // 佐證欄放行時，對應的 warn finding 也要一併排除，否則整列仍被 finding 拉回「有問題」。
+  const isRelaxedEvidenceFinding = (row, f) =>
+    row.evidenceRelaxed && f.code === "F03.EVIDENCE_NOT_SUPPORTED";
 
   function rowCauses(row) {
     const causes = new Set();
@@ -279,7 +334,11 @@
     if (row.cells.prop.kind === "warn") causes.add("prop");
     if (row.cells.evidence.kind === "warn") causes.add("evidence");
     if (row.cells.reg.kind === "warn") causes.add("reg");
-    row.findings.forEach((f) => { const c = CAUSE_CODE_MAP[f.code]; if (c) causes.add(c); });
+    row.findings.forEach((f) => {
+      if (isRelaxedEvidenceFinding(row, f)) return;
+      const c = CAUSE_CODE_MAP[f.code];
+      if (c) causes.add(c);
+    });
     return causes;
   }
 
@@ -306,6 +365,10 @@
       const row = newMatrixRow(entry.item_id, entry.topic);
       row.coverage = entry.coverage;
       row.naReason = entry.reason || null;
+      row.description = entry.description || null;
+      row.propText = entry.evidence_proposal_text || null;
+      row.goliveText = entry.evidence_golive_text || null;
+      row.goliveDiff = entry.golive_diff || null;
       rowMap.set(entry.item_id, row);
     });
 
@@ -400,17 +463,24 @@
       row.gist = rowGist(row);
       applyRuleCellFallback(row);
       applyCoverageCells(row);
+      // 排在 applyCoverageCells 之後：不適用／未填佐證的列已整列標成灰字，
+      // 不可再被「已填寫」的綠勾蓋掉（那會讓未判讀的列看起來像通過）。
+      applyStageTextCells(row, report.workflow_stage);
+      // 佐證放行必須排在所有狀態格都填完之後：它的前提正是「其他欄位都乾淨」。
+      relaxEvidenceCell(row);
       if (row.gist === "—" && COVERAGE_GIST[row.coverage]) row.gist = COVERAGE_GIST[row.coverage];
       const cellKeys = ["prop", "golive", "evidence", "reg"];
       // warn（有問題）、err（⚠️ 判讀失敗）、undet（❓ 無法判定）三種儲存格都代表「需人工確認」：
       // err/undet 是「AI 判不了，請人看」，同樣不能在預設「只看有問題」濾鏡下被藏掉。
       const attnKinds = { warn: 1, err: 1, undet: 1 };
       const anyCellAttn = cellKeys.some((k) => attnKinds[row.cells[k].kind]);
-      const findingSev = maxSeverity(row.findings);
+      const countedFindings = row.findings.filter((f) => !isRelaxedEvidenceFinding(row, f));
+      const findingSev = maxSeverity(countedFindings);
       const anyFindingWarnErr = findingSev === "error" || findingSev === "warn";
       // 有需注意的儲存格／有 warn+ 的附掛 finding／或完全沒有判讀結果時任何附掛 finding 都算數
       // （關閉判讀時，規則式的佐證空白 finding 是唯一線索，不能被漏掉）。
-      row.hasAttention = anyCellAttn || anyFindingWarnErr || (noAssessments && row.findings.length > 0);
+      row.hasAttention = anyCellAttn || anyFindingWarnErr
+        || (noAssessments && countedFindings.length > 0);
       // 嚴重度（紅底＋自動展開）只由真正 error 級的附掛 finding 決定；⚠️/❓ 在後端皆為 INFO
       // （判讀失敗/無法判定 ≠ 合規違規），不可染成紅色錯誤、搶走治理人員對真違規的 triage 注意力。
       row.rowSeverity = findingSev === "error" ? "error" : (row.hasAttention ? "warn" : "info");
@@ -424,7 +494,7 @@
       total: rows.length,
       primaryCause: computePrimaryCause(attentionRows),
     };
-    return { rows, others, notices, reference, stats };
+    return { rows, others, notices, reference, stats, stage: report.workflow_stage };
   }
 
   async function postForm(url, formData) {
@@ -695,9 +765,9 @@
       </label>
       <label>流程階段
         <select class="gv-select" data-action="set-stage">
-          <option value="proposal"${state.workflowStage === "proposal" ? " selected" : ""}>提案</option>
-          <option value="acceptance"${state.workflowStage === "acceptance" ? " selected" : ""}>驗收</option>
-          <option value="production"${state.workflowStage === "production" ? " selected" : ""}>正式營運</option>
+          ${Object.entries(STAGE_LABELS).map(([value, label]) =>
+            `<option value="${value}"${state.workflowStage === value ? " selected" : ""}>${label}</option>`
+          ).join("")}
         </select>
       </label>
     </div>`;
@@ -847,6 +917,8 @@
   // 狀態格 → 小色塊 label（依 kind 決定顏色/字樣；warn 依欄位不同截短或改固定字樣）。
   function matrixCellHtml(colKey, cell) {
     if (cell.kind === "ok") return `<span class="st-ok">✓ ${esc(cell.note || "充分")}</span>`;
+    // 通過色但不加 ✓：字樣本身是「未找到佐證」，掛個勾會變成自相矛盾的「✓ 未找到佐證」。
+    if (cell.kind === "okinfo") return `<span class="st-ok">${esc(cell.note)}</span>`;
     if (cell.kind === "undet") return `<span class="st-undet">？無法判定</span>`;
     // 灰底：本次未判讀，非合規結論也非警示，刻意與 ✓/▲/？ 拉開視覺層級。
     if (cell.kind === "skip") return `<span class="st-skip">${esc(cell.note || "未判讀")}</span>`;
@@ -868,7 +940,70 @@
     </div>`;
   }
 
-  function renderMatrixDetailRow(row) {
+  // 依換行與句末標點切句（不用 regex lookbehind，相容舊瀏覽器）；比對與標示都以句為單位。
+  function splitSentences(text) {
+    const out = [];
+    let buf = "";
+    for (const ch of String(text || "")) {
+      buf += ch;
+      if ("。；！？!?;\n".indexOf(ch) >= 0) {
+        const done = buf.trim();
+        if (done) out.push(done);
+        buf = "";
+      }
+    }
+    const tail = buf.trim();
+    if (tail) out.push(tail);
+    return out;
+  }
+
+  // 比對鍵：去掉所有空白，讓排版差異不被當成內容差異（與後端 golive_diff 同一套正規化）。
+  const sentenceKey = (s) => s.split(/\s+/).join("");
+
+  // 上線佐證中「提案沒寫過的句子」標成 <mark>；標示對象是原文，一律先 esc 再包標籤。
+  function diffMarkHtml(goliveText, propText) {
+    const seen = new Set(splitSentences(propText).map(sentenceKey));
+    return splitSentences(goliveText)
+      .map((s) => (seen.has(sentenceKey(s)) ? esc(s) : `<mark>${esc(s)}</mark>`))
+      .join("");
+  }
+
+  function srcItemHtml(label, bodyHtml, noteHtml) {
+    return `<div class="gv-src-item"><div class="gv-src-label">${esc(label)}</div>${
+      noteHtml || ""}${bodyHtml ? `<div class="gv-src-text">${bodyHtml}</div>` : ""}</div>`;
+  }
+
+  // 展開列的「文件內容（參考）」：治理人員要拿原文對照 AI 判讀，不能只看結論。
+  // 佐證文件內容是未信任的上傳內容，一律走 esc()。
+  function sourceTextBlockHtml(row, stage) {
+    const parts = [];
+    if (row.description) parts.push(srcItemHtml("檢查項目", esc(row.description)));
+    // 不適用列的提案佐證欄填的是「不適用理由」，上方「未送語意判讀」區塊已完整顯示，這裡不重複。
+    if (row.propText && row.coverage !== "not_applicable") {
+      parts.push(srcItemHtml("提案階段佐證說明", esc(row.propText)));
+    }
+    if (isGoliveStage(stage) && (row.goliveText || row.goliveDiff)) {
+      const note = DIFF_LABELS[row.goliveDiff]
+        ? `<div class="gv-src-note">${esc(DIFF_LABELS[row.goliveDiff])}</div>` : "";
+      const body = !row.goliveText ? "" : row.goliveDiff === "changed"
+        ? diffMarkHtml(row.goliveText, row.propText)
+        : esc(row.goliveText);
+      parts.push(srcItemHtml("上線階段佐證說明", body, note));
+    }
+    ((row.assessment && row.assessment.citations) || []).forEach((citation) => {
+      parts.push(srcItemHtml(
+        `佐證文件引用 · ${citation.document_id} ${citation.locator_type}:${citation.locator_value}`,
+        esc(citation.quote || "（本次未取得原文片段）"),
+      ));
+    });
+    if (!parts.length) return "";
+    return `<div class="gv-mdetail-finding">
+      <div class="gv-mdetail-head">文件內容（參考）</div>
+      <div class="gv-src">${parts.join("")}</div>
+    </div>`;
+  }
+
+  function renderMatrixDetailRow(row, stage) {
     const unassessed = row.assessment && row.assessment.assessed === false;
     const assessmentHtml = !row.assessment ? "" : unassessed ? `<div class="gv-mdetail-finding">
       <div class="gv-mdetail-head">結構化判讀 · 未執行</div>
@@ -898,35 +1033,41 @@
           }</p></div>
         </div>`
       : "";
-    const blocks = [coverageHtml, assessmentHtml, findingsHtml].filter(Boolean);
+    const blocks = [
+      sourceTextBlockHtml(row, stage), coverageHtml, assessmentHtml, findingsHtml,
+    ].filter(Boolean);
     const inner = blocks.length
       ? blocks.join('<div class="gv-mdetail-sep"></div>')
       : `<div class="gv-mdetail-empty">此項次無個別 finding；狀態來自彙整表判讀。</div>`;
     const refsLine = row.refs ? `<div class="gv-mdetail-refs">條文引用：${esc(row.refs)}</div>` : "";
-    return `<tr class="gv-matrix-detail"><td colspan="8">${inner}${refsLine}</td></tr>`;
+    const cols = isGoliveStage(stage) ? 8 : 7;   // 提案階段少一欄「上線內容」
+    return `<tr class="gv-matrix-detail"><td colspan="${cols}">${inner}${refsLine}</td></tr>`;
   }
 
-  function renderMatrixRow(row) {
+  function renderMatrixRow(row, stage) {
     const open = !!state.rowOpen[row.itemId];
     const rowClass = row.rowSeverity === "error" ? " row-err" : (row.hasAttention ? " row-attn" : "");
     const topic = row.topic ? esc(row.topic) : "—";
     const gist = esc(row.gist || "—");
+    // 提案階段不看上線佐證（後端也不判），整欄留著只會是空欄，直接不輸出。
+    const goliveCell = isGoliveStage(stage)
+      ? `<td>${matrixCellHtml("golive", row.cells.golive)}</td>` : "";
     const mainRow = `<tr class="gv-mrow${rowClass}${open ? " open" : ""}" data-action="row-toggle" data-key="${esc(row.itemId)}">
       <td>${esc(row.itemId)}</td>
       <td>${topic}</td>
       <td>${matrixCellHtml("prop", row.cells.prop)}</td>
-      <td>${matrixCellHtml("golive", row.cells.golive)}</td>
+      ${goliveCell}
       <td>${matrixCellHtml("evidence", row.cells.evidence)}</td>
       <td>${matrixCellHtml("reg", row.cells.reg)}</td>
       <td class="gv-mgist" title="${gist}">${gist}</td>
       <td class="gv-mcaret"><span class="fcaret">⌄</span></td>
     </tr>`;
-    return mainRow + (open ? renderMatrixDetailRow(row) : "");
+    return mainRow + (open ? renderMatrixDetailRow(row, stage) : "");
   }
 
   // ① 檢核項狀態總覽：整份報告的中心視覺 — 一眼看出哪些檢核項有問題待確認。
   function renderMatrix(m) {
-    const { rows, stats } = m;
+    const { rows, stats, stage } = m;
     if (!rows.length) {
       return `<div class="gv-matrix">
         <div class="gv-matrix-head"><h2 class="gv-h2">① 檢核項狀態總覽</h2></div>
@@ -950,10 +1091,11 @@
       <div class="gv-matrix-card">
         <table>
           <thead><tr>
-            <th>項次</th><th>管理議題</th><th>提案內容</th><th>上線內容</th>
+            <th>項次</th><th>管理議題</th><th>提案內容</th>
+            ${isGoliveStage(stage) ? "<th>上線內容</th>" : ""}
             <th>佐證支持</th><th>法規符合</th><th>摘要</th><th></th>
           </tr></thead>
-          <tbody>${shown.map(renderMatrixRow).join("")}</tbody>
+          <tbody>${shown.map((row) => renderMatrixRow(row, stage)).join("")}</tbody>
         </table>
       </div>
     </div>`;
@@ -1043,7 +1185,7 @@
       <h2 class="gv-h2">審查執行資訊</h2>
       <div class="gv-meta-grid">
         <div><strong>判定</strong><span>${esc(r.decision_status || "—")}</span></div>
-        <div><strong>流程階段</strong><span>${esc(r.workflow_stage || "—")}</span></div>
+        <div><strong>流程階段</strong><span>${esc(STAGE_LABELS[r.workflow_stage] || r.workflow_stage || "—")}</span></div>
         <div><strong>模型呼叫</strong><span>主要 ${usage.review_llm_primary_calls || 0}／升級 ${usage.review_llm_escalation_calls || 0}</span></div>
         <div><strong>Token</strong><span>輸入 ${usage.input_tokens || 0}／輸出 ${usage.output_tokens || 0}</span></div>
         <div><strong>文件解析</strong><span>${documents.map((doc) => `${doc.document_id}:${doc.status}`).join("、") || "無佐證文件"}</span></div>

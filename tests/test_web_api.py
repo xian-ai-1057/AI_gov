@@ -229,7 +229,7 @@ def test_review_batch_supporting_only_uses_current_report_contract():
         "/api/review",
         data={
             "kinds": json.dumps(["supporting"]),
-            "workflow_stage": "acceptance",
+            "workflow_stage": "golive",
         },
         files=files,
     )
@@ -237,7 +237,7 @@ def test_review_batch_supporting_only_uses_current_report_contract():
     assert res.status_code == 200
     body = res.json()
     assert set(body) == REPORT_KEYS
-    assert body["workflow_stage"] == "acceptance"
+    assert body["workflow_stage"] == "golive"
     assert body["decision_status"] == "changes_required"
     assert "passed" not in body
     assert {
@@ -541,3 +541,30 @@ def test_roster_covers_every_item_with_llm_off(tmp_path):
     assert first["coverage"] == "not_applicable"
     assert first["reason"] == "本系統不涉及該情境"
     assert {row["coverage"] for row in roster} <= {"assessable", "not_applicable", "no_evidence"}
+
+
+@requires_templates
+def test_roster_payload_carries_source_text_and_stage_diff(tmp_path):
+    """報告要能顯示原文供人工對照：名冊的原文與差異欄必須真的送到前端。"""
+    f03 = build_f03_fixture(tmp_path / "f03.xlsx", items=[
+        {"row": 5, "state": "是", "proposal": "提案時的做法", "golive": "上線後改用新做法"},
+    ])
+
+    def _roster_first(stage: str) -> dict:
+        res = client.post("/api/review", data={"workflow_stage": stage}, files=[
+            _form_file("f03", f03),
+        ])
+        assert res.status_code == 200
+        return res.json()["checklist_roster"][0]
+
+    golive = _roster_first("golive")
+    assert golive["evidence_proposal_text"] == "提案時的做法"
+    assert golive["evidence_golive_text"] == "上線後改用新做法"
+    assert golive["golive_diff"] == "changed"
+    assert golive["description"]
+
+    # 提案階段不看 J 欄：帶出上線佐證原文會讓人以為 AI 已審過那段。
+    proposal = _roster_first("proposal")
+    assert proposal["evidence_proposal_text"] == "提案時的做法"
+    assert proposal["evidence_golive_text"] is None
+    assert proposal["golive_diff"] is None

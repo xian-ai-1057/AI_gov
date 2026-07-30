@@ -115,7 +115,7 @@ prompt 判的」。忘了 bump 版本時 content_hash 仍會變，可據此察�
 
 | 變數 | 內容 |
 |---|---|
-| `workflow_stage` | `proposal` / `acceptance` / `production` |
+| `workflow_stage` | `proposal`（提案）/ `golive`（上線） |
 | `items_json` | 待審檢核項陣列：`item_id`、`description`、`proposal`、`golive`、`allowed_citations`、`regulations` |
 | `evidence_json` | 檢索到的佐證片段：`document_id`、`unit_id`、`locator_type`、`locator_value`、`content`、`untrusted_data` |
 | `policy_version` | 目前為 `f03-policy-v1` |
