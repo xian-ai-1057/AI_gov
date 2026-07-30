@@ -1,6 +1,6 @@
 /* AI 治理審查小幫手 — 前端（vanilla JS）。
-   兩步驟：上傳送件包 → 審查報告。狀態驅動整頁重繪。
-   後端：POST /api/review。資料全程地端，無外部請求。 */
+   三步驟：上傳送件包 → 確認自動分類 → 審查報告。狀態驅動整頁重繪。
+   後端：POST /api/classify、POST /api/review。資料全程地端，無外部請求。 */
 
 (() => {
   "use strict";
@@ -20,13 +20,12 @@
     if (grade === "低") return { bg: "var(--ok-bg)", fg: "var(--ok)", border: "var(--ok-bg)" };
     return SEV.info;
   }
-  const STEP_LABELS = ["上傳送件包", "審查報告"];
-  // 上傳欄位（表單各一份，佐證可多份）；value 對應 /api/review 的 form field 名稱。
-  const SLOTS = [
-    { key: "f01", tag: "F1", name: "F01 系統資訊表", note: "系統基本資訊與必填欄位", multiple: false },
-    { key: "f02", tag: "F2", name: "F02 風險評鑑", note: "固有風險計分與分級", multiple: false },
-    { key: "f03", tag: "F3", name: "F03 上線檢核表", note: "上線前檢核項目", multiple: false },
-    { key: "supporting", tag: "＋", name: "佐證文件", note: "模型卡、測試報告等（可多檔）", multiple: true },
+  const STEP_LABELS = ["上傳送件包", "確認分類", "審查報告"];
+  const CHECKLIST = [
+    { tag: "F1", name: "F01 系統資訊表", note: "系統基本資訊與必填欄位" },
+    { tag: "F2", name: "F02 風險評鑑", note: "固有風險計分與分級" },
+    { tag: "F3", name: "F03 上線檢核表", note: "上線前檢核項目" },
+    { tag: "＋", name: "佐證文件", note: "模型卡、測試報告等（可多檔）" },
   ];
 
   // 只有 F03 檢核項 finding 的 location 會長這樣（見 f03.py F03ChecklistItem.loc）：
@@ -101,7 +100,9 @@
   // ── 狀態 ───────────────────────────────────────────────────────
   const state = {
     step: 1,
-    slots: { f01: null, f02: null, f03: null, supporting: [] },  // 真實 File 物件
+    files: [],          // 真實 File 物件
+    classify: null,     // /api/classify 回應
+    kinds: {},          // index -> 使用者確認或修正後的 kind
     review: null,       // /api/review 回應
     role: "proposer",  // proposer | reviewer
     workflowStage: "proposal",
@@ -111,14 +112,10 @@
     matrixFilter: "attention", // 總覽表濾鏡："attention"（只看有問題）| "all"（全部）
     refOpen: false,     // 【彙整參考】卡片是否展開
     refTab: null,       // 【彙整參考】目前分頁 key（aggregate/regref/passlog/all）
+    classifying: false,
     reviewing: false,
     error: null,
   };
-
-  function chosenFiles() {
-    return [state.slots.f01, state.slots.f02, state.slots.f03, ...state.slots.supporting]
-      .filter(Boolean);
-  }
 
   const app = document.getElementById("app");
   const fileInput = document.getElementById("file-input");
@@ -441,53 +438,83 @@
   }
 
   function reachableStep() {
-    return state.review ? 2 : 1;
+    if (state.review) return 3;
+    if (state.classify) return 2;
+    return 1;
+  }
+
+  function invalidateReport() {
+    state.review = null;
+    state.open = {};
+    state.rowOpen = {};
+    state.refOpen = false;
+    state.refTab = null;
+  }
+
+  function currentClassifications() {
+    const seen = new Set();
+    return state.classify.files.map((file) => {
+      const kind = state.kinds[file.index] ?? file.kind;
+      let flag = null;
+      if (kind === "ignore") {
+        flag = file.flag === "unknown" ? "unknown" : "ignored";
+      } else if (["f01", "f02", "f03"].includes(kind)) {
+        if (seen.has(kind)) flag = "dup";
+        else seen.add(kind);
+      }
+      return { file, kind, flag };
+    });
   }
 
   // ── 動作 ───────────────────────────────────────────────────────
-  function onFilesChosen(slotKey, fileList) {
+  function onFilesChosen(fileList) {
     const files = Array.from(fileList || []);
     if (!files.length) return;
-    if (slotKey === "supporting") {
-      // 佐證可分次選取，累加而非覆蓋（同名檔以後選的為準）。
-      const byName = new Map(state.slots.supporting.map((f) => [f.name, f]));
-      files.forEach((f) => byName.set(f.name, f));
-      state.slots.supporting = [...byName.values()];
-    } else {
-      state.slots[slotKey] = files[0];
-    }
+    invalidateReport();
+    state.files = files;
+    state.classify = null;
+    state.kinds = {};
     state.error = null;
     render();
   }
 
-  function clearSlot(slotKey, name) {
-    if (slotKey === "supporting") {
-      state.slots.supporting = name
-        ? state.slots.supporting.filter((f) => f.name !== name)
-        : [];
-    } else {
-      state.slots[slotKey] = null;
-    }
+  async function goClassify() {
+    if (!state.files.length || state.classifying || state.reviewing) return;
+    invalidateReport();
     state.error = null;
+    state.classifying = true;
+    render();
+    const fd = new FormData();
+    state.files.forEach((file) => fd.append("files", file, file.name));
+    try {
+      const data = await postForm("/api/classify", fd);
+      state.classify = data;
+      state.kinds = {};
+      data.files.forEach((file) => { state.kinds[file.index] = file.kind; });
+      state.step = 2;
+    } catch (error) {
+      state.error = error.message;
+    }
+    state.classifying = false;
     render();
   }
 
   async function startReview() {
-    if (!chosenFiles().length) return;
+    if (!state.classify || state.classifying || state.reviewing) return;
+    invalidateReport();
     state.error = null;
     state.reviewing = true;
     render();
     const fd = new FormData();
-    ["f01", "f02", "f03"].forEach((key) => {
-      const file = state.slots[key];
-      if (file) fd.append(key, file, file.name);
-    });
-    state.slots.supporting.forEach((f) => fd.append("supporting", f, f.name));
+    state.files.forEach((file) => fd.append("files", file, file.name));
+    const confirmed = state.classify.files.map((file) =>
+      state.kinds[file.index] != null ? state.kinds[file.index] : file.kind);
+    fd.append("kinds", JSON.stringify(confirmed));
     fd.append("workflow_stage", state.workflowStage);
     try {
       applyReport(await postForm("/api/review", fd));
-    } catch (e) {
-      state.error = e.message;
+    } catch (error) {
+      state.error = error.message;
       state.reviewing = false;
       render();
     }
@@ -512,13 +539,15 @@
     state.refTab = defaultRefTab(m.reference);
 
     state.reviewing = false;
-    state.step = 2;
+    state.step = 3;
     render();
   }
 
   function reset() {
     state.step = 1;
-    state.slots = { f01: null, f02: null, f03: null, supporting: [] };
+    state.files = [];
+    state.classify = null;
+    state.kinds = {};
     state.review = null;
     state.filter = "info";  // 與初始預設一致（落地分頁在 applyReport 依紀錄數再決定）
     state.open = {};
@@ -526,6 +555,7 @@
     state.matrixFilter = "attention";
     state.refOpen = false;
     state.refTab = null;
+    state.classifying = false;
     state.reviewing = false;  // 防禦性清空：正常路徑 applyReport/錯誤處理已先清，這裡保持完整
     state.error = null;
     fileInput.value = "";
@@ -559,7 +589,8 @@
       const can = n <= reach;
       const num = n < cur ? "✓" : String(n);
       const sep = n < STEP_LABELS.length ? `<span class="gv-step-sep">›</span>` : "";
-      return `<button class="gv-step ${cls}${can ? "" : " disabled"}" data-action="goto" data-step="${n}">
+      return `<button class="gv-step ${cls}${can ? "" : " disabled"}" data-action="goto" data-step="${n}"
+        ${can ? "" : 'disabled aria-disabled="true"'}>
         <span class="num">${num}</span><span>${esc(label)}</span></button>${sep}`;
     }).join("");
 
@@ -573,7 +604,7 @@
         <div class="brand">
           <span class="logo">🛡️</span>
           <div><div class="title">AI 治理審查小幫手</div>
-            <div class="sub">送件包初步審查 · 規則檢查與語意判讀</div></div>
+            <div class="sub">批次上傳自動分類 · 規則檢查與語意判讀</div></div>
         </div>
         <div class="pill"><span class="dot"></span>地端執行 · 資料不外送</div>
       </div>
@@ -582,31 +613,80 @@
   }
 
   function renderError() {
-    return state.error ? `<div class="gv-error">⚠ ${esc(state.error)}</div>` : "";
+    return state.error ? `<div class="gv-error" role="alert">⚠ ${esc(state.error)}</div>` : "";
   }
 
   // ── 渲染：Step 1 上傳 ──────────────────────────────────────────
-  function renderSlot(slot) {
-    const picked = slot.multiple ? state.slots.supporting : state.slots[slot.key];
-    const filled = slot.multiple ? picked.length > 0 : !!picked;
-    const files = slot.multiple ? picked : (picked ? [picked] : []);
-    const rows = files.map((f) => `<div class="gv-slot-file">
-      <span class="ic">${fileIcon(f.name)}</span>
-      <span class="fname">${esc(f.name)}</span>
-      <span class="fsize">${fmtSize(f.size)}</span>
-      <button class="btn-small" data-action="clear-slot" data-slot="${slot.key}" data-name="${esc(f.name)}">移除</button>
-    </div>`).join("");
-    return `<div class="gv-slot${filled ? " filled" : ""}">
-      <div class="head">
-        <span class="tag">${esc(slot.tag)}</span>
-        <div class="meta"><div class="name">${esc(slot.name)}</div><div class="note">${esc(slot.note)}</div></div>
-        <button class="btn-small" data-action="pick" data-slot="${slot.key}">${filled && !slot.multiple ? "更換" : "選擇檔案"}</button>
-      </div>
-      ${rows}</div>`;
+  function renderStep1() {
+    const loaded = state.files.length > 0;
+    let body;
+    if (!loaded) {
+      body = `<div class="gv-upload-grid">
+        <button class="gv-drop" id="dropzone" data-action="pick">
+          <span class="ic">⤓</span>
+          <div><div class="big">拖入送件包所有檔案</div>
+            <div class="small">支援 F01 / F02 / F03 與佐證（可多檔）· 或點此選擇檔案</div></div>
+          <span class="cta">選擇檔案</span>
+        </button>
+        <div class="gv-aside"><h3>送件包應包含</h3>
+          ${CHECKLIST.map((item) => `<div class="item"><span class="tag">${esc(item.tag)}</span>
+            <div><div class="name">${esc(item.name)}</div><div class="note">${esc(item.note)}</div></div></div>`).join("")}
+        </div></div>`;
+    } else {
+      const rows = state.files.map((file) => `<div class="gv-row">
+        <span class="ic">${fileIcon(file.name)}</span>
+        <div class="meta"><div class="fname">${esc(file.name)}</div></div>
+        <span class="fsize">${fmtSize(file.size)}</span></div>`).join("");
+      body = `<div class="gv-filelist">
+        <div class="head"><span>已選擇 ${state.files.length} 個檔案</span>
+          <button class="btn-small" data-action="reset">重新選擇</button></div>
+        ${rows}</div>
+        <div class="row-end"><button class="btn-primary" data-action="classify">下一步：確認分類　→</button></div>`;
+    }
+    return `<div>
+      <h1 class="gv-h1">上傳送件包</h1>
+      <p class="gv-lead">一次拖入提案單位提交的所有檔案，系統會自動辨識 F01 / F02 / F03 與佐證文件。審查前仍可逐檔確認或修正。</p>
+      ${renderError()}${body}</div>`;
   }
 
-  function renderStep1() {
-    const stagePicker = `<div class="gv-review-options">
+  // ── 渲染：Step 2 分類 ──────────────────────────────────────────
+  function renderStep2() {
+    const classification = state.classify;
+    const current = currentClassifications();
+    const hasReviewableFile = current.some(({ kind }) => kind !== "ignore");
+    const counts = { f01: 0, f02: 0, f03: 0, supporting: 0, ignore: 0 };
+    current.forEach(({ kind }) => {
+      counts[kind] = (counts[kind] || 0) + 1;
+    });
+    const flagged = current.filter(({ flag }) => flag).length;
+    const chip = (label, fg, bg, border) =>
+      `<span class="gv-chip" style="color:${fg};background:${bg};border-color:${border};">${esc(label)}</span>`;
+    const chips = [
+      chip(`共 ${classification.files.length} 個檔案`, "var(--text)", "var(--surface)", "var(--border)"),
+      chip(`表單 ${counts.f01 + counts.f02 + counts.f03} 份`, "var(--accent)", "var(--accent-soft)", "var(--accent-soft)"),
+      chip(`佐證 ${counts.supporting} 份`, "var(--muted)", "var(--bg)", "var(--border)"),
+    ];
+    if (flagged) {
+      chips.push(chip(`需確認 ${flagged} 項`, "var(--warn-fg)", "var(--warn-bg)", "var(--warn-border)"));
+    }
+
+    const optionHtml = (selected) => classification.kinds.map((option) =>
+      `<option value="${esc(option.value)}"${option.value === selected ? " selected" : ""}>${esc(option.label)}</option>`).join("");
+    const rows = current.map(({ file, kind, flag }) => {
+      const flagLabel = flag === "dup" ? "重複" : flag === "unknown" ? "無法辨識" :
+        flag === "ignored" ? "已忽略" : "";
+      const flagHtml = flagLabel ? `<span class="gv-flag">${flagLabel}</span>` : "";
+      return `<div class="gv-classify-row${flag ? " flagged" : ""}">
+        <div class="line">
+          <span class="ic">${fileIcon(file.filename)}</span>
+          <div class="body"><div class="top"><span class="fname">${esc(file.filename)}</span>${flagHtml}</div>
+            <div class="reason">${esc(file.reason)}</div></div>
+          <select class="gv-select" data-action="set-kind" data-index="${file.index}"
+            aria-label="檔案 ${esc(file.filename)} 的分類">${optionHtml(kind)}</select>
+        </div></div>`;
+    }).join("");
+
+    const reviewOptions = `<div class="gv-review-options">
       <label>使用角色
         <select class="gv-select" data-action="set-role">
           <option value="proposer"${state.role === "proposer" ? " selected" : ""}>提案者</option>
@@ -621,18 +701,19 @@
         </select>
       </label>
     </div>`;
-    const count = chosenFiles().length;
-    const actions = `<div class="row-split">
-      <button class="btn-ghost" data-action="reset">清空</button>
-      <button class="btn-primary${count ? "" : " disabled"}" data-action="start-review">開始審查　→</button>
-    </div>`;
+
     return `<div>
-      <h1 class="gv-h1">上傳送件包</h1>
-      <p class="gv-lead">依欄位放入提案單位提交的檔案。未上傳的表單會由缺件檢查列出，不影響其餘檢查。</p>
+      <h1 class="gv-h1">自動分類<span class="light">（可修正）</span></h1>
+      <p class="gv-lead">Excel 依工作表名稱判定，其他檔案列為佐證。請逐一確認；標記為「重複」或「無法辨識」的項目尤其需要人工判斷。</p>
       ${renderError()}
-      ${stagePicker}
-      <div class="gv-slots">${SLOTS.map(renderSlot).join("")}</div>
-      ${actions}</div>`;
+      <div class="gv-chips">${chips.join("")}</div>
+      ${reviewOptions}
+      <div class="gv-filelist">${rows}</div>
+      <div class="row-split">
+        <button class="btn-ghost" data-action="goto" data-step="1">←　返回上傳</button>
+        <button class="btn-primary" data-action="start-review"
+          ${hasReviewableFile ? "" : 'disabled aria-disabled="true"'}>開始審查　→</button>
+      </div></div>`;
   }
 
   // ── 渲染：finding 卡片共用（扁平清單 / 彙整參考 / 其他待處理 共用）────
@@ -972,9 +1053,15 @@
   }
 
   function renderOverlay() {
-    if (!state.reviewing) return "";
+    if (!state.classifying && !state.reviewing) return "";
+    if (state.classifying) {
+      return `<div class="gv-overlay" role="status" aria-live="polite"><div class="box">
+        <div class="spin"></div><div class="t">分類中…</div>
+        <div class="s">正在讀取 Excel 工作表名稱；應用不會保存檔案，請求暫存會在處理後清除。</div>
+        </div></div>`;
+    }
     // 啟用語意判讀時，本機小模型可能要跑數分鐘；文案先講清楚，免得使用者以為當掉。
-    return `<div class="gv-overlay"><div class="box">
+    return `<div class="gv-overlay" role="status" aria-live="polite"><div class="box">
       <div class="spin"></div><div class="t">審查中…</div>
       <div class="s">規則檢查隨即完成；若已啟用語意判讀，依模型與檢核項數可能需要數分鐘。</div>
       </div></div>`;
@@ -983,18 +1070,48 @@
   // ── 主渲染 ─────────────────────────────────────────────────────
   function render() {
     let content;
-    content = state.step === 1 ? renderStep1() : renderReport();
+    if (state.step === 1) content = renderStep1();
+    else if (state.step === 2) content = renderStep2();
+    else content = renderReport();
+    const busy = state.classifying || state.reviewing;
+    app.setAttribute("aria-busy", busy ? "true" : "false");
     app.innerHTML = `${renderHeader()}<div class="gv-main">${content}</div>${renderOverlay()}`;
+    bindDynamic();
+  }
+
+  function bindDynamic() {
+    const dropzone = document.getElementById("dropzone");
+    if (!dropzone) return;
+    ["dragover", "dragenter"].forEach((eventName) => {
+      dropzone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        dropzone.classList.add("dragover");
+      });
+    });
+    ["dragleave", "dragend"].forEach((eventName) => {
+      dropzone.addEventListener(eventName, () => dropzone.classList.remove("dragover"));
+    });
+    dropzone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      dropzone.classList.remove("dragover");
+      if (event.dataTransfer && event.dataTransfer.files) {
+        onFilesChosen(event.dataTransfer.files);
+      }
+    });
   }
 
   // ── 事件（委派）────────────────────────────────────────────────
   app.addEventListener("click", (e) => {
+    if (state.classifying || state.reviewing) return;
     const el = e.target.closest("[data-action]");
     if (!el) return;
     const action = el.dataset.action;
-    if (action === "pick") pickInto(el.dataset.slot);
-    else if (action === "clear-slot") clearSlot(el.dataset.slot, el.dataset.name);
+    if (action === "pick") {
+      fileInput.value = "";
+      fileInput.click();
+    }
     else if (action === "reset") reset();
+    else if (action === "classify") goClassify();
     else if (action === "start-review") startReview();
     else if (action === "goto") gotoStep(Number(el.dataset.step));
     else if (action === "toggle") { const id = el.dataset.id; state.open[id] = !state.open[id]; render(); }
@@ -1007,25 +1124,27 @@
   });
 
   app.addEventListener("change", (e) => {
+    if (state.classifying || state.reviewing) return;
     const el = e.target.closest("[data-action]");
     if (!el) return;
-    if (el.dataset.action === "set-role") state.role = el.value;
-    else if (el.dataset.action === "set-stage") state.workflowStage = el.value;
+    if (el.dataset.action === "set-kind") {
+      const index = Number(el.dataset.index);
+      if (state.kinds[index] !== el.value) invalidateReport();
+      state.kinds[index] = el.value;
+      state.error = null;
+    }
+    else if (el.dataset.action === "set-role") state.role = el.value;
+    else if (el.dataset.action === "set-stage") {
+      if (state.workflowStage !== el.value) invalidateReport();
+      state.workflowStage = el.value;
+      state.error = null;
+    }
     else return;
     render();
   });
 
-  // 隱藏的 <input type=file> 由各欄位共用：點擊時記下目標欄位，change 時再分派回該欄位。
-  let pendingSlot = null;
-  function pickInto(slotKey) {
-    pendingSlot = slotKey;
-    fileInput.multiple = slotKey === "supporting";
-    fileInput.value = "";
-    fileInput.click();
-  }
-
-  fileInput.addEventListener("change", (e) => {
-    if (pendingSlot) onFilesChosen(pendingSlot, e.target.files);
+  fileInput.addEventListener("change", (event) => {
+    if (!state.classifying && !state.reviewing) onFilesChosen(event.target.files);
   });
 
   render();

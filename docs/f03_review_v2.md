@@ -27,12 +27,25 @@ flowchart LR
 
 ## API
 
-`POST /api/review` 以 multipart form 提供：
+網頁先呼叫 `POST /api/classify`，以 repeated `files` 取得每檔的建議類別、判定原因與
+重複／無法辨識旗標。應用不持久化預覽檔；框架可能將大型 request 暫存於
+作業系統目錄，request 結束後即清除。
+
+使用者確認或修正後，`POST /api/review` 的批次模式以 multipart form 提供：
+
+- `files`: 原順序的整批檔案，可多份。
+- `kinds`: 與 `files` 等長的 JSON 陣列，值為 `f01 | f02 | f03 | supporting | ignore`。
+- `workflow_stage`: `proposal`（預設）、`acceptance` 或 `production`。
+- `enable_llm`: 選填；省略時採應用設定。
+
+為相容既有呼叫端，`POST /api/review` 也接受預先分欄模式：
 
 - `f01` / `f02` / `f03`: 各一份表單檔（選填；未上傳由缺件檢查列出）。
 - `supporting`: 佐證文件，可多份。
 - `workflow_stage`: `proposal`（預設）、`acceptance` 或 `production`。
 - `enable_llm`: 選填；省略時採應用設定。
+
+批次與預先分欄模式不可混用。忽略項目會寫入最終 findings，但不會送入 parser。
 
 回應欄位：
 
