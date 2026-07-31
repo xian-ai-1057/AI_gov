@@ -33,15 +33,23 @@ class FakeClient:
         return ChatResult(self.outputs.pop(0), input_tokens=10, output_tokens=5, latency_ms=2)
 
 
-def _gateway(outputs: list[str], *, cache_namespace: str | None = None) -> PromptGateway:
+def _gateway(
+    outputs: list[str],
+    *,
+    cache_namespace: str | None = None,
+    escalation_version: str = "v1",
+) -> PromptGateway:
     templates = [
-        PromptTemplate.create(prompt_id, "v1", [{
+        PromptTemplate.create(prompt_id, version, [{
             "role": "user",
             "content": "{{workflow_stage}}{{items_json}}{{evidence_json}}"
                        "{{policy_version}}{{output_schema_version}}"
                        "{{primary_assessments_json}}",
         }])
-        for prompt_id in ("govcheck.f03.fairness", "govcheck.f03.escalation")
+        for prompt_id, version in (
+            ("govcheck.f03.fairness", "v1"),
+            ("govcheck.f03.escalation", escalation_version),
+        )
     ]
     return PromptGateway(
         provider=StaticPromptProvider(templates),
@@ -76,7 +84,12 @@ def _checklist() -> F03Checklist:
 
 
 def _response(
-    *, confidence=0.9, citation=True, evidence="supported", reasonableness="sufficient"
+    *,
+    confidence=0.9,
+    citation=True,
+    evidence="supported",
+    reasonableness="sufficient",
+    rubric_met=None,
 ) -> str:
     return json.dumps({"results": [{
         "item_id": "1-1",
@@ -87,6 +100,7 @@ def _response(
         "confidence": confidence,
         "citations": [{"document_id": "doc1", "unit_id": "doc1:1"}] if citation else [],
         "recommendations": [],
+        "rubric_met": rubric_met or [],
     }]})
 
 
@@ -159,10 +173,15 @@ def test_unreadable_document_is_not_treated_as_not_found():
     assert {finding.code for finding in outcome.findings} == {"F03.PROMPT_UNAVAILABLE"}
 
 
-def test_duplicate_content_uses_one_model_item_but_returns_each_item():
+def test_duplicate_content_uses_one_model_item_but_returns_each_item(monkeypatch):
+    monkeypatch.setattr(
+        f03_assessment,
+        "load_rubrics",
+        lambda: {"1-1": ["同一判準"], "3-1": ["同一判準"]},
+    )
     checklist = _checklist()
     checklist.items.append(checklist.items[0].model_copy(update={"item_id": "3-1"}))
-    output = json.loads(_response())
+    output = json.loads(_response(rubric_met=[True]))
     outcome = f03_assessment.run_all(
         checklist,
         [_artifact()],
@@ -171,7 +190,33 @@ def test_duplicate_content_uses_one_model_item_but_returns_each_item():
     )
 
     assert [row.item_id for row in outcome.assessments] == ["1-1", "3-1"]
+    assert all(row.assessed for row in outcome.assessments)
+    assert all(row.rubric[0].text == "同一判準" for row in outcome.assessments)
     assert outcome.usage.review_llm_primary_calls == 1
+
+
+def test_different_rubrics_prevent_same_content_deduplication(monkeypatch):
+    """文字相同但人工判準不同時，兩項不可共用同一份 rubric 判讀。"""
+    monkeypatch.setattr(
+        f03_assessment,
+        "load_rubrics",
+        lambda: {"1-1": ["判準甲"], "3-1": ["判準乙", "判準丙"]},
+    )
+    checklist = _checklist()
+    checklist.items.append(checklist.items[0].model_copy(update={"item_id": "3-1"}))
+    first = json.loads(_response(rubric_met=[True]))["results"][0]
+    second = first | {"item_id": "3-1", "rubric_met": [False, True]}
+    gateway = _gateway([json.dumps({"results": [first, second]})])
+
+    outcome = f03_assessment.run_all(
+        checklist, [_artifact()], gateway, workflow_stage=WorkflowStage.PROPOSAL
+    )
+
+    by_id = {row.item_id: row for row in outcome.assessments}
+    assert [line.text for line in by_id["1-1"].rubric] == ["判準甲"]
+    assert [line.text for line in by_id["3-1"].rubric] == ["判準乙", "判準丙"]
+    sent = gateway.client.messages[0][-1]["content"]
+    assert "判準甲" in sent and "判準乙" in sent and "判準丙" in sent
 
 
 def test_unchanged_item_uses_versioned_assessment_cache():
@@ -187,6 +232,61 @@ def test_unchanged_item_uses_versioned_assessment_cache():
     assert first.usage.review_llm_primary_calls == 1
     assert second.usage.review_llm_primary_calls == 0
     assert second.usage.cache_hits == 1
+
+
+def test_rubric_change_invalidates_assessment_cache(monkeypatch):
+    """判準改版就是模型輸入改版，不得沿用舊 rubric 勾選。"""
+    f03_assessment.clear_assessment_cache()
+    versions = iter([
+        {"1-1": ["舊判準"]},
+        {"1-1": ["新判準"]},
+    ])
+    monkeypatch.setattr(f03_assessment, "load_rubrics", lambda: next(versions))
+    gateway = _gateway(
+        [_response(rubric_met=[True]), _response(rubric_met=[False])],
+        cache_namespace="rubric-version-test",
+    )
+
+    first = f03_assessment.run_all(
+        _checklist(), [_artifact()], gateway, workflow_stage=WorkflowStage.PROPOSAL
+    )
+    second = f03_assessment.run_all(
+        _checklist(), [_artifact()], gateway, workflow_stage=WorkflowStage.PROPOSAL
+    )
+
+    assert first.assessments[0].rubric[0].text == "舊判準"
+    assert second.assessments[0].rubric[0].text == "新判準"
+    assert second.assessments[0].rubric[0].met is False
+    assert second.usage.review_llm_primary_calls == 1
+    assert second.usage.cache_hits == 0
+
+
+def test_escalation_prompt_change_invalidates_final_assessment_cache():
+    """低信心初判的最終值來自 escalation；該模板改版時不得沿用舊結果。"""
+    f03_assessment.clear_assessment_cache()
+    first_gateway = _gateway(
+        [_response(confidence=0.2), _response(confidence=0.95)],
+        cache_namespace="escalation-version-test",
+        escalation_version="v1",
+    )
+    second_gateway = _gateway(
+        [_response(confidence=0.2), _response(confidence=0.96)],
+        cache_namespace="escalation-version-test",
+        escalation_version="v2",
+    )
+
+    first = f03_assessment.run_all(
+        _checklist(), [_artifact()], first_gateway, workflow_stage=WorkflowStage.PROPOSAL
+    )
+    second = f03_assessment.run_all(
+        _checklist(), [_artifact()], second_gateway, workflow_stage=WorkflowStage.PROPOSAL
+    )
+
+    assert first.assessments[0].confidence == 0.95
+    assert second.assessments[0].confidence == 0.96
+    assert second.usage.review_llm_primary_calls == 1
+    assert second.usage.review_llm_escalation_calls == 1
+    assert second.usage.cache_hits == 0
 
 
 def test_proposal_stage_does_not_send_golive_text_to_model():

@@ -94,6 +94,33 @@ def test_roster_carries_source_text_for_manual_cross_check() -> None:
     assert row.evidence_golive_text == "上線前重跑偏誤測試"
 
 
+def test_roster_uses_canonical_short_name_for_standard_item() -> None:
+    """標準項次的列首不受提案單位改寫 D 欄影響。"""
+    checklist = F03Checklist(items=[_item(
+        item_id="4-2", description="提案單位自行改寫的超長檢查項目說明",
+    )])
+    assert checklist.roster(WorkflowStage.PROPOSAL)[0].short_name == "模型監控機制"
+
+
+def test_roster_derives_bounded_short_name_for_unknown_item() -> None:
+    """範本新增項次時由 D 欄 fallback，且最終顯示長度不超過 14 字。"""
+    checklist = F03Checklist(items=[_item(
+        item_id="9-9", description="9-9 這是一段非常非常長的新增檢查項目說明，後面是填寫指引",
+    )])
+    short_name = checklist.roster(WorkflowStage.PROPOSAL)[0].short_name
+    assert short_name.endswith("…")
+    assert len(short_name) == 14
+
+
+def test_roster_carries_each_evidence_column_char_count() -> None:
+    checklist = F03Checklist(items=[_item(
+        evidence_proposal="提 案 三 字", evidence_golive="上線四個字",
+    )])
+    row = checklist.roster(WorkflowStage.GOLIVE)[0]
+    assert row.evidence_proposal_chars == 4
+    assert row.evidence_golive_chars == 5
+
+
 def test_proposal_stage_roster_hides_golive_text() -> None:
     """提案階段不看 J 欄：帶出上線佐證原文會讓人誤以為 AI 已審過那段。"""
     checklist = F03Checklist(items=[_item(

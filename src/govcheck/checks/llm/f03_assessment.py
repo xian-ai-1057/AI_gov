@@ -14,9 +14,11 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 import unicodedata
 from collections import OrderedDict
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -34,12 +36,19 @@ from govcheck.models import (
     F03ChecklistItem,
     F03ItemAssessment,
     Finding,
+    LayerStatus,
     PromptRunRef,
+    RubricLine,
     Severity,
     UsageSummary,
     WorkflowStage,
 )
-from govcheck.prompts import PromptGateway, PromptUnavailable, profile_for_item
+from govcheck.prompts import (
+    PromptGateway,
+    PromptUnavailable,
+    load_rubrics,
+    profile_for_item,
+)
 from govcheck.regulations.mapping import format_section_ref
 from govcheck.regulations.models import F03ItemRetrieval, RetrievalMap
 
@@ -76,6 +85,9 @@ class _ItemVerdict(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     citations: list[_CitationVerdict] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+    # 逐句檢核：與該項 rubric 等長、逐句對位的 true/false。沒給 rubric 的項次會是空陣列；
+    # 長度對不上時 _validate_results 整筆丟棄（錯位的勾比沒有勾更誤導）。
+    rubric_met: list[bool] = Field(default_factory=list)
 
 
 class _BatchVerdict(BaseModel):
@@ -93,6 +105,40 @@ class AssessmentOutcome:
     findings: list[Finding]
     usage: UsageSummary
     prompt_refs: list[PromptRunRef]
+    # L2（檢索比對）與 L3（語意判讀）各自的狀態與耗時，供報告頁分層顯示。
+    layers: list[LayerStatus] = field(default_factory=list)
+
+
+def _layer(layer_id: str, label: str, state: str, elapsed_ms: int | None = None) -> LayerStatus:
+    return LayerStatus(id=layer_id, label=label, state=state, elapsed_ms=elapsed_ms)
+
+
+def _skipped_layers() -> list[LayerStatus]:
+    """判讀沒跑到時的分層狀態。標「已略過」而非「已完成」——後者會謊稱判讀過了。"""
+    return [
+        _layer("L2", "法規／佐證檢索", "skipped"),
+        _layer("L3", "敘述充分性判讀", "skipped"),
+    ]
+
+
+def _emit(progress, event: dict) -> None:
+    if progress is None:
+        return
+    try:
+        progress(event)
+    except Exception as exc:  # noqa: BLE001 - 進度通知失敗不得中斷判讀
+        log.warning("progress callback failed err=%s", type(exc).__name__)
+
+
+def _emit_skipped_layers(progress) -> None:
+    """把未執行的 L2／L3 也送成事件，避免串流端永遠停在 running/todo。"""
+    for layer in _skipped_layers():
+        _emit(progress, {
+            "kind": "layer",
+            "id": layer.id,
+            "label": layer.label,
+            "state": layer.state,
+        })
 
 
 def run_all(
@@ -107,11 +153,14 @@ def run_all(
     retrieval_map: RetrievalMap | None = None,
     max_sections_per_item: int = 3,
     max_excerpt_chars: int = 300,
+    progress: Callable[[dict], None] | None = None,
 ) -> AssessmentOutcome:
     """對可判讀的檢核項做語意判讀；永不 raise（呼叫端不需為 LLM 故障設防）。
 
     retrieval_map：凍結法規對照表。缺檔或未映射的項次一律以 regulation_gap=undetermined
     收場——沒有審查基準就不宣稱符合，也不宣稱有缺口。
+    progress：分層進度回呼。L2（檢索）通常一分鐘內完成、L3（模型）可能數分鐘，
+    分開回報讓報告頁能先把檢索結果放出來。
     """
     all_targets = _targets(checklist, workflow_stage)
     targets = all_targets[:max_items]
@@ -119,8 +168,11 @@ def run_all(
     # 若不提示，治理人員會誤以為整份檢核表都已判讀。
     truncated = _truncation_findings(len(all_targets) - len(targets), max_items)
     if not targets:
-        return AssessmentOutcome([], truncated, UsageSummary(), [])
+        _emit_skipped_layers(progress)
+        return AssessmentOutcome([], truncated, UsageSummary(), [], _skipped_layers())
 
+    t_l2 = time.perf_counter()
+    _emit(progress, {"kind": "layer", "id": "L2", "state": "running"})
     canonical = retrieval_map.f03_items if retrieval_map is not None else {}
     regs = {
         item.item_id: _regulation_payload(
@@ -134,6 +186,9 @@ def run_all(
         for item in targets
         if item.item_id in canonical
     }
+    # 判準會改變模型輸入與逐句結果，因此必須在內容去重與快取鍵生成之前載入。
+    # 缺檔時是空 dict，既有無-rubric 路徑維持不變。
+    rubrics = load_rubrics()
     # 模板竄改比對放在判讀前：即使後續模型呼叫全部失敗，這筆規則式警示仍會出現在報告裡。
     template_findings = [
         _template_modified_finding(item)
@@ -141,17 +196,21 @@ def run_all(
         if item.item_id in canonical and _template_modified(item, canonical[item.item_id])
     ]
     try:
-        unique_targets, duplicate_of = _deduplicate_targets(targets, workflow_stage, regs)
+        unique_targets, duplicate_of = _deduplicate_targets(
+            targets, workflow_stage, regs, rubrics
+        )
         prompt_ids = {
             f"govcheck.f03.{profile_for_item(item.item_id)}" for item in unique_targets
         }
     except KeyError as exc:
         log.warning("f03 prompt route unavailable err=%s", type(exc).__name__)
+        _emit_skipped_layers(progress)
         return AssessmentOutcome(
             [_undetermined(item, artifacts) for item in targets],
             [_unavailable_finding(), *template_findings, *truncated],
             UsageSummary(),
             [],
+            _skipped_layers(),
         )
     prompt_ids.add("govcheck.f03.escalation")
     try:
@@ -159,11 +218,13 @@ def run_all(
     except (PromptUnavailable, KeyError, ValueError) as exc:
         log.warning("f03 prompt run unavailable err=%s", type(exc).__name__)
         assessments = [_undetermined(item, artifacts) for item in targets]
+        _emit_skipped_layers(progress)
         return AssessmentOutcome(
             assessments,
             [_unavailable_finding(), *template_findings, *truncated],
             UsageSummary(),
             [],
+            _skipped_layers(),
         )
 
     # Prompt readiness precedes retrieval so a prompt outage cannot waste an
@@ -173,12 +234,19 @@ def run_all(
         unique_targets, artifacts, retriever, top_k, workflow_stage
     )
     usage = UsageSummary(evidence_embedding_calls=retriever.embedding_calls)
+    # L2（法規條文組裝＋佐證檢索）到此為止，通常一分鐘內；接下來的模型呼叫才是慢的部分。
+    l2_ms = round((time.perf_counter() - t_l2) * 1000)
+    _emit(progress, {"kind": "layer", "id": "L2", "state": "done", "elapsed_ms": l2_ms})
+    _emit(progress, {"kind": "layer", "id": "L3", "state": "running"})
+    t_l3 = time.perf_counter()
     assessments: list[F03ItemAssessment] = []
     cached_item_ids: set[str] = set()
     cache_keys: dict[str, str] = {}
     misses = []
     for item, hits in prepared:
-        key = _assessment_cache_key(item, hits, workflow_stage, gateway, prompt_run, regs)
+        key = _assessment_cache_key(
+            item, hits, workflow_stage, gateway, prompt_run, regs, rubrics
+        )
         cache_keys[item.item_id] = key
         cached = _cache_get(key) if key else None
         if cached is None:
@@ -193,7 +261,7 @@ def run_all(
     batches = [
         (profile, batch)
         for profile, rows in grouped.items()
-        for batch in _pack(rows, regs)
+        for batch in _pack(rows, regs, rubrics)
     ]
     for profile, batch in batches:
         prompt_id = f"govcheck.f03.{profile}"
@@ -201,14 +269,14 @@ def run_all(
             result, call_usage = gateway.execute(
                 prompt_run,
                 prompt_id,
-                _variables(batch, workflow_stage, regs),
+                _variables(batch, workflow_stage, regs, rubrics),
                 schema=_BATCH_SCHEMA,
             )
             usage.add(call_usage)
             verdict = _BatchVerdict.model_validate(parse_json_object(result.content))
             assessments.extend(_validate_results(
                 batch, verdict, artifacts, prompt_id,
-                prompt_run.templates[prompt_id].version, refs_by_item,
+                prompt_run.templates[prompt_id].version, refs_by_item, rubrics,
             ))
         except (LLMError, ValidationError, ValueError, KeyError) as exc:
             log.warning("f03 assessment batch failed profile=%s err=%s", profile, type(exc).__name__)
@@ -227,7 +295,7 @@ def run_all(
             result, call_usage = gateway.execute(
                 prompt_run,
                 "govcheck.f03.escalation",
-                _escalation_variables(escalated, prepared, workflow_stage, regs),
+                _escalation_variables(escalated, prepared, workflow_stage, regs, rubrics),
                 schema=_BATCH_SCHEMA,
                 call_kind="escalation",
             )
@@ -248,6 +316,7 @@ def run_all(
                     "govcheck.f03.escalation",
                     prompt_run.templates["govcheck.f03.escalation"].version,
                     refs_by_item,
+                    rubrics,
                 )
             }
             assessments = [replacements.get(row.item_id, row) for row in assessments]
@@ -293,7 +362,13 @@ def run_all(
     ))
     findings += template_findings
     findings += truncated
-    return AssessmentOutcome(assessments, findings, usage, list(prompt_run.refs))
+    l3_ms = round((time.perf_counter() - t_l3) * 1000)
+    _emit(progress, {"kind": "layer", "id": "L3", "state": "done", "elapsed_ms": l3_ms})
+    layers = [
+        _layer("L2", "法規／佐證檢索", "done", l2_ms),
+        _layer("L3", "敘述充分性判讀", "done", l3_ms),
+    ]
+    return AssessmentOutcome(assessments, findings, usage, list(prompt_run.refs), layers)
 
 
 def _truncation_findings(dropped: int, max_items: int) -> list[Finding]:
@@ -325,6 +400,7 @@ def _deduplicate_targets(
     targets: list[F03ChecklistItem],
     stage: WorkflowStage,
     regs: dict[str, list[dict]],
+    rubrics: dict[str, list[str]] | None = None,
 ) -> tuple[list[F03ChecklistItem], dict[str, str]]:
     unique = []
     canonical_by_signature: dict[str, str] = {}
@@ -339,6 +415,7 @@ def _deduplicate_targets(
                 item.evidence_proposal,
                 item.evidence_golive if stage is not WorkflowStage.PROPOSAL else None,
                 regs.get(item.item_id, []),
+                (rubrics or {}).get(item.item_id, []),
             ], ensure_ascii=False, sort_keys=True).encode()
         ).hexdigest()
         canonical_id = canonical_by_signature.get(signature)
@@ -372,13 +449,14 @@ def _prepare_many(
 def _pack(
     rows: list[tuple[F03ChecklistItem, list[EvidenceHit]]],
     regs: dict[str, list[dict]],
+    rubrics: dict[str, list[str]] | None = None,
 ) -> list[list[tuple[F03ChecklistItem, list[EvidenceHit]]]]:
     batches = []
     current = []
     tokens = 0
     for row in rows:
         estimate = len(
-            json.dumps(_item_payload(*row, regs=regs), ensure_ascii=False)
+            json.dumps(_item_payload(*row, regs=regs, rubrics=rubrics), ensure_ascii=False)
         ) // 2 + 1
         if current and tokens + estimate > _MAX_PROMPT_TOKENS:
             batches.append(current)
@@ -395,11 +473,13 @@ def _variables(
     batch: list[tuple[F03ChecklistItem, list[EvidenceHit]]],
     stage: WorkflowStage,
     regs: dict[str, list[dict]],
+    rubrics: dict[str, list[str]] | None = None,
 ) -> dict[str, object]:
     return {
         "workflow_stage": stage.value,
         "items_json": json.dumps(
-            [_item_payload(item, hits, stage, regs) for item, hits in batch], ensure_ascii=False
+            [_item_payload(item, hits, stage, regs, rubrics) for item, hits in batch],
+            ensure_ascii=False,
         ),
         "evidence_json": json.dumps([_evidence_payload(hit) for _, hits in batch for hit in hits], ensure_ascii=False),
         "policy_version": _POLICY_VERSION,
@@ -412,11 +492,13 @@ def _escalation_variables(
     prepared: list[tuple[F03ChecklistItem, list[EvidenceHit]]],
     stage: WorkflowStage,
     regs: dict[str, list[dict]],
+    rubrics: dict[str, list[str]] | None = None,
 ) -> dict[str, object]:
     variables = _variables(
         [(item, hits) for item, hits in prepared if item.item_id in {a.item_id for a in assessments}],
         stage,
         regs,
+        rubrics,
     )
     variables["primary_assessments_json"] = json.dumps(
         [assessment.model_dump(mode="json") for assessment in assessments], ensure_ascii=False
@@ -429,6 +511,7 @@ def _item_payload(
     hits: list[EvidenceHit],
     stage: WorkflowStage | None = None,
     regs: dict[str, list[dict]] | None = None,
+    rubrics: dict[str, list[str]] | None = None,
 ) -> dict:
     return {
         "item_id": item.item_id,
@@ -444,6 +527,9 @@ def _item_payload(
         ],
         # 法規條文摘錄＝符合性判讀的基準。空陣列代表本項無條文對照，模型不得妄下符合性結論。
         "regulations": (regs or {}).get(item.item_id, []),
+        # 審查員檢核句：人工撰寫的判準，模型只逐句回「說明有沒有回應這一句」。
+        # 空陣列代表本項無判準，rubric_met 也應為空。
+        "rubric": (rubrics or {}).get(item.item_id, []),
     }
 
 
@@ -527,6 +613,19 @@ def _evidence_payload(hit: EvidenceHit) -> dict:
     }
 
 
+def _rubric_lines(lines: list[str], met: list[bool]) -> list[RubricLine]:
+    """把人工判準與模型的逐句回覆配對；長度對不上就整筆丟棄。
+
+    錯位的勾比沒有勾更誤導——治理人員會拿它去核對原文，發現對不上就再也不會信任
+    這個區塊。寧可少一個區塊，不要一個會說謊的區塊。
+    """
+    if not lines or len(met) != len(lines):
+        if lines and met:
+            log.warning("rubric length mismatch lines=%d met=%d", len(lines), len(met))
+        return []
+    return [RubricLine(text=text, met=bool(flag)) for text, flag in zip(lines, met)]
+
+
 def _validate_results(
     batch: list[tuple[F03ChecklistItem, list[EvidenceHit]]],
     response: _BatchVerdict,
@@ -534,6 +633,7 @@ def _validate_results(
     prompt_id: str,
     prompt_version: str,
     refs_by_item: dict[str, list[str]],
+    rubrics: dict[str, list[str]] | None = None,
 ) -> list[F03ItemAssessment]:
     verdicts = {row.item_id: row for row in response.results}
     output = []
@@ -581,6 +681,7 @@ def _validate_results(
             confidence=verdict.confidence,
             citations=citations,
             recommendations=verdict.recommendations,
+            rubric=_rubric_lines((rubrics or {}).get(item.item_id, []), verdict.rubric_met),
             prompt_id=prompt_id,
             prompt_version=prompt_version,
         ))
@@ -622,12 +723,14 @@ def _assessment_cache_key(
     gateway: PromptGateway,
     prompt_run,
     regs: dict[str, list[dict]],
+    rubrics: dict[str, list[str]] | None = None,
 ) -> str:
     if not gateway.cache_namespace:
         return ""
     profile = profile_for_item(item.item_id)
     prompt_id = f"govcheck.f03.{profile}"
     template = prompt_run.templates[prompt_id]
+    escalation = prompt_run.templates["govcheck.f03.escalation"]
     payload = {
         "namespace": gateway.cache_namespace,
         "stage": stage.value,
@@ -636,7 +739,11 @@ def _assessment_cache_key(
         "prompt_id": prompt_id,
         "prompt_version": template.version,
         "prompt_hash": template.content_hash,
-        "item": _item_payload(item, hits, stage, regs),
+        # 最終 assessment 可能來自低信心升級。升級模板改版時，即使主要模板未變，
+        # 也不得命中舊的最終結果。
+        "escalation_prompt_version": escalation.version,
+        "escalation_prompt_hash": escalation.content_hash,
+        "item": _item_payload(item, hits, stage, regs, rubrics),
         "evidence_hashes": [
             hashlib.sha256(hit.content.encode()).hexdigest() for hit in hits
         ],

@@ -79,6 +79,21 @@ class Citation(BaseModel):
     quote: str = ""
 
 
+class RubricLine(BaseModel):
+    """審查員檢核句的逐句判定。
+
+    句子（text）是**人工撰寫的判準**，來自 prompts/govcheck.f03.rubrics.yaml，
+    不是模型生成的——模型只回答「這段說明有沒有回應這一句」（met）。
+    讓模型自己造判準等於讓它自己出題自己改，覆核者無從核對。
+
+    這樣呈現的好處：治理人員看得出模型錯在哪一句，未打勾的句子也能直接貼進補件通知，
+    比「敘述過於草率」這種籠統評語有用得多。
+    """
+
+    text: str
+    met: bool
+
+
 class F03ItemAssessment(BaseModel):
     item_id: str
     profile: str
@@ -99,6 +114,8 @@ class F03ItemAssessment(BaseModel):
     assessed: bool = True
     citations: list[Citation] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+    # 逐句檢核結果；空 list = 本項沒有 rubric 判準，或模型回覆與判準長度對不上而整筆丟棄。
+    rubric: list[RubricLine] = Field(default_factory=list)
     prompt_id: str | None = None
     prompt_version: str | None = None
 

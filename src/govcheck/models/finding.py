@@ -18,6 +18,7 @@ from govcheck.models.evidence import (
     UsageSummary,
 )
 from govcheck.models.f03 import F03ItemCoverage
+from govcheck.models.report_view import LayerStatus
 
 
 class Severity(str, Enum):
@@ -57,6 +58,11 @@ class ReviewReport(BaseModel):
     document_statuses: list[DocumentArtifact] = Field(default_factory=list, exclude=True)
     usage_summary: UsageSummary = Field(default_factory=UsageSummary, exclude=True)
     review_run_meta: ReviewRunMeta = Field(default_factory=ReviewRunMeta, exclude=True)
+    # 三層檢查各自的執行狀態與耗時；漸進回傳時逐層更新，讓先完成的層先能用。
+    layers: list[LayerStatus] = Field(default_factory=list, exclude=True)
+    # 本次審查的識別碼，供覆核決定回寫（POST /api/review/{review_id}/decisions）。
+    # engine 產生，不落在既有 model_dump 契約內。
+    review_id: str = Field(default="", exclude=True)
     banner: str = "⚠️ 本報告為 AI 初判草稿，需治理人員與三遵人工覆核，最終判定權不在 AI。"
 
     @property
