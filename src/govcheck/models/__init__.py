@@ -16,11 +16,20 @@ from govcheck.models.evidence import (
     F03ItemAssessment,
     PromptRunRef,
     ReviewRunMeta,
+    RubricLine,
     SourceUnit,
     UsageSummary,
     WorkflowStage,
 )
 from govcheck.models.finding import Finding, ReviewReport, Severity
+from govcheck.models.report_view import (
+    CommonFact,
+    Defect,
+    DefectHit,
+    LayerStatus,
+    Locator,
+    Verdict,
+)
 from govcheck.models.submission import FilePresence, Submission
 
 __all__ = [
@@ -44,6 +53,7 @@ __all__ = [
     "F03ItemAssessment",
     "PromptRunRef",
     "ReviewRunMeta",
+    "RubricLine",
     "SourceUnit",
     "UsageSummary",
     "WorkflowStage",
@@ -52,4 +62,10 @@ __all__ = [
     "ReviewReport",
     "Severity",
     "Submission",
+    "CommonFact",
+    "Defect",
+    "DefectHit",
+    "LayerStatus",
+    "Locator",
+    "Verdict",
 ]

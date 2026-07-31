@@ -18,6 +18,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 import govcheck.web.api as api_module
+from govcheck.models import (
+    Citation,
+    F03ItemAssessment,
+    Finding,
+    ReviewReport,
+    RubricLine,
+    Severity,
+)
 from govcheck.parsers.f02_parser import ASSESS_SHEET
 from govcheck.review.config import load_review_config
 from govcheck.web.api import app
@@ -44,6 +52,8 @@ REPORT_KEYS = {
     "risk_score", "risk_grade", "findings",
     "item_assessments", "checklist_roster", "document_statuses",
     "citations", "usage_summary", "review_run_meta", "markdown",
+    "review_id", "verdict", "layers", "defects", "notices",
+    "common_facts", "uniform_columns", "rubrics",
 }
 
 _REVIEW_CFG = load_review_config()
@@ -77,6 +87,14 @@ def _xlsx_bytes(*sheet_names: str) -> bytes:
     buffer = io.BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()
+
+
+def _sse_events(response) -> list[dict]:
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
 
 
 # ── /api/classify：批次分類預覽 ──────────────────────────────────────
@@ -188,6 +206,18 @@ def test_review_response_contract_keys():
     # 無 F02 的送件包：風險欄位為 None（前端據此不渲染風險 tile）
     assert body["risk_score"] is None
     assert body["risk_grade"] is None
+    assert len(body["review_id"]) == 32
+    assert body["verdict"]["code"] == "blocked"
+    assert {layer["id"]: layer["state"] for layer in body["layers"]} == {
+        "L1": "done",
+        "L2": "skipped",
+        "L3": "skipped",
+    }
+    assert isinstance(body["defects"], list)
+    assert isinstance(body["notices"], list)
+    assert isinstance(body["common_facts"], list)
+    assert isinstance(body["uniform_columns"], list)
+    assert body["rubrics"] == {}
 
 
 def test_review_returns_structured_metadata():
@@ -435,6 +465,151 @@ def test_review_unsafe_and_duplicate_filenames():
     res = client.post("/api/review", files=files)
     assert res.status_code == 200
     assert "DOC.MISSING_F01" in {f["code"] for f in res.json()["findings"]}
+
+
+# ── 報告頁 v2 投影／SSE／覆核決定 ──────────────────────────────────────
+
+
+def test_report_projection_builds_rubric_quote_locator_and_item_codes():
+    report = ReviewReport(
+        form_type="送件包",
+        review_id="a" * 32,
+        findings=[Finding(
+            severity=Severity.WARN,
+            code="F03.ASSESSMENT_INCOMPLETE",
+            title="內容不完整",
+            message="請補述",
+            location="項次 4-2（系統穩健性與安全性）",
+            source="llm",
+        )],
+        item_assessments=[F03ItemAssessment(
+            item_id="4-2",
+            profile="security",
+            rubric=[
+                RubricLine(text="有指名監控指標", met=True),
+                RubricLine(text="有寫檢視頻率", met=False),
+            ],
+            citations=[Citation(
+                document_id="doc-safe-id",
+                unit_id="doc-safe-id:12",
+                locator_type="page",
+                locator_value="12",
+                quote="已建立監控指標。",
+            )],
+        )],
+    )
+
+    rubric = api_module._report_dict(report)["rubrics"]["4-2"]
+    assert rubric["lines"] == [
+        {"text": "有指名監控指標", "met": True},
+        {"text": "有寫檢視頻率", "met": False},
+    ]
+    assert rubric["quote"] == "已建立監控指標。"
+    assert rubric["quote_locator"] == {
+        "file": "doc-safe-id",
+        "sheet": None,
+        "cell": None,
+        "page": 12,
+        "section": None,
+    }
+    assert rubric["codes"] == ["F03.ASSESSMENT_INCOMPLETE"]
+
+
+def test_review_stream_sends_partial_before_final_with_serialized_reports():
+    res = client.post("/api/review/stream", files=[_pdf()])
+
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/event-stream")
+    events = _sse_events(res)
+    kinds = [event["kind"] for event in events]
+    partial_index = kinds.index("partial")
+    final_index = kinds.index("final")
+    assert partial_index < final_index
+    partial = events[partial_index]["report"]
+    final = events[final_index]["report"]
+    assert set(partial) == REPORT_KEYS
+    assert set(final) == REPORT_KEYS
+    assert partial["review_id"] == final["review_id"]
+    assert isinstance(partial["defects"], list)
+    assert not any(
+        event["kind"] == "final" and "report" not in event
+        for event in events
+    )
+
+
+def test_review_stream_preserves_batch_upload_mode():
+    res = client.post(
+        "/api/review/stream",
+        data={"kinds": json.dumps(["supporting"])},
+        files=[_batch_file("evidence.txt", "佐證內容".encode(), "text/plain")],
+    )
+
+    assert res.status_code == 200
+    events = _sse_events(res)
+    final = next(event for event in events if event["kind"] == "final")
+    assert "CLASSIFY.SUMMARY" in {
+        finding["code"] for finding in final["report"]["findings"]
+    }
+
+
+def test_review_stream_reports_execution_error_as_frame(monkeypatch):
+    def _boom(*args, **kwargs):
+        raise RuntimeError("sensitive details must not escape")
+
+    monkeypatch.setattr(api_module, "review_submission", _boom)
+    res = client.post("/api/review/stream", files=[_pdf()])
+
+    assert res.status_code == 200
+    events = _sse_events(res)
+    assert events == [{"kind": "error", "status": 400, "detail": "解析或審查失敗：RuntimeError"}]
+    assert "sensitive details" not in res.text
+
+
+def test_decisions_api_round_trip_and_missing_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("GOVCHECK_DECISION_DIR", str(tmp_path / "decisions"))
+    review_id = "a" * 32
+
+    missing = client.get(f"/api/review/{review_id}/decisions")
+    assert missing.status_code == 200
+    assert missing.json() == {"review_id": review_id, "decisions": {}}
+
+    saved = client.post(
+        f"/api/review/{review_id}/decisions",
+        json={
+            "decisions": {"1-1": "accept", "4-2": "reject", "5-1": "pending"},
+            "subject": "測試案件",
+            "note": "已覆核",
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["decisions"] == {
+        "1-1": "accept",
+        "4-2": "reject",
+        "5-1": "pending",
+    }
+    loaded = client.get(f"/api/review/{review_id}/decisions")
+    assert loaded.status_code == 200
+    assert loaded.json()["decisions"] == saved.json()["decisions"]
+    assert loaded.json()["subject"] == "測試案件"
+    assert loaded.json()["note"] == "已覆核"
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_decisions_api_rejects_invalid_review_id(method):
+    request = getattr(client, method)
+    kwargs = {"json": {"decisions": {}}} if method == "post" else {}
+    res = request(f"/api/review/{'A' * 32}/decisions", **kwargs)
+    assert res.status_code == 400
+
+
+def test_decisions_api_rejects_invalid_value(tmp_path, monkeypatch):
+    monkeypatch.setenv("GOVCHECK_DECISION_DIR", str(tmp_path / "decisions"))
+    res = client.post(
+        f"/api/review/{'a' * 32}/decisions",
+        json={"decisions": {"4-2": "approved"}},
+    )
+    assert res.status_code == 400
+    assert "未知的覆核決定" in res.json()["detail"]
 
 
 def test_readiness_is_false_when_provider_disabled():

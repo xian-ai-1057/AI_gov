@@ -157,3 +157,25 @@ def test_no_f02_no_f03_skips_map_notice(monkeypatch, tmp_path: Path) -> None:
     f01 = build_f01_fixture(tmp_path / "f01.xlsx")
     codes = [f.code for f in engine.review_submission({"f01": f01}).findings]
     assert "REGULATION.MAP_UNAVAILABLE" not in codes
+
+
+def test_progress_contract_emits_skipped_layers_and_full_final_report(monkeypatch) -> None:
+    """非 SSE 呼叫端也能只靠 progress callback 取得完整且可結束的狀態。"""
+    _no_map(monkeypatch)
+    events: list[dict] = []
+    audits: list[tuple[str, dict]] = []
+    monkeypatch.setattr(engine, "audit", lambda event, **fields: audits.append((event, fields)))
+
+    report = engine.review_submission({}, progress=events.append)
+
+    layer_states = [
+        (event["id"], event["state"])
+        for event in events
+        if event["kind"] == "layer"
+    ]
+    assert ("L2", "skipped") in layer_states
+    assert ("L3", "skipped") in layer_states
+    final = next(event for event in events if event["kind"] == "final")
+    assert final["report"] is report
+    assert audits == [("review_done", audits[0][1])]
+    assert audits[0][1]["review_id"] == report.review_id
