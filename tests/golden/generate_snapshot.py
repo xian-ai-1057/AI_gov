@@ -1,8 +1,7 @@
-"""Phase 2 基準 golden snapshot 產生器。
+"""規則側基準 golden snapshot 產生器。
 
-用**未修改的現行 engine** 對 synthetic 送件包執行審查，把 ReviewReport 以決定性
-序列化寫入 tests/golden/phase2_baseline.json，供 Phase 3b 後的回歸測試確認
-rag.enabled=false（預設）時輸出與快照逐字節相同。
+用現行 engine 對 synthetic 送件包執行審查，把 ReviewReport 以決定性序列化寫入
+tests/golden/rules_baseline.json，供回歸測試確認規則側輸出未漂移。
 
 重新產生指令（任何人都可重跑；覆蓋既有快照時應再 commit）：
     uv run python tests/golden/generate_snapshot.py
@@ -12,6 +11,8 @@ rag.enabled=false（預設）時輸出與快照逐字節相同。
     不依賴任何隨機或時間成分。
   - 序列化固定：json.dumps(sort_keys=True) 確保物件鍵排序穩定；
     findings 順序維持 engine 的 sort(severity_order) 結果（Python stable sort 保序）。
+  - 環境固定：強制把法規對照表指向不存在的路徑。對照表是本機資產（含法規原文，不入庫），
+    有沒有它會改變 findings；快照只鎖規則側，故一律以「對照表缺席」為基準。
   - 排除動態欄位：report.banner 為靜態字串，包含亦穩定；無 timestamp 欄位在模型中。
 
 重跑驗證：腳本第二次執行時若快照已存在，會在覆蓋前先比對內容，差異則報錯。
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -56,9 +58,9 @@ _BASELINE_ANSWERS: dict[str, str] = {
     "M-03-01": "Y", "M-03-02": "N",
 }
 
-SNAPSHOT_PATH = Path(__file__).resolve().parent / "phase2_baseline.json"
+SNAPSHOT_PATH = Path(__file__).resolve().parent / "rules_baseline.json"
 
-SCHEMA_VERSION = "phase2_baseline_v1"
+SCHEMA_VERSION = "rules_baseline_v1"
 
 
 # ── 送件包建立 ────────────────────────────────────────────────────────────────
@@ -96,6 +98,8 @@ def _serialize_report(report) -> dict:
 
 def generate_snapshot_data() -> dict:
     """在 tempdir 中建 fixture → 呼叫 engine → 回傳快照 dict。"""
+    # 對照表在不在，會改變 findings；快照鎖的是規則側，故一律以「缺席」為基準。
+    os.environ["GOVCHECK_REGULATIONS_MAPPING_PATH"] = "/nonexistent/golden/retrieval_map.json"
     with tempfile.TemporaryDirectory(prefix="govcheck_golden_") as td:
         tmp = Path(td)
 
@@ -114,7 +118,7 @@ def generate_snapshot_data() -> dict:
         "generated_by": "tests/golden/generate_snapshot.py",
         "note": (
             "Re-generate: uv run python tests/golden/generate_snapshot.py  "
-            "| 此快照依賴未修改的 Phase 2 engine；Phase 3b 修改 engine 前先 commit 此快照。"
+            "| 產生時強制法規對照表缺席，故此快照只鎖規則側輸出。"
         ),
         "submissions": [
             {
@@ -196,9 +200,9 @@ def main() -> int:
         return 1
 
     print("\n[DONE] Snapshot ready. Next steps:")
-    print("  1. git add tests/golden/phase2_baseline.json tests/golden/")
-    print("  2. Commit (before any engine changes)")
-    print("  3. After Phase 3b engine changes, AC-11 regression test will compare against this snapshot.")
+    print("  1. git add tests/golden/rules_baseline.json tests/golden/")
+    print("  2. Commit")
+    print("  3. tests/test_engine.py::test_regression_zero_drift 會逐字元比對此快照。")
     return 0
 
 

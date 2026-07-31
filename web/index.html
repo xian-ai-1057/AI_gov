@@ -9,6 +9,9 @@
 </head>
 <body>
   <div id="app"></div>
+  <!-- 報告頁 modal / toast 必須留在 #app 外，避免狀態重繪時被一併移除。 -->
+  <div class="mask" id="mask" hidden></div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
   <!-- 隱藏的真實檔案輸入：由「選擇檔案」按鈕觸發 -->
   <input id="file-input" type="file" multiple hidden>
   <script src="./app.js"></script>

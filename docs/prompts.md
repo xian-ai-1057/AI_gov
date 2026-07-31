@@ -115,11 +115,16 @@ prompt 判的」。忘了 bump 版本時 content_hash 仍會變，可據此察�
 
 | 變數 | 內容 |
 |---|---|
-| `workflow_stage` | `proposal` / `acceptance` / `production` |
-| `items_json` | 待審檢核項陣列：`item_id`、`description`、`proposal`、`golive`、`allowed_citations` |
+| `workflow_stage` | `proposal`（提案）/ `golive`（上線） |
+| `items_json` | 待審檢核項陣列：`item_id`、`description`、`proposal`、`golive`、`allowed_citations`、`regulations` |
 | `evidence_json` | 檢索到的佐證片段：`document_id`、`unit_id`、`locator_type`、`locator_value`、`content`、`untrusted_data` |
 | `policy_version` | 目前為 `f03-policy-v1` |
 | `output_schema_version` | 目前為 `2` |
+
+`regulations` 是該項對應的法規條文摘錄（`ref` 條號、`title`、`excerpt`），來自凍結對照表
+`data/rag/retrieval_map.json`。它是**審查基準**、可信；與 `evidence`（提案單位提交、標記
+`untrusted_data` 的待審資料）性質不同，prompt 內必須明確區分。對照表缺檔或該項未映射時
+為空陣列，此時應用層會強制把 `regulation_gap` 降為 `undetermined`。
 
 `govcheck.f03.escalation` 另需 `primary_assessments_json`（第一輪初判結果）。
 
@@ -134,6 +139,7 @@ prompt 判的」。忘了 bump 版本時 content_hash 仍會變，可據此察�
   "reasonableness": "sufficient|reasonable|vague|unreasonable|undetermined",
   "evidence_status": "supported|partial|not_found|unreadable",
   "conflict_status": "consistent|contradicted|conflicting_sources|unknown",
+  "regulation_gap": "covered|gap|undetermined", "gap_refs": ["R03 五、(二) 2"],
   "confidence": 0.0, "citations": [{"document_id": "...", "unit_id": "..."}],
   "recommendations": ["..."]}]}
 ```
@@ -146,6 +152,9 @@ prompt 判的」。忘了 bump 版本時 content_hash 仍會變，可據此察�
 - `evidence_status=supported` 但引用全被丟掉 → 自動降級為 `partial`；無佐證時降為
   `not_found` 或 `unreadable`。
 - `conflict_status=contradicted` 但無有效引用 → 降級為 `unknown`。
+- 該項 `regulations` 為空 → `regulation_gap` 一律降為 `undetermined`（沒有基準就不下結論）。
+- 報告顯示的條號**只由 canonical `section_path` 推導**；`gap_refs` 僅作交集過濾，
+  模型自創的條號對不上就整批忽略、退回列出全部 canonical 引用。
 - `confidence < 0.6` 或 `conflicting_sources` → 觸發一次 escalation 覆判，且該結果不進快取。
 
 這些是防線不是替代品：prompt 仍應明確要求模型遵守同樣的規則，否則會產生大量被丟棄的引用。

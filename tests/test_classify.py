@@ -1,10 +1,7 @@
-"""批次自動分類 + 路由 + 編排測試。
+"""批次自動分類、路由與審查編排測試。
 
-分為兩類：
-  - 無須官方範本者（空檔/壞檔/PDF/純路由邏輯）→ 恆可跑，提供無網路確定性基線。
-  - 須官方範本者（F01/F02/F03 真檔分類與端到端）→ data/original 未連結時 skip。
-
-關鍵驗證：分類依**工作表名稱**而非檔名（刻意給誤導性檔名證明之）。
+分類只看工作表名稱，不看檔名；非 Excel 一律視為佐證，無已知分頁或壞掉的
+Excel 則標示為無法辨識。需要真的解析表單的端到端案例才使用官方範本。
 """
 
 from __future__ import annotations
@@ -24,7 +21,7 @@ from govcheck.classify import (
 )
 from govcheck.parsers.f02_parser import ASSESS_SHEET
 from govcheck.review.config import load_review_config
-from govcheck.review.engine import review_files, review_routed, review_submission
+from govcheck.review.engine import review_files, review_routed
 from tests.fixture_builder import (
     OFFICIAL,
     OFFICIAL_F01,
@@ -44,211 +41,312 @@ requires_templates = pytest.mark.skipif(
 )
 
 
-def codes(report) -> set[str]:
-    return {f.code for f in report.findings}
+def _codes(report) -> set[str]:
+    return {finding.code for finding in report.findings}
 
 
-# ── 分類器：無須官方範本 ─────────────────────────────────────────────
+def _xlsx_with_sheets(path, *sheet_names: str):
+    workbook = openpyxl.Workbook()
+    workbook.remove(workbook.active)
+    for sheet_name in sheet_names:
+        workbook.create_sheet(sheet_name)
+    workbook.save(path)
+    return path
 
 
-def test_pdf_is_supporting(tmp_path):
-    p = tmp_path / "R06_可解釋性說明.pdf"
-    p.write_bytes(b"%PDF-1.4 not a real pdf")
-    c = classify_file(p)
-    assert c.kind is FileKind.SUPPORTING
-    assert c.matched_sheet is None
+def _classification(
+    kind: FileKind,
+    name: str,
+    path: str | None = None,
+) -> FileClassification:
+    return FileClassification(
+        path=path if path is not None else f"/fake/{name}",
+        filename=name,
+        kind=kind,
+        reason="測試資料",
+    )
 
 
-def test_docx_is_supporting(tmp_path):
-    p = tmp_path / "委外技術文件.docx"
-    p.write_bytes(b"PK\x03\x04 junk")  # 不會被開啟（副檔名閘門）
-    assert classify_file(p).kind is FileKind.SUPPORTING
+# ── 分類器：純規則、無須官方範本 ─────────────────────────────────────
 
 
-def test_blank_xlsx_is_unknown(tmp_path):
-    p = tmp_path / "其他試算表.xlsx"
-    openpyxl.Workbook().save(p)  # 無任何已知表單分頁
-    c = classify_file(p)
-    assert c.kind is FileKind.UNKNOWN
-    assert c.matched_sheet is None
+@pytest.mark.parametrize("filename", ["R06_可解釋性說明.pdf", "委外技術文件.docx"])
+def test_non_excel_is_supporting_without_opening_file(tmp_path, filename):
+    path = tmp_path / filename
+    path.write_bytes(b"not a real document")
+
+    result = classify_file(path)
+
+    assert result.kind is FileKind.SUPPORTING
+    assert result.matched_sheet is None
+    assert result.path == str(path)
 
 
-def test_corrupt_xlsx_is_unknown(tmp_path):
-    p = tmp_path / "bad.xlsx"
-    p.write_text("this is not an excel file")  # 比照 test_parse_error_does_not_crash
-    c = classify_file(p)  # 不應丟例外
-    assert c.kind is FileKind.UNKNOWN
-    assert "無法開啟" in c.reason
+def test_excel_without_known_sheet_is_unknown(tmp_path):
+    path = _xlsx_with_sheets(tmp_path / "其他試算表.xlsx", "Sheet1")
+
+    result = classify_file(path)
+
+    assert result.kind is FileKind.UNKNOWN
+    assert result.matched_sheet is None
+    assert "Sheet1" in result.reason
 
 
-def test_classify_fileobj_matches_extension_gate():
-    # 位元組版（UI 預覽用）：非 Excel 檔名 → 佐證，不開檔
-    assert classify_fileobj(io.BytesIO(b"x"), "evidence.pdf").kind is FileKind.SUPPORTING
+def test_corrupt_excel_is_unknown_instead_of_raising(tmp_path):
+    path = tmp_path / "bad.xlsx"
+    path.write_text("this is not an excel file")
+
+    result = classify_file(path)
+
+    assert result.kind is FileKind.UNKNOWN
+    assert "無法開啟" in result.reason
 
 
-def test_classify_fileobj_blank_xlsx_unknown(tmp_path):
-    buf = io.BytesIO()
-    openpyxl.Workbook().save(buf)
-    buf.seek(0)
-    assert classify_fileobj(buf, "x.xlsx").kind is FileKind.UNKNOWN
+def test_classify_fileobj_uses_the_same_extension_gate():
+    result = classify_fileobj(io.BytesIO(b"not opened"), "evidence.pdf")
+
+    assert result.kind is FileKind.SUPPORTING
+    assert result.path is None
 
 
-# ── 路由邏輯：無須官方範本（直接組 FileClassification） ───────────────
+def test_classify_fileobj_reads_excel_from_memory():
+    buffer = io.BytesIO()
+    workbook = openpyxl.Workbook()
+    workbook.active.title = F03_SHEET
+    workbook.save(buffer)
+    buffer.seek(0)
+
+    result = classify_fileobj(buffer, "看似佐證.xlsx")
+
+    assert result.kind is FileKind.F03
+    assert result.matched_sheet == F03_SHEET
 
 
-def _fc(kind: FileKind, name: str, path: str | None = None) -> FileClassification:
-    return FileClassification(path=path or f"/fake/{name}", filename=name, kind=kind, reason="t")
+@pytest.mark.parametrize(
+    ("sheet_name", "misleading_name", "expected_kind"),
+    [
+        (F01_SHEET, "風險評鑑_最終版.xlsx", FileKind.F01),
+        (ASSESS_SHEET, "F01_系統資訊表.xlsx", FileKind.F02),
+        (F03_SHEET, "資料佐證.xlsx", FileKind.F03),
+    ],
+)
+def test_known_form_is_classified_by_sheet_not_filename(
+    tmp_path,
+    sheet_name,
+    misleading_name,
+    expected_kind,
+):
+    path = _xlsx_with_sheets(tmp_path / misleading_name, sheet_name)
+
+    result = classify_file(path)
+
+    assert result.kind is expected_kind
+    assert result.matched_sheet == sheet_name
 
 
-def test_route_summary_always_present():
-    _, _, findings = route_classifications([_fc(FileKind.SUPPORTING, "a.pdf")])
-    assert findings[0].code == "CLASSIFY.SUMMARY"
-    assert findings[0].severity.value == "info"
+def test_f02_sheet_has_priority_when_workbook_contains_multiple_known_sheets(tmp_path):
+    path = _xlsx_with_sheets(
+        tmp_path / "混合.xlsx",
+        F03_SHEET,
+        F01_SHEET,
+        ASSESS_SHEET,
+    )
+
+    assert classify_file(path).kind is FileKind.F02
 
 
-def test_route_supporting_and_unknown():
-    results = [
-        _fc(FileKind.F01, "f01.xlsx", "/t/f01.xlsx"),
-        _fc(FileKind.SUPPORTING, "R07_公平性.pdf"),
-        FileClassification(filename="weird.xlsx", kind=FileKind.UNKNOWN, reason="無已知分頁"),
+def test_classify_files_preserves_input_order(tmp_path):
+    paths = [
+        _xlsx_with_sheets(tmp_path / "a.xlsx", F03_SHEET),
+        tmp_path / "b.pdf",
+        _xlsx_with_sheets(tmp_path / "c.xlsx", F01_SHEET),
     ]
+    paths[1].write_bytes(b"%PDF")
+
+    results = classify_files(paths)
+
+    assert [result.kind for result in results] == [
+        FileKind.F03,
+        FileKind.SUPPORTING,
+        FileKind.F01,
+    ]
+
+
+# ── 路由邏輯 ──────────────────────────────────────────────────────────
+
+
+def test_route_includes_summary_and_routes_supporting_and_unknown():
+    results = [
+        _classification(FileKind.F01, "f01.xlsx", "/t/f01.xlsx"),
+        _classification(FileKind.SUPPORTING, "R07_公平性.pdf", "/t/R07.pdf"),
+        FileClassification(
+            filename="weird.xlsx",
+            kind=FileKind.UNKNOWN,
+            reason="無已知分頁",
+        ),
+    ]
+
     files, supporting, findings = route_classifications(results)
+
     assert files == {"f01": "/t/f01.xlsx"}
     assert supporting == ["R07_公平性.pdf"]
-    cs = {f.code for f in findings}
-    assert "CLASSIFY.SUMMARY" in cs
-    assert "CLASSIFY.UNRECOGNIZED" in cs
+    assert findings[0].code == "CLASSIFY.SUMMARY"
+    assert findings[0].severity.value == "info"
+    assert "CLASSIFY.UNRECOGNIZED" in {finding.code for finding in findings}
 
 
-def test_route_duplicate_first_wins():
+def test_route_duplicate_form_keeps_first_and_warns():
     results = [
-        _fc(FileKind.F02, "first.xlsm", "/t/first.xlsm"),
-        _fc(FileKind.F02, "second.xlsm", "/t/second.xlsm"),
+        _classification(FileKind.F02, "first.xlsm", "/t/first.xlsm"),
+        _classification(FileKind.F02, "second.xlsm", "/t/second.xlsm"),
     ]
+
     files, _, findings = route_classifications(results)
-    assert files["f02"] == "/t/first.xlsm"  # 第一份勝出
-    dup = [f for f in findings if f.code == "CLASSIFY.DUPLICATE_F02"]
-    assert len(dup) == 1
-    assert dup[0].severity.value == "warn"
-    assert "first.xlsm" in dup[0].message and "second.xlsm" in dup[0].message
+
+    assert files == {"f02": "/t/first.xlsm"}
+    duplicate = next(
+        finding for finding in findings if finding.code == "CLASSIFY.DUPLICATE_F02"
+    )
+    assert duplicate.severity.value == "warn"
+    assert "first.xlsm" in duplicate.message
+    assert "second.xlsm" in duplicate.message
 
 
-def test_route_unknown_not_routed():
-    results = [FileClassification(filename="x.xlsx", kind=FileKind.UNKNOWN, reason="r")]
-    files, supporting, _ = route_classifications(results)
-    assert files == {} and supporting == []
+def test_route_unknown_is_never_sent_to_a_parser():
+    result = FileClassification(
+        filename="x.xlsx",
+        kind=FileKind.UNKNOWN,
+        reason="無已知分頁",
+    )
+
+    files, supporting, findings = route_classifications([result])
+
+    assert files == {}
+    assert supporting == []
+    assert {finding.code for finding in findings} == {
+        "CLASSIFY.SUMMARY",
+        "CLASSIFY.UNRECOGNIZED",
+    }
 
 
-# ── 編排 review_files：無須官方範本 ──────────────────────────────────
+@pytest.mark.parametrize("kind", [FileKind.F01, FileKind.SUPPORTING])
+def test_route_pathless_assignable_file_is_not_silently_counted(kind):
+    result = FileClassification(
+        filename="preview-only.xlsx",
+        kind=kind,
+        reason="記憶體預覽",
+    )
+
+    files, supporting, findings = route_classifications([result])
+
+    assert files == {}
+    assert supporting == []
+    assert "CLASSIFY.MISSING_PATH" in {finding.code for finding in findings}
 
 
-def test_review_files_returns_tuple(tmp_path):
-    p = tmp_path / "x.pdf"
-    p.write_bytes(b"%PDF")
-    out = review_files([p])
-    assert isinstance(out, tuple) and len(out) == 2
-    report, results = out
-    assert results[0].kind is FileKind.SUPPORTING
+def test_route_records_ignored_file():
+    result = FileClassification(
+        filename="unknown.xlsx",
+        kind=FileKind.IGNORED,
+        reason="使用者確認忽略",
+    )
+
+    files, supporting, findings = route_classifications([result])
+
+    assert files == {}
+    assert supporting == []
+    ignored = next(finding for finding in findings if finding.code == "CLASSIFY.IGNORED")
+    assert ignored.severity.value == "warn"
+    assert "未送入" in ignored.message
+    assert "共 1 個檔案" in findings[0].message
 
 
-def test_review_files_all_supporting_missing_core(tmp_path):
-    p = tmp_path / "佐證.pdf"
-    p.write_bytes(b"%PDF")
-    report, _ = review_files([p])
-    c = codes(report)
-    assert "DOC.MISSING_F01" in c  # 缺核心表單 → ERROR
-    assert "DOC.MISSING_F03" in c
-    assert "CLASSIFY.SUMMARY" in c
-    assert "SUBMISSION.OK" not in c  # 有 ERROR → 不補 OK
+# ── 審查編排 ──────────────────────────────────────────────────────────
 
 
-def test_review_files_unknown_excel_warns(tmp_path):
-    p = tmp_path / "其他.xlsx"
-    openpyxl.Workbook().save(p)
-    report, results = review_files([p])
-    assert "CLASSIFY.UNRECOGNIZED" in codes(report)
-    assert results[0].kind is FileKind.UNKNOWN
+def test_review_files_returns_report_and_classifications(tmp_path):
+    path = tmp_path / "佐證.pdf"
+    path.write_bytes(b"%PDF")
+
+    report, classifications = review_files([path])
+
+    assert classifications[0].kind is FileKind.SUPPORTING
+    assert "CLASSIFY.SUMMARY" in _codes(report)
+    assert "DOC.MISSING_F01" in _codes(report)
+    assert "DOC.MISSING_F03" in _codes(report)
+    assert report.decision_status.value == "changes_required"
 
 
-def test_review_routed_ok_only_when_clean():
-    # 空 files → review_submission 報缺件 ERROR；併入 WARN 後仍不補 OK
-    warn = review_submission({}).findings  # 取得一個現成 ERROR 集
-    report = review_routed({}, [], class_findings=[])
-    assert "SUBMISSION.OK" not in codes(report)
-    assert any(f.severity.value == "error" for f in report.findings)
-    assert warn  # sanity：空送件本就有缺件 finding
+def test_review_files_unknown_excel_adds_warning_without_parsing_it(tmp_path):
+    path = _xlsx_with_sheets(tmp_path / "其他.xlsx", "Sheet1")
+
+    report, classifications = review_files([path])
+
+    assert classifications[0].kind is FileKind.UNKNOWN
+    assert "CLASSIFY.UNRECOGNIZED" in _codes(report)
+    assert "F01.PARSE_ERROR" not in _codes(report)
+    assert report.decision_status.value == "changes_required"
 
 
-# ── 須官方範本：真檔分類證明「依分頁、非依檔名」+ 端到端 ───────────────
+def test_review_routed_classification_warning_controls_decision_status():
+    warning = route_classifications(
+        [
+            _classification(FileKind.F02, "first.xlsm", "/t/first.xlsm"),
+            _classification(FileKind.F02, "second.xlsm", "/t/second.xlsm"),
+        ]
+    )[2]
+
+    report = review_routed({}, class_findings=warning)
+
+    assert "SUBMISSION.OK" not in _codes(report)
+    assert report.decision_status.value == "changes_required"
+
+
+# ── 官方範本端到端 ────────────────────────────────────────────────────
 
 
 @requires_templates
-def test_f01_classified_despite_misleading_name(tmp_path):
-    p = build_f01_fixture(tmp_path / "風險評鑑_最終版.xlsx")  # 檔名像 F02
-    c = classify_file(p)
-    assert c.kind is FileKind.F01
-    assert c.matched_sheet == F01_SHEET
-
-
-@requires_templates
-def test_f02_classified_despite_misleading_name(tmp_path):
+def test_review_files_mixed_unordered_bundle_uses_current_decision_status(tmp_path):
     from tests.test_f02_rules import BASELINE
-    p = build_f02_fixture(tmp_path / "f01_系統表.xlsm", answers=BASELINE, cached_grade="低")
-    c = classify_file(p)
-    assert c.kind is FileKind.F02
-    assert c.matched_sheet == ASSESS_SHEET
 
-
-@requires_templates
-def test_f03_classified_despite_misleading_name(tmp_path):
-    p = build_f03_fixture(tmp_path / "資料佐證.xlsx")  # 檔名像佐證
-    c = classify_file(p)
-    assert c.kind is FileKind.F03
-    assert c.matched_sheet == F03_SHEET
-
-
-@requires_templates
-def test_classify_files_preserves_order(tmp_path):
-    from tests.test_f02_rules import BASELINE
+    evidence = tmp_path / "R06.txt"
+    evidence.write_text("模型透明性與可解釋性佐證")
     paths = [
-        build_f03_fixture(tmp_path / "a.xlsx"),
-        build_f02_fixture(tmp_path / "b.xlsm", answers=BASELINE, cached_grade="低"),
-        build_f01_fixture(tmp_path / "c.xlsx"),
-    ]
-    kinds = [r.kind for r in classify_files(paths)]
-    assert kinds == [FileKind.F03, FileKind.F02, FileKind.F01]
-
-
-@requires_templates
-def test_review_files_mixed_unordered_ok(tmp_path):
-    from tests.test_f02_rules import BASELINE
-    pdf = tmp_path / "R06.pdf"
-    pdf.write_bytes(b"%PDF")
-    paths = [  # 亂序 + 佐證夾雜
         build_f03_fixture(tmp_path / "f03.xlsx"),
-        pdf,
+        evidence,
         build_f02_fixture(tmp_path / "f02.xlsm", answers=BASELINE, cached_grade="低"),
         build_f01_fixture(tmp_path / "f01.xlsx"),
     ]
+
     report, results = review_files(paths)
-    c = codes(report)
-    assert "SUBMISSION.OK" in c
-    assert "CLASSIFY.SUMMARY" in c
-    assert report.error_count == 0 and report.warn_count == 0
-    kinds = {r.kind for r in results}
-    assert {FileKind.F01, FileKind.F02, FileKind.F03, FileKind.SUPPORTING} <= kinds
+
+    assert "CLASSIFY.SUMMARY" in _codes(report)
+    assert "SUBMISSION.OK" in _codes(report)
+    assert report.error_count == 0
+    assert report.warn_count == 0
+    # F03 的實質內容尚未跑 LLM，不可因規則全綠就標為 approved。
+    assert report.decision_status.value == "manual_review"
+    assert {result.kind for result in results} == {
+        FileKind.F01,
+        FileKind.F02,
+        FileKind.F03,
+        FileKind.SUPPORTING,
+    }
 
 
 @requires_templates
-def test_review_files_duplicate_f02_warns(tmp_path):
+def test_review_files_duplicate_form_requires_changes(tmp_path):
     from tests.test_f02_rules import BASELINE
+
     paths = [
         build_f01_fixture(tmp_path / "f01.xlsx"),
         build_f02_fixture(tmp_path / "f02_a.xlsm", answers=BASELINE, cached_grade="低"),
         build_f02_fixture(tmp_path / "f02_b.xlsm", answers=BASELINE, cached_grade="低"),
         build_f03_fixture(tmp_path / "f03.xlsx"),
     ]
+
     report, _ = review_files(paths)
-    c = codes(report)
-    assert "CLASSIFY.DUPLICATE_F02" in c
-    assert "SUBMISSION.OK" not in c  # 有 WARN → 不補 OK
+
+    assert "CLASSIFY.DUPLICATE_F02" in _codes(report)
+    assert "SUBMISSION.OK" not in _codes(report)
+    assert report.decision_status.value == "changes_required"

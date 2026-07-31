@@ -1,12 +1,24 @@
-"""Unified, stage-aware F03 content and supporting-evidence assessment."""
+"""F03 檢核項的統一語意判讀：內容品質 + 佐證支持 + 法規符合性，一次呼叫判完。
+
+三個面向刻意合在同一次模型呼叫，而非分成兩套 check：判斷「敘述是否具體」與
+「敘述是否涵蓋條文要求」看的是同一段文字，拆開會讓同一項被判讀兩次、
+等待時間加倍，且兩套結論可能互相矛盾。
+
+法規條文摘錄來自凍結對照表（`regulations/`），是**審查基準**；
+條文引用一律由 canonical section_path 決定性推導，模型回的 gap_refs 只作交集過濾，
+避免模型憑空造出不存在的條號。
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import threading
+import time
+import unicodedata
 from collections import OrderedDict
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -24,12 +36,21 @@ from govcheck.models import (
     F03ChecklistItem,
     F03ItemAssessment,
     Finding,
+    LayerStatus,
     PromptRunRef,
+    RubricLine,
     Severity,
     UsageSummary,
     WorkflowStage,
 )
-from govcheck.prompts import PromptGateway, PromptUnavailable, profile_for_item
+from govcheck.prompts import (
+    PromptGateway,
+    PromptUnavailable,
+    load_rubrics,
+    profile_for_item,
+)
+from govcheck.regulations.mapping import format_section_ref
+from govcheck.regulations.models import F03ItemRetrieval, RetrievalMap
 
 log = get_logger("f03_assessment")
 
@@ -58,9 +79,15 @@ class _ItemVerdict(BaseModel):
     ]
     evidence_status: EvidenceStatus
     conflict_status: ConflictStatus
+    # 未給條文摘錄時模型可能省略；預設 undetermined，且 _validate_results 會強制回 undetermined。
+    regulation_gap: Literal["covered", "gap", "undetermined"] = "undetermined"
+    gap_refs: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
     citations: list[_CitationVerdict] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+    # 逐句檢核：與該項 rubric 等長、逐句對位的 true/false。沒給 rubric 的項次會是空陣列；
+    # 長度對不上時 _validate_results 整筆丟棄（錯位的勾比沒有勾更誤導）。
+    rubric_met: list[bool] = Field(default_factory=list)
 
 
 class _BatchVerdict(BaseModel):
@@ -78,6 +105,40 @@ class AssessmentOutcome:
     findings: list[Finding]
     usage: UsageSummary
     prompt_refs: list[PromptRunRef]
+    # L2（檢索比對）與 L3（語意判讀）各自的狀態與耗時，供報告頁分層顯示。
+    layers: list[LayerStatus] = field(default_factory=list)
+
+
+def _layer(layer_id: str, label: str, state: str, elapsed_ms: int | None = None) -> LayerStatus:
+    return LayerStatus(id=layer_id, label=label, state=state, elapsed_ms=elapsed_ms)
+
+
+def _skipped_layers() -> list[LayerStatus]:
+    """判讀沒跑到時的分層狀態。標「已略過」而非「已完成」——後者會謊稱判讀過了。"""
+    return [
+        _layer("L2", "法規／佐證檢索", "skipped"),
+        _layer("L3", "敘述充分性判讀", "skipped"),
+    ]
+
+
+def _emit(progress, event: dict) -> None:
+    if progress is None:
+        return
+    try:
+        progress(event)
+    except Exception as exc:  # noqa: BLE001 - 進度通知失敗不得中斷判讀
+        log.warning("progress callback failed err=%s", type(exc).__name__)
+
+
+def _emit_skipped_layers(progress) -> None:
+    """把未執行的 L2／L3 也送成事件，避免串流端永遠停在 running/todo。"""
+    for layer in _skipped_layers():
+        _emit(progress, {
+            "kind": "layer",
+            "id": layer.id,
+            "label": layer.label,
+            "state": layer.state,
+        })
 
 
 def run_all(
@@ -88,28 +149,68 @@ def run_all(
     workflow_stage: WorkflowStage,
     max_items: int = 30,
     top_k: int = 4,
-    progress=None,
     retriever: EvidenceRetriever | None = None,
+    retrieval_map: RetrievalMap | None = None,
+    max_sections_per_item: int = 3,
+    max_excerpt_chars: int = 300,
+    progress: Callable[[dict], None] | None = None,
 ) -> AssessmentOutcome:
+    """對可判讀的檢核項做語意判讀；永不 raise（呼叫端不需為 LLM 故障設防）。
+
+    retrieval_map：凍結法規對照表。缺檔或未映射的項次一律以 regulation_gap=undetermined
+    收場——沒有審查基準就不宣稱符合，也不宣稱有缺口。
+    progress：分層進度回呼。L2（檢索）通常一分鐘內完成、L3（模型）可能數分鐘，
+    分開回報讓報告頁能先把檢索結果放出來。
+    """
     all_targets = _targets(checklist, workflow_stage)
     targets = all_targets[:max_items]
     # 截斷必須留痕：超出上限的檢核項不會出現在任何 assessment/finding，
     # 若不提示，治理人員會誤以為整份檢核表都已判讀。
     truncated = _truncation_findings(len(all_targets) - len(targets), max_items)
     if not targets:
-        return AssessmentOutcome([], truncated, UsageSummary(), [])
+        _emit_skipped_layers(progress)
+        return AssessmentOutcome([], truncated, UsageSummary(), [], _skipped_layers())
+
+    t_l2 = time.perf_counter()
+    _emit(progress, {"kind": "layer", "id": "L2", "state": "running"})
+    canonical = retrieval_map.f03_items if retrieval_map is not None else {}
+    regs = {
+        item.item_id: _regulation_payload(
+            canonical[item.item_id], max_sections_per_item, max_excerpt_chars
+        )
+        for item in targets
+        if item.item_id in canonical
+    }
+    refs_by_item = {
+        item.item_id: _canonical_refs(canonical[item.item_id], max_sections_per_item)
+        for item in targets
+        if item.item_id in canonical
+    }
+    # 判準會改變模型輸入與逐句結果，因此必須在內容去重與快取鍵生成之前載入。
+    # 缺檔時是空 dict，既有無-rubric 路徑維持不變。
+    rubrics = load_rubrics()
+    # 模板竄改比對放在判讀前：即使後續模型呼叫全部失敗，這筆規則式警示仍會出現在報告裡。
+    template_findings = [
+        _template_modified_finding(item)
+        for item in targets
+        if item.item_id in canonical and _template_modified(item, canonical[item.item_id])
+    ]
     try:
-        unique_targets, duplicate_of = _deduplicate_targets(targets, workflow_stage)
+        unique_targets, duplicate_of = _deduplicate_targets(
+            targets, workflow_stage, regs, rubrics
+        )
         prompt_ids = {
             f"govcheck.f03.{profile_for_item(item.item_id)}" for item in unique_targets
         }
     except KeyError as exc:
         log.warning("f03 prompt route unavailable err=%s", type(exc).__name__)
+        _emit_skipped_layers(progress)
         return AssessmentOutcome(
             [_undetermined(item, artifacts) for item in targets],
-            [_unavailable_finding(), *truncated],
+            [_unavailable_finding(), *template_findings, *truncated],
             UsageSummary(),
             [],
+            _skipped_layers(),
         )
     prompt_ids.add("govcheck.f03.escalation")
     try:
@@ -117,11 +218,13 @@ def run_all(
     except (PromptUnavailable, KeyError, ValueError) as exc:
         log.warning("f03 prompt run unavailable err=%s", type(exc).__name__)
         assessments = [_undetermined(item, artifacts) for item in targets]
+        _emit_skipped_layers(progress)
         return AssessmentOutcome(
             assessments,
-            [_unavailable_finding(), *truncated],
+            [_unavailable_finding(), *template_findings, *truncated],
             UsageSummary(),
             [],
+            _skipped_layers(),
         )
 
     # Prompt readiness precedes retrieval so a prompt outage cannot waste an
@@ -131,12 +234,19 @@ def run_all(
         unique_targets, artifacts, retriever, top_k, workflow_stage
     )
     usage = UsageSummary(evidence_embedding_calls=retriever.embedding_calls)
+    # L2（法規條文組裝＋佐證檢索）到此為止，通常一分鐘內；接下來的模型呼叫才是慢的部分。
+    l2_ms = round((time.perf_counter() - t_l2) * 1000)
+    _emit(progress, {"kind": "layer", "id": "L2", "state": "done", "elapsed_ms": l2_ms})
+    _emit(progress, {"kind": "layer", "id": "L3", "state": "running"})
+    t_l3 = time.perf_counter()
     assessments: list[F03ItemAssessment] = []
     cached_item_ids: set[str] = set()
     cache_keys: dict[str, str] = {}
     misses = []
     for item, hits in prepared:
-        key = _assessment_cache_key(item, hits, workflow_stage, gateway, prompt_run)
+        key = _assessment_cache_key(
+            item, hits, workflow_stage, gateway, prompt_run, regs, rubrics
+        )
         cache_keys[item.item_id] = key
         cached = _cache_get(key) if key else None
         if cached is None:
@@ -151,27 +261,26 @@ def run_all(
     batches = [
         (profile, batch)
         for profile, rows in grouped.items()
-        for batch in _pack(rows)
+        for batch in _pack(rows, regs, rubrics)
     ]
-    for done, (profile, batch) in enumerate(batches, start=1):
+    for profile, batch in batches:
         prompt_id = f"govcheck.f03.{profile}"
         try:
             result, call_usage = gateway.execute(
                 prompt_run,
                 prompt_id,
-                _variables(batch, workflow_stage),
+                _variables(batch, workflow_stage, regs, rubrics),
                 schema=_BATCH_SCHEMA,
             )
             usage.add(call_usage)
             verdict = _BatchVerdict.model_validate(parse_json_object(result.content))
             assessments.extend(_validate_results(
-                batch, verdict, artifacts, prompt_id, prompt_run.templates[prompt_id].version
+                batch, verdict, artifacts, prompt_id,
+                prompt_run.templates[prompt_id].version, refs_by_item, rubrics,
             ))
         except (LLMError, ValidationError, ValueError, KeyError) as exc:
             log.warning("f03 assessment batch failed profile=%s err=%s", profile, type(exc).__name__)
             assessments.extend(_undetermined(item, artifacts, profile=profile) for item, _ in batch)
-        if progress is not None:
-            progress({"stage": "llm", "label": "F03 結構化判讀", "done": done, "total": len(batches)})
 
     escalated = [
         assessment for assessment in assessments
@@ -186,7 +295,7 @@ def run_all(
             result, call_usage = gateway.execute(
                 prompt_run,
                 "govcheck.f03.escalation",
-                _escalation_variables(escalated, prepared, workflow_stage),
+                _escalation_variables(escalated, prepared, workflow_stage, regs, rubrics),
                 schema=_BATCH_SCHEMA,
                 call_kind="escalation",
             )
@@ -206,6 +315,8 @@ def run_all(
                     artifacts,
                     "govcheck.f03.escalation",
                     prompt_run.templates["govcheck.f03.escalation"].version,
+                    refs_by_item,
+                    rubrics,
                 )
             }
             assessments = [replacements.get(row.item_id, row) for row in assessments]
@@ -238,16 +349,26 @@ def run_all(
 
     per_item = [_findings(assessment) for assessment in assessments]
     findings = [finding for rows in per_item for finding in rows]
+    gaps = sum(1 for a in assessments if a.assessed and a.regulation_gap == "gap")
+    summary = (f"共評估 {len(assessments)} 項；需補正或人工確認 "
+               f"{sum(bool(rows) for rows in per_item)} 項")
+    summary += f"，其中法規符合性缺口 {gaps} 項。" if regs else "。（本次無法規條文對照，未做符合性判讀）"
     findings.append(Finding(
         severity=Severity.INFO,
         code="F03.ASSESSMENT_SUMMARY",
         title="F03 結構化審查摘要",
-        message=(f"共評估 {len(assessments)} 項；需補正或人工確認 "
-                 f"{sum(bool(rows) for rows in per_item)} 項。"),
+        message=summary,
         source="llm",
     ))
+    findings += template_findings
     findings += truncated
-    return AssessmentOutcome(assessments, findings, usage, list(prompt_run.refs))
+    l3_ms = round((time.perf_counter() - t_l3) * 1000)
+    _emit(progress, {"kind": "layer", "id": "L3", "state": "done", "elapsed_ms": l3_ms})
+    layers = [
+        _layer("L2", "法規／佐證檢索", "done", l2_ms),
+        _layer("L3", "敘述充分性判讀", "done", l3_ms),
+    ]
+    return AssessmentOutcome(assessments, findings, usage, list(prompt_run.refs), layers)
 
 
 def _truncation_findings(dropped: int, max_items: int) -> list[Finding]:
@@ -278,18 +399,24 @@ def _targets(checklist: F03Checklist, stage: WorkflowStage) -> list[F03Checklist
 def _deduplicate_targets(
     targets: list[F03ChecklistItem],
     stage: WorkflowStage,
+    regs: dict[str, list[dict]],
+    rubrics: dict[str, list[str]] | None = None,
 ) -> tuple[list[F03ChecklistItem], dict[str, str]]:
     unique = []
     canonical_by_signature: dict[str, str] = {}
     duplicate_of: dict[str, str] = {}
     for item in targets:
+        # 法規條文必須進簽章：兩項內容相同但對應不同條文時，判讀結果不可互相沿用，
+        # 否則 A 項的條文缺口會被複製到適用其他條文的 B 項上。
         signature = hashlib.sha256(
             json.dumps([
                 profile_for_item(item.item_id),
                 item.description,
                 item.evidence_proposal,
                 item.evidence_golive if stage is not WorkflowStage.PROPOSAL else None,
-            ], ensure_ascii=False).encode()
+                regs.get(item.item_id, []),
+                (rubrics or {}).get(item.item_id, []),
+            ], ensure_ascii=False, sort_keys=True).encode()
         ).hexdigest()
         canonical_id = canonical_by_signature.get(signature)
         if canonical_id is None:
@@ -321,12 +448,16 @@ def _prepare_many(
 
 def _pack(
     rows: list[tuple[F03ChecklistItem, list[EvidenceHit]]],
+    regs: dict[str, list[dict]],
+    rubrics: dict[str, list[str]] | None = None,
 ) -> list[list[tuple[F03ChecklistItem, list[EvidenceHit]]]]:
     batches = []
     current = []
     tokens = 0
     for row in rows:
-        estimate = len(json.dumps(_item_payload(*row), ensure_ascii=False)) // 2 + 1
+        estimate = len(
+            json.dumps(_item_payload(*row, regs=regs, rubrics=rubrics), ensure_ascii=False)
+        ) // 2 + 1
         if current and tokens + estimate > _MAX_PROMPT_TOKENS:
             batches.append(current)
             current = []
@@ -341,11 +472,14 @@ def _pack(
 def _variables(
     batch: list[tuple[F03ChecklistItem, list[EvidenceHit]]],
     stage: WorkflowStage,
+    regs: dict[str, list[dict]],
+    rubrics: dict[str, list[str]] | None = None,
 ) -> dict[str, object]:
     return {
         "workflow_stage": stage.value,
         "items_json": json.dumps(
-            [_item_payload(item, hits, stage) for item, hits in batch], ensure_ascii=False
+            [_item_payload(item, hits, stage, regs, rubrics) for item, hits in batch],
+            ensure_ascii=False,
         ),
         "evidence_json": json.dumps([_evidence_payload(hit) for _, hits in batch for hit in hits], ensure_ascii=False),
         "policy_version": _POLICY_VERSION,
@@ -357,10 +491,14 @@ def _escalation_variables(
     assessments: list[F03ItemAssessment],
     prepared: list[tuple[F03ChecklistItem, list[EvidenceHit]]],
     stage: WorkflowStage,
+    regs: dict[str, list[dict]],
+    rubrics: dict[str, list[str]] | None = None,
 ) -> dict[str, object]:
     variables = _variables(
         [(item, hits) for item, hits in prepared if item.item_id in {a.item_id for a in assessments}],
         stage,
+        regs,
+        rubrics,
     )
     variables["primary_assessments_json"] = json.dumps(
         [assessment.model_dump(mode="json") for assessment in assessments], ensure_ascii=False
@@ -372,6 +510,8 @@ def _item_payload(
     item: F03ChecklistItem,
     hits: list[EvidenceHit],
     stage: WorkflowStage | None = None,
+    regs: dict[str, list[dict]] | None = None,
+    rubrics: dict[str, list[str]] | None = None,
 ) -> dict:
     return {
         "item_id": item.item_id,
@@ -385,7 +525,81 @@ def _item_payload(
         "allowed_citations": [
             {"document_id": hit.document_id, "unit_id": hit.unit_id} for hit in hits
         ],
+        # 法規條文摘錄＝符合性判讀的基準。空陣列代表本項無條文對照，模型不得妄下符合性結論。
+        "regulations": (regs or {}).get(item.item_id, []),
+        # 審查員檢核句：人工撰寫的判準，模型只逐句回「說明有沒有回應這一句」。
+        # 空陣列代表本項無判準，rubric_met 也應為空。
+        "rubric": (rubrics or {}).get(item.item_id, []),
     }
+
+
+def _regulation_payload(
+    canonical: F03ItemRetrieval,
+    max_sections: int,
+    max_excerpt_chars: int,
+) -> list[dict]:
+    """canonical 條文摘錄 → prompt payload（受段數與字數上限節流）。"""
+    sections = canonical.sections[:max_sections]
+    return [
+        {
+            "ref": format_section_ref(section.reg_code, section.section_path),
+            "title": section.title,
+            "excerpt": section.excerpt[:max_excerpt_chars],
+        }
+        for section in sections
+    ]
+
+
+def _canonical_refs(canonical: F03ItemRetrieval, max_sections: int) -> list[str]:
+    """本項可用的條文引用顯示字串；報告只會出現這個清單裡的條號。"""
+    return [
+        format_section_ref(section.reg_code, section.section_path)
+        for section in canonical.sections[:max_sections]
+    ]
+
+
+def _normalize_ref(text: str | None) -> str:
+    """比對用正規化：NFKC（全形→半形）、去頭尾空白、內部連續空白壓成單一空格。"""
+    if not text:
+        return ""
+    return " ".join(unicodedata.normalize("NFKC", text).split())
+
+
+def _display_refs(all_refs: list[str], gap_refs: list[str]) -> list[str]:
+    """模型指出的缺口條號 ∩ canonical 引用；交集為空則列出全部 canonical 引用。
+
+    顯示來源永遠是 canonical，模型只能從中挑選，不能新增——否則報告會出現不存在的條號。
+    """
+    if gap_refs:
+        wanted = {_normalize_ref(ref) for ref in gap_refs}
+        filtered = [ref for ref in all_refs if _normalize_ref(ref) in wanted]
+        if filtered:
+            return filtered
+    return all_refs
+
+
+def _template_modified(item: F03ChecklistItem, canonical: F03ItemRetrieval) -> bool:
+    """上傳的 L 欄「規範參考」或檢查項目描述與官方模板不符 → True。
+
+    上傳側為空時 skip 比對（欄位未填不等於被改）。
+    """
+    uploaded_ref = _normalize_ref(item.regulation_ref_raw)
+    if uploaded_ref and uploaded_ref != _normalize_ref(canonical.canonical_ref_raw):
+        return True
+    uploaded_desc = _normalize_ref(item.description)
+    return bool(uploaded_desc and uploaded_desc != _normalize_ref(canonical.canonical_description))
+
+
+def _template_modified_finding(item: F03ChecklistItem) -> Finding:
+    return Finding(
+        severity=Severity.WARN,
+        code="F03.TEMPLATE_REF_MODIFIED",
+        title="F03 模板欄位疑似被修改",
+        message=(f"項次 {item.item_id} 的「規範參考」或「檢查項目」與官方模板不符，"
+                 "疑似被提案單位修改；判讀仍以官方模板為準，請人工核查。"),
+        location=item.loc,
+        source="rule",
+    )
 
 
 def _evidence_payload(hit: EvidenceHit) -> dict:
@@ -399,12 +613,27 @@ def _evidence_payload(hit: EvidenceHit) -> dict:
     }
 
 
+def _rubric_lines(lines: list[str], met: list[bool]) -> list[RubricLine]:
+    """把人工判準與模型的逐句回覆配對；長度對不上就整筆丟棄。
+
+    錯位的勾比沒有勾更誤導——治理人員會拿它去核對原文，發現對不上就再也不會信任
+    這個區塊。寧可少一個區塊，不要一個會說謊的區塊。
+    """
+    if not lines or len(met) != len(lines):
+        if lines and met:
+            log.warning("rubric length mismatch lines=%d met=%d", len(lines), len(met))
+        return []
+    return [RubricLine(text=text, met=bool(flag)) for text, flag in zip(lines, met)]
+
+
 def _validate_results(
     batch: list[tuple[F03ChecklistItem, list[EvidenceHit]]],
     response: _BatchVerdict,
     artifacts: list[DocumentArtifact],
     prompt_id: str,
     prompt_version: str,
+    refs_by_item: dict[str, list[str]],
+    rubrics: dict[str, list[str]] | None = None,
 ) -> list[F03ItemAssessment]:
     verdicts = {row.item_id: row for row in response.results}
     output = []
@@ -431,6 +660,15 @@ def _validate_results(
             evidence_status = EvidenceStatus.PARTIAL if hits else _absence_status(artifacts)
         if conflict_status is ConflictStatus.CONTRADICTED and not citations:
             conflict_status = ConflictStatus.UNKNOWN
+        # 沒有條文對照就沒有審查基準：模型無論回什麼，一律降回 undetermined，
+        # 避免在「不知道要比對什麼」的情況下宣稱符合或有缺口。
+        canonical_refs = refs_by_item.get(item.item_id, [])
+        regulation_gap = verdict.regulation_gap if canonical_refs else "undetermined"
+        regulation_refs = (
+            _display_refs(canonical_refs, verdict.gap_refs)
+            if regulation_gap == "gap"
+            else []
+        )
         output.append(F03ItemAssessment(
             item_id=item.item_id,
             profile=profile_for_item(item.item_id),
@@ -438,9 +676,12 @@ def _validate_results(
             reasonableness=verdict.reasonableness,
             evidence_status=evidence_status,
             conflict_status=conflict_status,
+            regulation_gap=regulation_gap,
+            regulation_refs=regulation_refs,
             confidence=verdict.confidence,
             citations=citations,
             recommendations=verdict.recommendations,
+            rubric=_rubric_lines((rubrics or {}).get(item.item_id, []), verdict.rubric_met),
             prompt_id=prompt_id,
             prompt_version=prompt_version,
         ))
@@ -481,12 +722,15 @@ def _assessment_cache_key(
     stage: WorkflowStage,
     gateway: PromptGateway,
     prompt_run,
+    regs: dict[str, list[dict]],
+    rubrics: dict[str, list[str]] | None = None,
 ) -> str:
     if not gateway.cache_namespace:
         return ""
     profile = profile_for_item(item.item_id)
     prompt_id = f"govcheck.f03.{profile}"
     template = prompt_run.templates[prompt_id]
+    escalation = prompt_run.templates["govcheck.f03.escalation"]
     payload = {
         "namespace": gateway.cache_namespace,
         "stage": stage.value,
@@ -495,7 +739,11 @@ def _assessment_cache_key(
         "prompt_id": prompt_id,
         "prompt_version": template.version,
         "prompt_hash": template.content_hash,
-        "item": _item_payload(item, hits, stage),
+        # 最終 assessment 可能來自低信心升級。升級模板改版時，即使主要模板未變，
+        # 也不得命中舊的最終結果。
+        "escalation_prompt_version": escalation.version,
+        "escalation_prompt_hash": escalation.content_hash,
+        "item": _item_payload(item, hits, stage, regs, rubrics),
         "evidence_hashes": [
             hashlib.sha256(hit.content.encode()).hexdigest() for hit in hits
         ],
@@ -578,6 +826,19 @@ def _findings(assessment: F03ItemAssessment) -> list[Finding]:
         output.append(_finding("F03.EVIDENCE_CONTRADICTED", "佐證內容可能衝突", assessment, location))
     if assessment.conflict_status is ConflictStatus.CONFLICTING_SOURCES:
         output.append(_finding("F03.EVIDENCE_SOURCE_CONFLICT", "佐證文件彼此衝突", assessment, location))
+    if assessment.regulation_gap == "gap":
+        refs = "、".join(assessment.regulation_refs) or "（對照表未提供條號）"
+        message = f"佐證未涵蓋下列條文要求：{refs}。"
+        if assessment.recommendations:
+            message += "；".join(assessment.recommendations)
+        output.append(Finding(
+            severity=Severity.WARN,
+            code="F03.REGULATION_GAP",
+            title="佐證與法規條文存在符合性缺口",
+            message=message,
+            location=location,
+            source="llm",
+        ))
     return output
 
 

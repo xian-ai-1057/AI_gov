@@ -94,6 +94,7 @@ def parse_f03_checklist(path: str | Path, cfg: dict | None = None) -> F03Checkli
 
         items.append(F03ChecklistItem(
             item_id=item_id,
+            row_index=r,  # 供報告組出可稽核座標（「F03·檢核表 J14」）
             lifecycle=last_lifecycle,
             topic=clean(ws[f"{topic_col}{r}"].value),
             description=clean(ws[f"{desc_col}{r}"].value),

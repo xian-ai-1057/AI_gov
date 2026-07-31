@@ -9,9 +9,14 @@ from pydantic import BaseModel, Field
 
 
 class WorkflowStage(str, Enum):
+    """治理流程只有兩段：提案送審、上線送審。
+
+    上線階段＝提案內容已核可、系統實際要上線前的複審，因此除了提案內容外還要看
+    上線階段佐證（F03 J 欄）與「上線後跟提案差了什麼」。
+    """
+
     PROPOSAL = "proposal"
-    ACCEPTANCE = "acceptance"
-    PRODUCTION = "production"
+    GOLIVE = "golive"
 
 
 class DocumentParseStatus(str, Enum):
@@ -74,6 +79,21 @@ class Citation(BaseModel):
     quote: str = ""
 
 
+class RubricLine(BaseModel):
+    """審查員檢核句的逐句判定。
+
+    句子（text）是**人工撰寫的判準**，來自 prompts/govcheck.f03.rubrics.yaml，
+    不是模型生成的——模型只回答「這段說明有沒有回應這一句」（met）。
+    讓模型自己造判準等於讓它自己出題自己改，覆核者無從核對。
+
+    這樣呈現的好處：治理人員看得出模型錯在哪一句，未打勾的句子也能直接貼進補件通知，
+    比「敘述過於草率」這種籠統評語有用得多。
+    """
+
+    text: str
+    met: bool
+
+
 class F03ItemAssessment(BaseModel):
     item_id: str
     profile: str
@@ -83,12 +103,19 @@ class F03ItemAssessment(BaseModel):
     ] = "undetermined"
     evidence_status: EvidenceStatus = EvidenceStatus.NOT_FOUND
     conflict_status: ConflictStatus = ConflictStatus.UNKNOWN
+    # 佐證是否涵蓋該檢核項對應的法規條文要求。undetermined 也用於「本項無條文對照」
+    # （對照表缺檔或該項未映射）——沒有基準就不宣稱符合，也不宣稱有缺口。
+    regulation_gap: Literal["covered", "gap", "undetermined"] = "undetermined"
+    # 條文引用顯示字串，一律由對照表的 canonical section_path 推導，不採信模型自述的條號。
+    regulation_refs: list[str] = Field(default_factory=list)
     confidence: float = 0.0
     # False = 模型從未對此項做出判讀（端點失敗/回應缺漏/Prompt 未就緒）。
     # 此時 evidence_status 等欄位只是佔位預設值，不得當成實質合規結論。
     assessed: bool = True
     citations: list[Citation] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+    # 逐句檢核結果；空 list = 本項沒有 rubric 判準，或模型回覆與判準長度對不上而整筆丟棄。
+    rubric: list[RubricLine] = Field(default_factory=list)
     prompt_id: str | None = None
     prompt_version: str | None = None
 

@@ -61,7 +61,7 @@ def test_proposal_stage_ignores_golive_only_evidence() -> None:
 
 
 def test_later_stages_accept_golive_only_evidence() -> None:
-    by_id = {row.item_id: row for row in _MIXED.roster(WorkflowStage.PRODUCTION)}
+    by_id = {row.item_id: row for row in _MIXED.roster(WorkflowStage.GOLIVE)}
     assert by_id["1-6"].coverage == "assessable"
 
 
@@ -80,6 +80,85 @@ def test_reason_is_truncated() -> None:
         _item(check_state="不適用", evidence_proposal="理" * 500),
     ])
     assert len(checklist.roster(WorkflowStage.PROPOSAL)[0].reason) == 200
+
+
+def test_roster_carries_source_text_for_manual_cross_check() -> None:
+    """原文要進報告：治理人員必須能拿 AI 判讀去對照提案單位實際填的字。"""
+    checklist = F03Checklist(items=[_item(
+        description="是否已完成偏誤測試", check_state="是",
+        evidence_proposal="已於 UAT 完成偏誤測試", evidence_golive="上線前重跑偏誤測試",
+    )])
+    row = checklist.roster(WorkflowStage.GOLIVE)[0]
+    assert row.description == "是否已完成偏誤測試"
+    assert row.evidence_proposal_text == "已於 UAT 完成偏誤測試"
+    assert row.evidence_golive_text == "上線前重跑偏誤測試"
+
+
+def test_roster_uses_canonical_short_name_for_standard_item() -> None:
+    """標準項次的列首不受提案單位改寫 D 欄影響。"""
+    checklist = F03Checklist(items=[_item(
+        item_id="4-2", description="提案單位自行改寫的超長檢查項目說明",
+    )])
+    assert checklist.roster(WorkflowStage.PROPOSAL)[0].short_name == "模型監控機制"
+
+
+def test_roster_derives_bounded_short_name_for_unknown_item() -> None:
+    """範本新增項次時由 D 欄 fallback，且最終顯示長度不超過 14 字。"""
+    checklist = F03Checklist(items=[_item(
+        item_id="9-9", description="9-9 這是一段非常非常長的新增檢查項目說明，後面是填寫指引",
+    )])
+    short_name = checklist.roster(WorkflowStage.PROPOSAL)[0].short_name
+    assert short_name.endswith("…")
+    assert len(short_name) == 14
+
+
+def test_roster_carries_each_evidence_column_char_count() -> None:
+    checklist = F03Checklist(items=[_item(
+        evidence_proposal="提 案 三 字", evidence_golive="上線四個字",
+    )])
+    row = checklist.roster(WorkflowStage.GOLIVE)[0]
+    assert row.evidence_proposal_chars == 4
+    assert row.evidence_golive_chars == 5
+
+
+def test_proposal_stage_roster_hides_golive_text() -> None:
+    """提案階段不看 J 欄：帶出上線佐證原文會讓人誤以為 AI 已審過那段。"""
+    checklist = F03Checklist(items=[_item(
+        check_state="是", evidence_proposal="提案說明", evidence_golive="上線說明",
+    )])
+    row = checklist.roster(WorkflowStage.PROPOSAL)[0]
+    assert row.evidence_proposal_text == "提案說明"
+    assert row.evidence_golive_text is None
+    assert row.golive_diff is None
+
+
+def test_source_text_is_truncated() -> None:
+    """佐證說明是自由填寫欄位，與不適用理由一樣不能無上限灌進 API payload。"""
+    checklist = F03Checklist(items=[_item(
+        description="檢" * 900, check_state="是", evidence_proposal="佐" * 900,
+    )])
+    row = checklist.roster(WorkflowStage.PROPOSAL)[0]
+    assert len(row.description) == 600
+    assert len(row.evidence_proposal_text) == 600
+
+
+@pytest.mark.parametrize(
+    ("proposal", "golive", "expected"),
+    [
+        ("提案時的做法", None, "missing"),
+        ("提案時的做法", "   ", "missing"),
+        ("提案時的做法", "提案時的做法", "same"),
+        ("提案時的做法", " 提案時 的做法 ", "same"),   # 只有排版差異不算內容差異
+        ("提案時的做法", "上線後改用新做法", "changed"),
+        (None, "上線後才補的做法", "changed"),          # 提案沒寫、上線才有＝差異
+    ],
+)
+def test_golive_diff_is_deterministic(proposal, golive, expected) -> None:
+    """上線階段的「與提案差異」是規則式文字比對，不經模型，可逐例驗證。"""
+    checklist = F03Checklist(items=[_item(
+        check_state="是", evidence_proposal=proposal, evidence_golive=golive,
+    )])
+    assert checklist.roster(WorkflowStage.GOLIVE)[0].golive_diff == expected
 
 
 def test_markdown_lists_every_unassessed_item() -> None:

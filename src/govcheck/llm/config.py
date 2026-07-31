@@ -95,4 +95,22 @@ def load_llm_config(path: str | None = None) -> dict:
             int,
             4,
         ),
+        # 佐證檢索用的 embeddings 端點（與 chat 端點分開，通常是不同模型）。
+        # api_key 只走環境變數 GOVCHECK_EMBEDDING_API_KEY，不從 YAML 讀。
+        "embedding_base_url": (
+            os.environ.get("GOVCHECK_EMBEDDING_BASE_URL")
+            or raw.get("embedding_base_url")
+            or base_url
+        ).rstrip("/"),
+        "embedding_model": (
+            os.environ.get("GOVCHECK_EMBEDDING_MODEL")
+            or raw.get("embedding_model")
+            or "bge-m3"
+        ),
+        "embedding_timeout": _as_number(
+            os.environ.get("GOVCHECK_EMBEDDING_TIMEOUT"),
+            raw.get("embedding_timeout"),
+            float,
+            120.0,
+        ),
     }

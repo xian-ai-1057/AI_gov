@@ -14,17 +14,21 @@
 **定位**：AI 產出「初判草稿」加速人工審閱，**最終判定權在治理人員與三遵**。
 報告全程標示「AI 初判，需人工覆核」。資料全程地端，**不外送雲端**。
 
-**現況：Phase 1–3 已完成** — 批次上傳自動分類 → 缺件 + F01 必填 + F02 規則 + F03 兩段佐證 LLM 比較（+彙整表）
-+ 跨表一致性，端到端可跑；介面含高還原 Web（FastAPI + 靜態前端）與 Streamlit。
-Phase 3 RAG 已實作：build-time 法規索引 + canonical 檢索映射（scripts/build_regulation_index.py），F03 LLM 符合性判讀 + F02 規則式義務條文提示。
+**收斂到五項核心能力**（其餘輔助功能已刻意移除，不要再長回來）：
+1. 文件是否填錯（規則）2. 風險評級是否算錯（規則）3. 敘述是否滿足需求（LLM）
+4. 專案內容是否合規（LLM + 規則）5. 產出綜合報告。
+
+需求 3 與 4 在**同一次模型呼叫**判完（`checks/llm/f03_assessment.py`）：兩者看同一段文字，
+拆開會讓每項判讀兩次、等待加倍、結論互相矛盾。介面只有一套（FastAPI + `web/` 靜態前端）。
 
 ---
 
 ## 技術棧
 
-Python 3.12、Streamlit、Pydantic v2、pandas（讀表）+ openpyxl（公式/儲存格層級）、
-PyYAML、pdfplumber/python-docx（佐證，後續）、pytest。**uv** 管理依賴。
-後續 Phase：pymilvus(Milvus Lite，build-time 索引) + embedding/LLM 統一走 requests + OpenAI 相容端點(/embeddings、/chat/completions；內部/地端端點，本機 dev 用 ollama)。
+Python 3.12、FastAPI + 靜態前端（vanilla JS）、Pydantic v2、pandas（讀表）+ openpyxl（公式/儲存格層級）、
+PyYAML、pdfplumber/python-docx（佐證）、pytest。**uv** 管理依賴。
+embedding/LLM 統一走 requests + OpenAI 相容端點（/embeddings、/chat/completions；
+內部/地端端點，本機 dev 用 ollama）。
 
 > 本機開發可用 ollama（gemma + bge-m3，`localhost:11434`）做真實端到端測試，免內部端點。
 
@@ -34,30 +38,33 @@ PyYAML、pdfplumber/python-docx（佐證，後續）、pytest。**uv** 管理依
 
 ```
 AI治理/
-├── app.py                          # Streamlit 入口（上傳 F02 → 報告）
 ├── pyproject.toml / uv.lock        # uv 管理
-├── scripts/
-│   ├── extract_f02_scoring.py      # 建置第一步：解析官方 .xlsm 公式 → 計分 config
-│   └── build_regulation_index.py   # Phase 3：build-time 法規索引 + canonical 映射（Milvus Lite）
-├── specs/                          # SDD spec：p3-01-regulation-index / p3-02-canonical-map / p3-03-rag-checks
+├── scripts/extract_f02_scoring.py  # 建置第一步：解析官方 .xlsm 公式 → 計分 config
 ├── src/govcheck/
-│   ├── config/f02_scoring.yaml     # 自動抽出的 F02 計分常數（勿手改，重跑腳本產生）
+│   ├── config/                     # f02_scoring.yaml（勿手改，重跑腳本產生）/ llm / log / review / parser
 │   ├── logging_setup.py            # 地端 log：ops(govcheck.log)+稽核(audit.log) 雙管線；profile 控細節程度
-│   ├── models/                     # F02Form / Finding / ReviewReport (Pydantic v2)
-│   ├── parsers/                    # f02_parser.py（pandas 讀續填表 + openpyxl 讀公式/快取）
-│   ├── scoring/f02_score.py        # 還原 Excel 公式：加總→加成→百分比→MAX→分級
-│   ├── rag/                        # Build-time RAG：pdf_text / chunker / refs / embedding / store / mapping
+│   ├── models/                     # F01/F02/F03 Form、Finding、ReviewReport、evidence (Pydantic v2)
+│   ├── parsers/                    # f01/f02/f03 主表 + supporting（佐證文件，走 ts_parser）
+│   ├── scoring/f02_score.py        # 還原 Excel 公式：加總→加成→百分比→MAX→分級        ← 需求 2
+│   ├── regulations/                # 凍結法規對照表：mapping / models / config（runtime 只讀 JSON）
+│   ├── evidence/retrieval.py       # 佐證片段混合檢索（BM25-like + 選用 embedding）
+│   ├── prompts/                    # PromptCatalog / Gateway / Provider（正式 prompt 文字不入庫）
 │   ├── checks/
 │   │   ├── base.py                 # Check 介面：__call__(form) -> list[Finding]
-│   │   ├── rule/                   # ✅ 規則式檢查：f02_rules / f01_rules / missing_docs / cross_consistency / f03_evidence_presence + f02_reg_refs
-│   │   └── llm/                    # ✅ f03_evidence.py（F03 兩段佐證 LLM 比較 + 彙整表）+ f03_rag（法規檢索輔助判讀）
+│   │   ├── rule/                   # missing_docs / f01_rules / f02_rules / cross_consistency
+│   │   │                           #   / f03_evidence_presence / f02_reg_refs          ← 需求 1、4
+│   │   └── llm/f03_assessment.py   # 內容 + 佐證 + 法規符合性一次判完                    ← 需求 3、4
 │   ├── review/engine.py            # 編排：parse → 跑 checks → 匯總
-│   ├── report/builder.py           # Finding → Markdown
-│   └── web/api.py                  # FastAPI：/api/classify + /api/review + 靜態掛載（介面層，零判讀邏輯）
-├── web/                            # 高還原靜態前端（index.html/styles.css/app.js；移植自 Claude Design 設計稿）
-├── docs/                           # 部署與遷移文檔（milvus_migration.md 等）
+│   ├── report/builder.py           # ReviewReport → Markdown                            ← 需求 5
+│   └── web/api.py                  # FastAPI：POST /api/review + GET /api/readiness（介面層，零判讀邏輯）
+├── src/ts_parser/                  # 內嵌的上游佐證 parser（整合邊界）
+├── web/                            # 唯一前端（index.html/styles.css/app.js）
+├── docs/                           # architecture / f03_review_v2 / prompts / ts_parser_source
 ├── tests/                          # 計分還原 + 規則正反例（真檔生成 fixture，皆有 ground truth）
-└── data/original/                  # 唯讀來源（PDF/xlsx 模板）；gitignore，禁寫入、禁入庫
+├── data/original/                  # 唯讀來源（PDF/xlsx 模板）；gitignore，禁寫入、禁入庫
+├── data/rag/retrieval_map.json     # 凍結法規對照表（gitignore；缺檔→ REGULATION.MAP_UNAVAILABLE）
+├── prompts/                        # 判讀 prompt YAML（gitignore；缺檔→ F03.PROMPT_UNAVAILABLE）
+└── _Archive/rag_build/             # 封存的法規索引建置管線（法規改版時取回重跑）
 ```
 
 `data/original/` 內容：R01–R07 七份治理辦法 PDF、附件一 F01(xlsx)、附件二 F02(xlsm)、
@@ -70,13 +77,10 @@ AI治理/
 ```bash
 uv sync --extra dev                            # 安裝依賴
 uv run python scripts/extract_f02_scoring.py   # （重）產出 F02 計分 config
-uv run python scripts/build_regulation_index.py --dry-run  # 檢視法規切塊(建索引前抽核)
-uv run python scripts/build_regulation_index.py            # 建置 RAG 法規索引 (Milvus Lite)
-uv run python scripts/build_regulation_index.py --eval     # 檢索品質 recall@k 報告
 uv run pytest                                  # 跑測試（須全綠才收工）
-uv run ruff check src tests scripts app.py     # lint
-uv run uvicorn govcheck.web.api:app --port 8501  # 啟動高還原 Web 介面（FastAPI + 靜態前端）
-uv run streamlit run app.py                    # 啟動 Streamlit 介面（兩者共用同一後端）
+uv run ruff check src tests scripts           # lint
+uv run python tests/golden/generate_snapshot.py  # 規則側 golden 基準（改動規則輸出才需重產）
+uv run uvicorn govcheck.web.api:app --port 8501  # 啟動 Web 介面 → http://localhost:8501
 ```
 
 ---
@@ -87,9 +91,10 @@ uv run streamlit run app.py                    # 啟動 Streamlit 介面（兩�
 - **規則 / LLM 嚴格分離**：`checks/rule/`（確定性、先跑、可單測、不需網路）與 `checks/llm/`（判讀、後續）分開。
 - **新增 Phase = 新增 Check 類別 + 在 engine 註冊**，不動既有程式。
 - **計分常數來自 config**，由 `scripts/extract_f02_scoring.py` 從官方檔公式自動抽出，不在程式寫死。
-
-**路線圖**：Phase 1 ✅F02 規則 → Phase 2 ✅缺件+F01必填+跨表一致 → Phase 3 ✅F03 兩段式(LLM+RAG) →
-Phase 4 佐證充分性 → Phase 5 Agent 協助提案者填寫。
+- **條文引用決定性推導**：報告顯示的條號一律由對照表 canonical `section_path` 推導，
+  模型回的 `gap_refs` 只作交集過濾——不讓模型憑空造出不存在的條號。
+- **保持精簡**：新功能先問「是不是那五項核心能力之一」。不是就別加；是的話優先擴充既有 Check，
+  而非另開一條平行管線。
 
 ---
 
@@ -112,6 +117,8 @@ Phase 4 佐證充分性 → Phase 5 Agent 協助提案者填寫。
   - **唯一例外（dev-only 除錯）**：`dev` profile 時 `dump_llm_raw()` 會把 LLM request/response 全文
     存到 `logs/llm_raw/`（gitignored）供解 JSON 解析失敗除錯；終端只印截斷版。prod / quiet **完全不寫**。
     僅限本機 ollama、無真實送件資料的情境；上線環境勿設 `GOVCHECK_LOG_PROFILE=dev`。
+- ❌ 把 `data/rag/retrieval_map.json`（法規原文摘錄）或 `prompts/*.yaml`（判準衍生自治理辦法）入庫。
+  兩者皆已 gitignore；新環境靠另外佈署，缺檔時程式自動降級並在報告明示。
 
 ### Git / 推送守則
 - 推 GitHub 前確認 `data/original/`、`.env`、`uploads/`、`output/`、`logs/`、`_Archive/` 都在 `.gitignore`
