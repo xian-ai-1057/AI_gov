@@ -163,6 +163,9 @@ prompt 判的」。忘了 bump 版本時 content_hash 仍會變，可據此察�
 
 這些是防線不是替代品：prompt 仍應明確要求模型遵守同樣的規則，否則會產生大量被丟棄的引用。
 
+佐證片段怎麼被檢索出來、`supported / partial / not_found / unreadable / unknown` 各自的定義與
+觸發條件，見 [docs/evidence_retrieval.md](evidence_retrieval.md)。
+
 ## Context 預算與分批
 
 每次請求的可用輸入預算為 `context_window_tokens - max_output_tokens - safety_margin`。

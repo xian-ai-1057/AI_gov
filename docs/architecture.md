@@ -41,7 +41,7 @@ flowchart TB
 
     LLM -->|"OpenAI 相容 /chat/completions"| LLMEP[("核准的內部 LLM 端點")]
     PROMPT["prompts/<br/>Catalog · Gateway · Provider"] -->|"固定 Prompt 版本"| LLM
-    EVIDENCE["evidence/<br/>來源定位 top-k 混合檢索"] --> LLM
+    EVIDENCE["evidence/<br/>來源定位 top-k 混合檢索<br/>（展開見 docs/evidence_retrieval.md）"] --> LLM
 
     RULE --> REPORT["report/builder.py<br/>Finding[] → ReviewReport → Markdown"]
     LLM --> REPORT
@@ -91,7 +91,21 @@ flowchart LR
 
 ---
 
-## 3. 目錄 ↔ 管線階段對照
+## 3. 佐證檢索（evidence/）
+
+上圖 `evidence/` 這一個方塊自成一條子管線：佐證文件解析 → 連續原文視窗切塊 →
+BM25-like（＋選用 embedding）混合排序 → 絕對相關性門檻 → 每項 top-k → 送模型 →
+引用驗證與狀態降級。架構圖、逐步流程，以及**完整佐證／部分佐證／無佐證**的定義與觸發條件
+（含 `unreadable`、`unknown` 兩個刻意分出來的狀態）見
+[docs/evidence_retrieval.md](evidence_retrieval.md)。
+
+一句話原則：**「找不到佐證」與「沒把佐證查完」是兩種結論**。詞面檢索永遠掃全文，語意檢索有
+取樣上限；被上限截斷或 embedding 端點失敗時，空結果一律標 backend-only 的 `unknown`，
+不會升級成 `not_found` 這個較強的主張。
+
+---
+
+## 4. 目錄 ↔ 管線階段對照
 
 ```mermaid
 flowchart LR
@@ -118,7 +132,7 @@ flowchart LR
 
 ---
 
-## 4. Web 介面：兩步驟狀態機（前端）
+## 5. Web 介面：兩步驟狀態機（前端）
 
 `web/app.js` 是純 vanilla JS 狀態機，`#app` 依 `state.step` 全量重繪，事件一律走
 `data-action` 委派（見 `web/app.js` 開頭的 `state` 物件）。
@@ -159,5 +173,6 @@ stateDiagram-v2
 ## 參考
 
 - [README.md](../README.md) — 安裝、使用流程、環境變數總覽
+- [docs/evidence_retrieval.md](evidence_retrieval.md) — 佐證檢索架構、流程與佐證狀態定義
 - [docs/f03_review_v2.md](f03_review_v2.md) — F03 判讀、Prompt 與 parser 整合契約
 - `CLAUDE.md`（repo root）— 行為守則、目錄結構權威來源
