@@ -19,12 +19,17 @@ import unicodedata
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from govcheck.evidence import EvidenceHit, EvidenceRetriever
-from govcheck.llm.client import LLMError, parse_json_object
+from govcheck.llm.client import (
+    LLMContextLengthError,
+    LLMError,
+    LLMOutputTruncatedError,
+    parse_json_object,
+)
 from govcheck.logging_setup import get_logger
 from govcheck.models import (
     Citation,
@@ -54,12 +59,13 @@ from govcheck.regulations.models import F03ItemRetrieval, RetrievalMap
 
 log = get_logger("f03_assessment")
 
-_SCHEMA_VERSION = "2"
-_POLICY_VERSION = "f03-policy-v1"
-_MAX_PROMPT_TOKENS = 6000
+_SCHEMA_VERSION = "3"
+_POLICY_VERSION = "f03-policy-v2"
 _CACHE_MAX_ITEMS = 512
+_ESTIMATED_OUTPUT_TOKENS_PER_ITEM = 512
 _ASSESSMENT_CACHE: OrderedDict[str, F03ItemAssessment] = OrderedDict()
 _CACHE_LOCK = threading.Lock()
+_T = TypeVar("_T")
 
 
 class _CitationVerdict(BaseModel):
@@ -67,6 +73,7 @@ class _CitationVerdict(BaseModel):
 
     document_id: str
     unit_id: str
+    excerpt_id: str
 
 
 class _ItemVerdict(BaseModel):
@@ -77,7 +84,9 @@ class _ItemVerdict(BaseModel):
     reasonableness: Literal[
         "sufficient", "reasonable", "vague", "unreasonable", "undetermined"
     ]
-    evidence_status: EvidenceStatus
+    # UNKNOWN is a backend-only safety state for incomplete retrieval. The model must judge only
+    # the four observable evidence states; validation applies UNKNOWN when absence is not provable.
+    evidence_status: Literal["supported", "partial", "not_found", "unreadable"]
     conflict_status: ConflictStatus
     # 未給條文摘錄時模型可能省略；預設 undetermined，且 _validate_results 會強制回 undetermined。
     regulation_gap: Literal["covered", "gap", "undetermined"] = "undetermined"
@@ -141,6 +150,22 @@ def _emit_skipped_layers(progress) -> None:
         })
 
 
+def _add_truncated_usage(
+    usage: UsageSummary,
+    exc: LLMContextLengthError | LLMOutputTruncatedError,
+    *,
+    call_kind: Literal["primary", "escalation"],
+) -> None:
+    """Count a 200/length response before retrying; context rejections have no usage."""
+    if not isinstance(exc, LLMOutputTruncatedError):
+        return
+    usage.review_llm_primary_calls += int(call_kind == "primary")
+    usage.review_llm_escalation_calls += int(call_kind == "escalation")
+    usage.input_tokens += exc.input_tokens
+    usage.output_tokens += exc.output_tokens
+    usage.latency_ms += exc.latency_ms
+
+
 def run_all(
     checklist: F03Checklist,
     artifacts: list[DocumentArtifact],
@@ -148,6 +173,7 @@ def run_all(
     *,
     workflow_stage: WorkflowStage,
     max_items: int = 30,
+    max_batch_items: int = 8,
     top_k: int = 4,
     retriever: EvidenceRetriever | None = None,
     retrieval_map: RetrievalMap | None = None,
@@ -230,7 +256,7 @@ def run_all(
     # Prompt readiness precedes retrieval so a prompt outage cannot waste an
     # embedding call or send document chunks to an otherwise unusable pipeline.
     retriever = retriever or EvidenceRetriever()
-    prepared = _prepare_many(
+    prepared, retrieval_incomplete_item_ids = _prepare_many(
         unique_targets, artifacts, retriever, top_k, workflow_stage
     )
     usage = UsageSummary(evidence_embedding_calls=retriever.embedding_calls)
@@ -245,7 +271,14 @@ def run_all(
     misses = []
     for item, hits in prepared:
         key = _assessment_cache_key(
-            item, hits, workflow_stage, gateway, prompt_run, regs, rubrics
+            item,
+            hits,
+            workflow_stage,
+            gateway,
+            prompt_run,
+            regs,
+            rubrics,
+            retrieval_complete=item.item_id not in retrieval_incomplete_item_ids,
         )
         cache_keys[item.item_id] = key
         cached = _cache_get(key) if key else None
@@ -258,12 +291,28 @@ def run_all(
     grouped: dict[str, list[tuple[F03ChecklistItem, list[EvidenceHit]]]] = {}
     for item, hits in misses:
         grouped.setdefault(profile_for_item(item.item_id), []).append((item, hits))
-    batches = [
-        (profile, batch)
-        for profile, rows in grouped.items()
-        for batch in _pack(rows, regs, rubrics)
-    ]
-    for profile, batch in batches:
+    # Input and output both constrain a batch. Reserving max_tokens protects the context window,
+    # while this item ceiling prevents a valid 2K response budget from being asked to hold eight
+    # verbose verdict objects and returning truncated JSON.
+    output_item_limit = max(1, gateway.max_output_tokens // _ESTIMATED_OUTPUT_TOKENS_PER_ITEM)
+    batch_item_limit = min(max(1, max_batch_items), output_item_limit)
+    batches = []
+    for profile, rows in grouped.items():
+        prompt_id = f"govcheck.f03.{profile}"
+        profile_batches = _pack(
+            rows,
+            max_items=batch_item_limit,
+            fits=lambda candidate, prompt_id=prompt_id: gateway.fits_context(
+                prompt_run,
+                prompt_id,
+                _variables(candidate, workflow_stage, regs, rubrics),
+                schema=_BATCH_SCHEMA,
+            ),
+        )
+        batches.extend((profile, batch) for batch in profile_batches)
+    pending_primary = list(batches)
+    while pending_primary:
+        profile, batch = pending_primary.pop(0)
         prompt_id = f"govcheck.f03.{profile}"
         try:
             result, call_usage = gateway.execute(
@@ -277,7 +326,30 @@ def run_all(
             assessments.extend(_validate_results(
                 batch, verdict, artifacts, prompt_id,
                 prompt_run.templates[prompt_id].version, refs_by_item, rubrics,
+                retrieval_incomplete_item_ids,
             ))
+        except (LLMContextLengthError, LLMOutputTruncatedError) as exc:
+            _add_truncated_usage(usage, exc, call_kind="primary")
+            if len(batch) > 1:
+                midpoint = len(batch) // 2
+                pending_primary[0:0] = [
+                    (profile, batch[:midpoint]),
+                    (profile, batch[midpoint:]),
+                ]
+                log.info(
+                    "f03 primary size retry split items=%d err=%s",
+                    len(batch),
+                    type(exc).__name__,
+                )
+                continue
+            log.warning(
+                "f03 primary item exceeds model size limit profile=%s err=%s",
+                profile,
+                type(exc).__name__,
+            )
+            assessments.extend(
+                _undetermined(item, artifacts, profile=profile) for item, _ in batch
+            )
         except (LLMError, ValidationError, ValueError, KeyError) as exc:
             log.warning("f03 assessment batch failed profile=%s err=%s", profile, type(exc).__name__)
             assessments.extend(_undetermined(item, artifacts, profile=profile) for item, _ in batch)
@@ -285,43 +357,95 @@ def run_all(
     escalated = [
         assessment for assessment in assessments
         if assessment.item_id not in cached_item_ids
+        and assessment.assessed
         and (
             assessment.confidence < 0.6
             or assessment.conflict_status is ConflictStatus.CONFLICTING_SOURCES
         )
     ]
     if escalated:
-        try:
-            result, call_usage = gateway.execute(
+        escalation_batches = _pack(
+            escalated,
+            max_items=batch_item_limit,
+            fits=lambda candidate: gateway.fits_context(
                 prompt_run,
                 "govcheck.f03.escalation",
-                _escalation_variables(escalated, prepared, workflow_stage, regs, rubrics),
+                _escalation_variables(
+                    candidate, prepared, workflow_stage, regs, rubrics
+                ),
                 schema=_BATCH_SCHEMA,
-                call_kind="escalation",
-            )
-            usage.add(call_usage)
-            verdict = _BatchVerdict.model_validate(parse_json_object(result.content))
-            # 只替換「升級判讀確實回覆」的項目。否則 _validate_results 會為缺漏的
-            # item_id 生出 _undetermined，反而把可用的初判覆寫成未判讀。
-            escalated_ids = {row.item_id for row in escalated}
-            answered_ids = {row.item_id for row in verdict.results} & escalated_ids
-            if len(answered_ids) < len(escalated_ids):
-                log.warning("f03 escalation partial answered=%d expected=%d",
-                            len(answered_ids), len(escalated_ids))
-            replacements = {
-                row.item_id: row for row in _validate_results(
-                    [(item, hits) for item, hits in prepared if item.item_id in answered_ids],
-                    verdict,
-                    artifacts,
+            ),
+        )
+        replacements = {}
+        pending_escalation = list(escalation_batches)
+        while pending_escalation:
+            escalation_batch = pending_escalation.pop(0)
+            try:
+                result, call_usage = gateway.execute(
+                    prompt_run,
                     "govcheck.f03.escalation",
-                    prompt_run.templates["govcheck.f03.escalation"].version,
-                    refs_by_item,
-                    rubrics,
+                    _escalation_variables(
+                        escalation_batch, prepared, workflow_stage, regs, rubrics
+                    ),
+                    schema=_BATCH_SCHEMA,
+                    call_kind="escalation",
                 )
-            }
-            assessments = [replacements.get(row.item_id, row) for row in assessments]
-        except (LLMError, ValidationError, ValueError, KeyError) as exc:
-            log.warning("f03 escalation failed err=%s", type(exc).__name__)
+                usage.add(call_usage)
+                verdict = _BatchVerdict.model_validate(parse_json_object(result.content))
+                # 只替換「升級判讀確實回覆」的項目。否則 _validate_results 會為缺漏的
+                # item_id 生出 _undetermined，反而把可用的初判覆寫成未判讀。
+                escalated_ids = {row.item_id for row in escalation_batch}
+                answered_ids = {row.item_id for row in verdict.results} & escalated_ids
+                if len(answered_ids) < len(escalated_ids):
+                    log.warning(
+                        "f03 escalation partial answered=%d expected=%d",
+                        len(answered_ids),
+                        len(escalated_ids),
+                    )
+                batch_prepared = [
+                    (item, hits)
+                    for item, hits in prepared
+                    if item.item_id in answered_ids
+                ]
+                replacements.update({
+                    row.item_id: row for row in _validate_results(
+                        batch_prepared,
+                        verdict,
+                        artifacts,
+                        "govcheck.f03.escalation",
+                        prompt_run.templates["govcheck.f03.escalation"].version,
+                        refs_by_item,
+                        rubrics,
+                        retrieval_incomplete_item_ids,
+                    )
+                })
+            except (LLMContextLengthError, LLMOutputTruncatedError) as exc:
+                _add_truncated_usage(usage, exc, call_kind="escalation")
+                if len(escalation_batch) > 1:
+                    midpoint = len(escalation_batch) // 2
+                    pending_escalation[0:0] = [
+                        escalation_batch[:midpoint],
+                        escalation_batch[midpoint:],
+                    ]
+                    log.info(
+                        "f03 escalation size retry split items=%d err=%s",
+                        len(escalation_batch),
+                        type(exc).__name__,
+                    )
+                    continue
+                # Keep the usable primary assessment for this item. A context failure must never
+                # replace it with an unassessed placeholder.
+                log.warning(
+                    "f03 escalation item exceeds model size limit err=%s",
+                    type(exc).__name__,
+                )
+            except (LLMError, ValidationError, ValueError, KeyError) as exc:
+                log.warning(
+                    "f03 escalation batch failed items=%d err=%s",
+                    len(escalation_batch),
+                    type(exc).__name__,
+                )
+        assessments = [replacements.get(row.item_id, row) for row in assessments]
 
     for assessment in assessments:
         key = cache_keys.get(assessment.item_id)
@@ -330,6 +454,8 @@ def run_all(
             and assessment.item_id not in cached_item_ids
             and assessment.confidence >= 0.6
             and assessment.conflict_status is not ConflictStatus.CONFLICTING_SOURCES
+            and assessment.evidence_status is not EvidenceStatus.UNKNOWN
+            and assessment.retrieval_complete
         ):
             _cache_put(key, assessment)
 
@@ -433,7 +559,10 @@ def _prepare_many(
     retriever: EvidenceRetriever,
     top_k: int,
     stage: WorkflowStage,
-) -> list[tuple[F03ChecklistItem, list[EvidenceHit]]]:
+) -> tuple[
+    list[tuple[F03ChecklistItem, list[EvidenceHit]]],
+    set[str],
+]:
     queries = [
         " ".join(filter(None, [
             item.description,
@@ -443,27 +572,38 @@ def _prepare_many(
         for item in items
     ]
     hits = retriever.retrieve_many(queries, artifacts, top_k=top_k)
-    return list(zip(items, hits))
+    incomplete_indices = getattr(
+        retriever, "last_incomplete_query_indices", frozenset()
+    )
+    incomplete_item_ids = {
+        item.item_id
+        for index, item in enumerate(items)
+        if index in incomplete_indices
+    }
+    return list(zip(items, hits)), incomplete_item_ids
 
 
 def _pack(
-    rows: list[tuple[F03ChecklistItem, list[EvidenceHit]]],
-    regs: dict[str, list[dict]],
-    rubrics: dict[str, list[str]] | None = None,
-) -> list[list[tuple[F03ChecklistItem, list[EvidenceHit]]]]:
-    batches = []
-    current = []
-    tokens = 0
+    rows: list[_T],
+    *,
+    max_items: int,
+    fits: Callable[[list[_T]], bool],
+) -> list[list[_T]]:
+    """Greedily pack rows using the exact rendered prompt budget.
+
+    A single row that does not fit is still returned as its own batch. The ChatClient preflight will
+    fail it closed without contacting the endpoint, while other rows can continue independently.
+    """
+    batches: list[list[_T]] = []
+    current: list[_T] = []
+    item_limit = max(1, max_items)
     for row in rows:
-        estimate = len(
-            json.dumps(_item_payload(*row, regs=regs, rubrics=rubrics), ensure_ascii=False)
-        ) // 2 + 1
-        if current and tokens + estimate > _MAX_PROMPT_TOKENS:
+        candidate = [*current, row]
+        if current and (len(candidate) > item_limit or not fits(candidate)):
             batches.append(current)
-            current = []
-            tokens = 0
-        current.append(row)
-        tokens += estimate
+            current = [row]
+        else:
+            current = candidate
     if current:
         batches.append(current)
     return batches
@@ -481,7 +621,7 @@ def _variables(
             [_item_payload(item, hits, stage, regs, rubrics) for item, hits in batch],
             ensure_ascii=False,
         ),
-        "evidence_json": json.dumps([_evidence_payload(hit) for _, hits in batch for hit in hits], ensure_ascii=False),
+        "evidence_json": json.dumps(_unique_evidence_payloads(batch), ensure_ascii=False),
         "policy_version": _POLICY_VERSION,
         "output_schema_version": _SCHEMA_VERSION,
     }
@@ -494,16 +634,65 @@ def _escalation_variables(
     regs: dict[str, list[dict]],
     rubrics: dict[str, list[str]] | None = None,
 ) -> dict[str, object]:
+    assessment_ids = {assessment.item_id for assessment in assessments}
     variables = _variables(
-        [(item, hits) for item, hits in prepared if item.item_id in {a.item_id for a in assessments}],
+        [(item, hits) for item, hits in prepared if item.item_id in assessment_ids],
         stage,
         regs,
         rubrics,
     )
     variables["primary_assessments_json"] = json.dumps(
-        [assessment.model_dump(mode="json") for assessment in assessments], ensure_ascii=False
+        [_primary_assessment_payload(assessment) for assessment in assessments],
+        ensure_ascii=False,
     )
     return variables
+
+
+def _primary_assessment_payload(assessment: F03ItemAssessment) -> dict:
+    """Keep only first-pass fields that the escalation prompt actually compares."""
+    return {
+        "item_id": assessment.item_id,
+        "completeness": assessment.completeness,
+        "reasonableness": assessment.reasonableness,
+        "evidence_status": assessment.evidence_status.value,
+        "retrieval_complete": assessment.retrieval_complete,
+        "conflict_status": assessment.conflict_status.value,
+        "regulation_gap": assessment.regulation_gap,
+        "regulation_refs": assessment.regulation_refs,
+        "confidence": assessment.confidence,
+        "citations": [
+            {
+                "document_id": citation.document_id,
+                "unit_id": citation.unit_id,
+                "excerpt_id": citation.excerpt_id,
+            }
+            for citation in assessment.citations
+        ],
+        "recommendations": assessment.recommendations,
+        "rubric_met": [line.met for line in assessment.rubric],
+    }
+
+
+def _unique_evidence_payloads(
+    batch: list[tuple[F03ChecklistItem, list[EvidenceHit]]],
+) -> list[dict]:
+    """Deduplicate identical windows and retain the items each window is evidence for."""
+    output: list[dict] = []
+    index_by_window: dict[tuple[str, str, str], int] = {}
+    for item, hits in batch:
+        for hit in hits:
+            # Two items can legitimately select different verbatim windows from the same source
+            # unit. item_ids prevents those windows from being
+            # accidentally applied to the wrong checklist item in a multi-item prompt.
+            key = (hit.document_id, hit.unit_id, hit.content)
+            existing = index_by_window.get(key)
+            if existing is not None:
+                if item.item_id not in output[existing]["item_ids"]:
+                    output[existing]["item_ids"].append(item.item_id)
+                continue
+            index_by_window[key] = len(output)
+            output.append(_evidence_payload(hit, item_ids=[item.item_id]))
+    return output
 
 
 def _item_payload(
@@ -523,7 +712,12 @@ def _item_payload(
             else ""
         ),
         "allowed_citations": [
-            {"document_id": hit.document_id, "unit_id": hit.unit_id} for hit in hits
+            {
+                "document_id": hit.document_id,
+                "unit_id": hit.unit_id,
+                "excerpt_id": _excerpt_id(hit),
+            }
+            for hit in hits
         ],
         # 法規條文摘錄＝符合性判讀的基準。空陣列代表本項無條文對照，模型不得妄下符合性結論。
         "regulations": (regs or {}).get(item.item_id, []),
@@ -602,15 +796,25 @@ def _template_modified_finding(item: F03ChecklistItem) -> Finding:
     )
 
 
-def _evidence_payload(hit: EvidenceHit) -> dict:
+def _evidence_payload(hit: EvidenceHit, *, item_ids: list[str]) -> dict:
     return {
+        "item_ids": item_ids,
         "document_id": hit.document_id,
         "unit_id": hit.unit_id,
+        "excerpt_id": _excerpt_id(hit),
         "locator_type": hit.locator_type,
         "locator_value": hit.locator_value,
         "content": hit.content,
         "untrusted_data": True,
     }
+
+
+def _excerpt_id(hit: EvidenceHit) -> str:
+    """Return a compact stable identity for one exact source window."""
+    identity = json.dumps(
+        [hit.document_id, hit.unit_id, hit.content], ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(identity.encode()).hexdigest()[:16]
 
 
 def _rubric_lines(lines: list[str], met: list[bool]) -> list[RubricLine]:
@@ -634,32 +838,49 @@ def _validate_results(
     prompt_version: str,
     refs_by_item: dict[str, list[str]],
     rubrics: dict[str, list[str]] | None = None,
+    retrieval_incomplete_item_ids: set[str] | None = None,
 ) -> list[F03ItemAssessment]:
     verdicts = {row.item_id: row for row in response.results}
+    incomplete_item_ids = retrieval_incomplete_item_ids or set()
     output = []
     for item, hits in batch:
         verdict = verdicts.get(item.item_id)
         if verdict is None:
             output.append(_undetermined(item, artifacts, profile=profile_for_item(item.item_id)))
             continue
-        allowed = {(hit.document_id, hit.unit_id): hit for hit in hits}
+        allowed_excerpts = {_excerpt_id(hit): hit for hit in hits}
         citations = []
         for citation in verdict.citations:
-            hit = allowed.get((citation.document_id, citation.unit_id))
+            source = (citation.document_id, citation.unit_id)
+            hit = allowed_excerpts.get(citation.excerpt_id)
+            if hit is not None and (hit.document_id, hit.unit_id) != source:
+                hit = None
             if hit is not None:
                 citations.append(Citation(
                     document_id=hit.document_id,
                     unit_id=hit.unit_id,
+                    excerpt_id=_excerpt_id(hit),
                     locator_type=hit.locator_type,
                     locator_value=hit.locator_value,
-                    quote=" ".join(hit.content.split())[:180],
+                    quote=hit.quote or " ".join(hit.content.split())[:180],
                 ))
-        evidence_status = verdict.evidence_status
+        evidence_status = EvidenceStatus(verdict.evidence_status)
         conflict_status = verdict.conflict_status
         if evidence_status is EvidenceStatus.SUPPORTED and not citations:
             evidence_status = EvidenceStatus.PARTIAL if hits else _absence_status(artifacts)
-        if conflict_status is ConflictStatus.CONTRADICTED and not citations:
+        if conflict_status in {
+            ConflictStatus.CONTRADICTED,
+            ConflictStatus.CONFLICTING_SOURCES,
+        } and not citations:
             conflict_status = ConflictStatus.UNKNOWN
+        retrieval_complete = item.item_id not in incomplete_item_ids
+        if not retrieval_complete:
+            # A bounded or failed semantic pass can miss a relevant chunk that has no lexical
+            # overlap. Do not convert that incomplete search into the stronger NOT_FOUND claim.
+            if not citations:
+                evidence_status = EvidenceStatus.UNKNOWN
+            if conflict_status is ConflictStatus.CONSISTENT:
+                conflict_status = ConflictStatus.UNKNOWN
         # 沒有條文對照就沒有審查基準：模型無論回什麼，一律降回 undetermined，
         # 避免在「不知道要比對什麼」的情況下宣稱符合或有缺口。
         canonical_refs = refs_by_item.get(item.item_id, [])
@@ -675,6 +896,7 @@ def _validate_results(
             completeness=verdict.completeness,
             reasonableness=verdict.reasonableness,
             evidence_status=evidence_status,
+            retrieval_complete=retrieval_complete,
             conflict_status=conflict_status,
             regulation_gap=regulation_gap,
             regulation_refs=regulation_refs,
@@ -724,6 +946,8 @@ def _assessment_cache_key(
     prompt_run,
     regs: dict[str, list[dict]],
     rubrics: dict[str, list[str]] | None = None,
+    *,
+    retrieval_complete: bool = True,
 ) -> str:
     if not gateway.cache_namespace:
         return ""
@@ -743,6 +967,7 @@ def _assessment_cache_key(
         # 也不得命中舊的最終結果。
         "escalation_prompt_version": escalation.version,
         "escalation_prompt_hash": escalation.content_hash,
+        "retrieval_complete": retrieval_complete,
         "item": _item_payload(item, hits, stage, regs, rubrics),
         "evidence_hashes": [
             hashlib.sha256(hit.content.encode()).hexdigest() for hit in hits
@@ -820,7 +1045,23 @@ def _findings(assessment: F03ItemAssessment) -> list[Finding]:
         output.append(_finding(
             "F03.ASSESSMENT_UNREASONABLE", "內容與檢核項要求不符", assessment, location
         ))
-    if assessment.evidence_status in {EvidenceStatus.PARTIAL, EvidenceStatus.NOT_FOUND, EvidenceStatus.UNREADABLE}:
+    if not assessment.retrieval_complete:
+        output.append(Finding(
+            severity=Severity.INFO,
+            code="F03.EVIDENCE_RETRIEVAL_INCOMPLETE",
+            title="佐證語意檢索未完整",
+            message=(
+                "佐證量超過本次語意檢索上限或 embedding 服務未完成；"
+                "空結果不代表未提供佐證，請人工覆核或使用預建向量索引。"
+            ),
+            location=location,
+            source="llm",
+        ))
+    if assessment.evidence_status in {
+        EvidenceStatus.PARTIAL,
+        EvidenceStatus.NOT_FOUND,
+        EvidenceStatus.UNREADABLE,
+    }:
         output.append(_finding("F03.EVIDENCE_NOT_SUPPORTED", "佐證不足或無法讀取", assessment, location))
     if assessment.conflict_status is ConflictStatus.CONTRADICTED:
         output.append(_finding("F03.EVIDENCE_CONTRADICTED", "佐證內容可能衝突", assessment, location))

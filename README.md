@@ -135,8 +135,9 @@ F02 的固有風險分數/分級**不採信檔內填的值**，而是依答案**
 
 ## 啟用 F03 語意判讀（預設關閉）
 
-F03 判讀依固定的 `item_id → review_profile → prompt_id` 路由，把內容完整性、合理性、
-佐證支持度、佐證衝突與**法規符合性**合併在一次主要模型呼叫。只有低信心或來源互相衝突才執行 escalation。
+F03 判讀依固定的 `item_id → review_profile → prompt_id` 路由，把每一項的內容完整性、合理性、
+佐證支持度、佐證衝突與**法規符合性**合併在同一次判讀。項目會依 context 預算分批，只有低信心
+或來源互相衝突才執行 escalation。
 正式 Prompt 不存放於 Git；所有模板都經 `PromptGateway` 從受控來源取得。
 
 ```bash
@@ -144,6 +145,8 @@ F03 判讀依固定的 `item_id → review_profile → prompt_id` 路由，把�
 GOVCHECK_LLM_ENABLED=true
 GOVCHECK_LLM_BASE_URL=http://localhost:11434/v1
 GOVCHECK_LLM_MODEL=gemma3:4b
+GOVCHECK_LLM_CONTEXT_WINDOW_TOKENS=30000  # 必須與實際部署的 context window 一致
+GOVCHECK_LLM_MAX_OUTPUT_TOKENS=4096
 GOVCHECK_PROMPT_PROVIDER=file          # file = 讀本機 prompts/；litellm = 走 Prompt Management 端點
 GOVCHECK_PROMPT_DIR=prompts
 GOVCHECK_PROMPT_LABEL=production       # production 讀 prompts/；其他 label 讀 prompts/<label>/
@@ -157,6 +160,11 @@ GOVCHECK_PROMPT_LABEL=production       # production 讀 prompts/；其他 label 
 且 `MODEL_HOST` 必須在核准清單內，否則回傳 `parser_unavailable`。
 佐證檢索預設為 BM25-like 關鍵字排序；設 `GOVCHECK_EVIDENCE_EMBEDDING_ENABLED=true` 可加上
 embedding 分數融合（端點見 `GOVCHECK_EMBEDDING_BASE_URL` / `GOVCHECK_EMBEDDING_MODEL`）。
+Chat 判讀會依 `GOVCHECK_LLM_CONTEXT_WINDOW_TOKENS` 的完整預算自動分批；embedding 輸入也會依
+設定的單筆長度、batch size 與每次 review 的 chunk 總上限切分。BM25 會串流掃過全部
+原文視窗，但每題只保留最高分的小型候選池，避免超大文件在呼叫模型前就用盡記憶體。若
+embedding 的 chunk 上限或端點故障使語意檢索未涵蓋全文，空結果會標成「檢索未完整」而非
+`not_found`，避免把取樣限制誤報為沒有佐證。
 
 ---
 

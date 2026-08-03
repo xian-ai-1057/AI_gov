@@ -31,6 +31,9 @@ class EvidenceStatus(str, Enum):
     PARTIAL = "partial"
     NOT_FOUND = "not_found"
     UNREADABLE = "unreadable"
+    # The bounded semantic corpus was not exhaustive, so an empty retrieval result cannot safely
+    # be interpreted as proof that no supporting evidence exists.
+    UNKNOWN = "unknown"
 
 
 class ConflictStatus(str, Enum):
@@ -74,6 +77,7 @@ class DocumentArtifact(BaseModel):
 class Citation(BaseModel):
     document_id: str
     unit_id: str
+    excerpt_id: str | None = None
     locator_type: str
     locator_value: str
     quote: str = ""
@@ -102,6 +106,10 @@ class F03ItemAssessment(BaseModel):
         "sufficient", "reasonable", "vague", "unreasonable", "undetermined"
     ] = "undetermined"
     evidence_status: EvidenceStatus = EvidenceStatus.NOT_FOUND
+    # False means bounded/failing semantic retrieval did not examine the whole parsed corpus.
+    # It is separate from evidence_status so an exact retrieved citation can remain supported
+    # without implying that unseen chunks were checked for additional or conflicting evidence.
+    retrieval_complete: bool = True
     conflict_status: ConflictStatus = ConflictStatus.UNKNOWN
     # 佐證是否涵蓋該檢核項對應的法規條文要求。undetermined 也用於「本項無條文對照」
     # （對照表缺檔或該項未映射）——沒有基準就不宣稱符合，也不宣稱有缺口。
@@ -127,6 +135,9 @@ class UsageSummary(BaseModel):
     parser_ocr_calls: int = 0
     parser_vlm_calls: int = 0
     evidence_embedding_calls: int = 0
+    # Endpoint-accepted completions, including finish_reason=length retries that consumed tokens.
+    # Locally rejected/context-400 attempts have no usage payload and are intentionally excluded;
+    # operational logs retain those attempts without exposing request bodies.
     review_llm_primary_calls: int = 0
     review_llm_escalation_calls: int = 0
     input_tokens: int = 0
@@ -150,6 +161,6 @@ class ReviewRunMeta(BaseModel):
     workflow_stage: WorkflowStage = WorkflowStage.PROPOSAL
     prompt_refs: list[PromptRunRef] = Field(default_factory=list)
     parser_source_commit: str | None = None
-    policy_version: str = "f03-policy-v1"
-    output_schema_version: str = "2"
+    policy_version: str = "f03-policy-v2"
+    output_schema_version: str = "3"
     model_deployment: str | None = None

@@ -12,6 +12,7 @@ class PromptContract:
     schema_version: str
     profiles: frozenset[str]
     minimum_app_version: str = "0.2.0"
+    required_content_markers: frozenset[str] = frozenset()
 
 
 _ITEM_PROFILES = {
@@ -91,8 +92,9 @@ class PromptCatalog:
             f"govcheck.f03.{profile}": PromptContract(
                 prompt_id=f"govcheck.f03.{profile}",
                 required_variables=self.COMMON_VARIABLES,
-                schema_version="f03-assessment-v2",
+                schema_version="f03-assessment-v3",
                 profiles=frozenset({profile}),
+                required_content_markers=frozenset({"excerpt_id"}),
             )
             for profile in (
                 "fairness",
@@ -106,8 +108,9 @@ class PromptCatalog:
         self._contracts["govcheck.f03.escalation"] = PromptContract(
             prompt_id="govcheck.f03.escalation",
             required_variables=self.COMMON_VARIABLES | frozenset({"primary_assessments_json"}),
-            schema_version="f03-assessment-v2",
+            schema_version="f03-assessment-v3",
             profiles=frozenset({"escalation"}),
+            required_content_markers=frozenset({"excerpt_id"}),
         )
 
     def get(self, prompt_id: str) -> PromptContract:

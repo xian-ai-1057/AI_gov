@@ -9,7 +9,13 @@ import threading
 from dataclasses import dataclass
 
 from govcheck import __version__
-from govcheck.llm.client import ChatClient, ChatResult
+from govcheck.llm.client import (
+    DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
+    DEFAULT_CONTEXT_WINDOW_TOKENS,
+    ChatClient,
+    ChatResult,
+    estimate_chat_input_tokens,
+)
 from govcheck.models import PromptRunRef, UsageSummary
 from govcheck.prompts.catalog import PromptCatalog
 from govcheck.prompts.providers import (
@@ -60,6 +66,17 @@ class PromptGateway:
                 raise PromptUnavailable(
                     f"Prompt template 變數契約缺漏：{prompt_id} ({', '.join(sorted(missing))})"
                 )
+            template_text = "\n".join(row["content"] for row in template.messages)
+            missing_markers = contract.required_content_markers - {
+                marker
+                for marker in contract.required_content_markers
+                if marker in template_text
+            }
+            if missing_markers:
+                raise PromptUnavailable(
+                    f"Prompt template 內容契約缺漏：{prompt_id} "
+                    f"({', '.join(sorted(missing_markers))})"
+                )
             templates[prompt_id] = template
             refs.append(PromptRunRef(
                 prompt_id=prompt_id,
@@ -78,15 +95,7 @@ class PromptGateway:
         schema: dict,
         call_kind: str = "primary",
     ) -> tuple[ChatResult, UsageSummary]:
-        contract = self.catalog.get(prompt_id)
-        missing = contract.required_variables - variables.keys()
-        if missing:
-            raise ValueError(f"Prompt 變數缺漏：{', '.join(sorted(missing))}")
-        template = run.templates[prompt_id]
-        messages = [
-            {"role": row["role"], "content": _render(row["content"], variables)}
-            for row in template.messages
-        ]
+        messages = self.render_messages(run, prompt_id, variables)
         result = self.client.chat_result(messages, schema=schema)
         usage = UsageSummary(
             review_llm_primary_calls=int(call_kind == "primary"),
@@ -96,6 +105,64 @@ class PromptGateway:
             latency_ms=result.latency_ms,
         )
         return result, usage
+
+    def render_messages(
+        self,
+        run: PromptRun,
+        prompt_id: str,
+        variables: dict[str, object],
+    ) -> list[dict]:
+        """Render the exact messages that will be sent, without executing a model call."""
+        contract = self.catalog.get(prompt_id)
+        missing = contract.required_variables - variables.keys()
+        if missing:
+            raise ValueError(f"Prompt 變數缺漏：{', '.join(sorted(missing))}")
+        template = run.templates[prompt_id]
+        return [
+            {"role": row["role"], "content": _render(row["content"], variables)}
+            for row in template.messages
+        ]
+
+    @property
+    def input_token_budget(self) -> int:
+        configured = getattr(self.client, "input_token_budget", None)
+        if configured is not None:
+            return max(0, int(configured))
+        return (
+            DEFAULT_CONTEXT_WINDOW_TOKENS
+            - 4096
+            - DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS
+        )
+
+    @property
+    def max_output_tokens(self) -> int:
+        return max(1, int(getattr(self.client, "max_output_tokens", 4096)))
+
+    def estimate_input_tokens(
+        self,
+        run: PromptRun,
+        prompt_id: str,
+        variables: dict[str, object],
+        *,
+        schema: dict | None = None,
+    ) -> int:
+        messages = self.render_messages(run, prompt_id, variables)
+        estimator = getattr(self.client, "estimate_input_tokens", None)
+        if callable(estimator):
+            return int(estimator(messages, schema=schema))
+        return estimate_chat_input_tokens(messages, schema)
+
+    def fits_context(
+        self,
+        run: PromptRun,
+        prompt_id: str,
+        variables: dict[str, object],
+        *,
+        schema: dict | None = None,
+    ) -> bool:
+        return self.estimate_input_tokens(
+            run, prompt_id, variables, schema=schema
+        ) <= self.input_token_budget
 
     def readiness(self) -> dict[str, str]:
         result = {}

@@ -494,7 +494,9 @@
       const stageColumn = report.workflow_stage === "proposal" ? "prop" : "golive";
       row.cells[stageColumn] = contentCell;
 
-      if (assessment.evidence_status === "supported") {
+      if (assessment.retrieval_complete === false) {
+        row.cells.evidence = { kind: "undet", note: "檢索未完整" };
+      } else if (assessment.evidence_status === "supported") {
         row.cells.evidence = { kind: "ok", note: "有佐證" };
       } else if (assessment.evidence_status === "unreadable") {
         row.cells.evidence = { kind: "undet", note: "文件無法解析" };

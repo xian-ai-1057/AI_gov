@@ -11,12 +11,12 @@ flowchart LR
     A --> C["保留位置的 SourceUnit chunks"]
     S --> R["規則與階段篩選"]
     C --> H["BM25-like + optional embedding top-k"]
-    R --> B["依 review profile 動態組批"]
+    R --> B["依 review profile + 完整 context 預算動態組批"]
     H --> B
     P["PromptGateway 固定版本"] --> B
     B --> L["主要 LLM：內容 + 證據一致性"]
     L --> E{"低信心／來源衝突？"}
-    E -->|是| X["escalation"]
+    E -->|是| X["分批 escalation"]
     E -->|否| O["item_assessments"]
     X --> O
     O --> Q["decision_status + citations + usage"]
@@ -24,6 +24,8 @@ flowchart LR
 
 `F01`、`F02`、`F03` 主表不交給 `ts_parser`。單一佐證文件解析失敗只影響該文件，規則與其他
 文件繼續執行；`unreadable`、`not_found` 與 `contradicted` 是不同語意。
+若 bounded embedding 未涵蓋全文，空結果使用 backend-only 的 `unknown`，表示檢索不完整而不是
+已證明沒有佐證。
 
 ## API
 
@@ -51,7 +53,8 @@ flowchart LR
 
 - `decision_status`: `approved | changes_required | manual_review | incomplete`
   （唯一的通過訊號；刻意不回 `passed`，避免兩個訊號互相矛盾）。
-- `item_assessments`: 每一 F03 項目的完整性、合理性、證據、衝突、**法規符合性**、信心、引用與建議。
+- `item_assessments`: 每一 F03 項目的完整性、合理性、證據、`retrieval_complete`、衝突、
+  **法規符合性**、信心、引用與建議。
 - `checklist_roster`: 全部檢核項的涵蓋狀態（含未送判讀者）。
 - `document_statuses`: 去除內容後的 parser 狀態與版本資訊。
 - `citations`: 所有有效引用的扁平集合。
@@ -69,6 +72,10 @@ schema version 與最低應用版本。每次 review run 重新解析 mutable la
 
 Prompt 平台的 model 與 optional parameters 不會傳入 Chat client。模型、temperature、timeout、
 重試、circuit breaker 與 JSON schema 都由應用程式控制。正式上線前呼叫：
+
+Chat client 另以部署設定的 context window、輸出預留與安全邊界做送出前預檢；primary 與
+escalation 都按完整 rendered prompt 分批。context 400 或輸出截斷只會縮小該批重試，不會將
+前一批 prompt 累積成對話歷史。
 
 ```text
 GET /api/readiness
