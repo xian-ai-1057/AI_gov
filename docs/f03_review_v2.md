@@ -25,7 +25,8 @@ flowchart LR
 `F01`、`F02`、`F03` 主表不交給 `ts_parser`。單一佐證文件解析失敗只影響該文件，規則與其他
 文件繼續執行；`unreadable`、`not_found` 與 `contradicted` 是不同語意。
 若 bounded embedding 未涵蓋全文，空結果使用 backend-only 的 `unknown`，表示檢索不完整而不是
-已證明沒有佐證。
+已證明沒有佐證。上圖 `H`（BM25-like + optional embedding top-k）的內部架構、逐步流程與各佐證
+狀態的觸發條件見 [docs/evidence_retrieval.md](evidence_retrieval.md)。
 
 ## API
 

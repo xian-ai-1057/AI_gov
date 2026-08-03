@@ -166,6 +166,9 @@ Chat 判讀會依 `GOVCHECK_LLM_CONTEXT_WINDOW_TOKENS` 的完整預算自動分�
 embedding 的 chunk 上限或端點故障使語意檢索未涵蓋全文，空結果會標成「檢索未完整」而非
 `not_found`，避免把取樣限制誤報為沒有佐證。
 
+檢索架構圖、逐步流程，以及**完整佐證／部分佐證／無佐證**的定義與觸發條件，見
+[docs/evidence_retrieval.md](docs/evidence_retrieval.md)。
+
 ---
 
 ## 日誌與稽核（地端）
