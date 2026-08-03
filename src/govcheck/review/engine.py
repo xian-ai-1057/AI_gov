@@ -401,6 +401,8 @@ def _run_f03_assessment(
         retriever = EvidenceRetriever(
             embedding_client=embedding_client,
             lexical_weight=llm_cfg.get("evidence_lexical_weight", 0.7),
+            max_content_chars=llm_cfg.get("evidence_excerpt_chars", 600),
+            max_embedding_chunks=llm_cfg.get("embedding_max_chunks", 512),
         )
         return f03_assessment.run_all(
             checklist,
@@ -408,6 +410,7 @@ def _run_f03_assessment(
             gateway,
             workflow_stage=workflow_stage,
             max_items=llm_cfg["max_items"],
+            max_batch_items=llm_cfg.get("batch_size", 8),
             top_k=llm_cfg.get("evidence_top_k", 4),
             retriever=retriever,
             retrieval_map=retrieval_map,
@@ -556,6 +559,7 @@ def _decision_status(
         "F03.PROMPT_UNAVAILABLE",
         "F03.LLM_SKIPPED",
         "F03.ASSESSMENT_TRUNCATED",  # 有檢核項根本沒送審 → 不可判為通過
+        "F03.EVIDENCE_RETRIEVAL_INCOMPLETE",
     } for f in findings):
         return DecisionStatus.MANUAL_REVIEW
     if any(f.code in {

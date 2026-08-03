@@ -52,7 +52,9 @@ def load_llm_config(path: str | None = None) -> dict:
     """回傳正規化後的 LLM 設定 dict。
 
     環境變數覆寫鍵：GOVCHECK_LLM_ENABLED / _BASE_URL / _MODEL / _API_KEY /
-    _TIMEOUT / _TEMPERATURE / _MAX_ITEMS / _MAX_OUTPUT_TOKENS / _BATCH_SIZE。
+    _TIMEOUT / _TEMPERATURE / _MAX_ITEMS / _MAX_OUTPUT_TOKENS /
+    _CONTEXT_WINDOW_TOKENS / _CONTEXT_SAFETY_MARGIN_TOKENS / _BATCH_SIZE，以及
+    GOVCHECK_EVIDENCE_* / GOVCHECK_EMBEDDING_* 系列設定。
     api_key 一律由環境變數提供。
     """
     raw = _load_yaml(str(Path(path) if path else CONFIG_PATH))
@@ -71,6 +73,18 @@ def load_llm_config(path: str | None = None) -> dict:
             raw.get("max_output_tokens"),
             int,
             4096,
+        ),
+        "context_window_tokens": _as_number(
+            os.environ.get("GOVCHECK_LLM_CONTEXT_WINDOW_TOKENS"),
+            raw.get("context_window_tokens"),
+            int,
+            30_000,
+        ),
+        "context_safety_margin_tokens": _as_number(
+            os.environ.get("GOVCHECK_LLM_CONTEXT_SAFETY_MARGIN_TOKENS"),
+            raw.get("context_safety_margin_tokens"),
+            int,
+            1_024,
         ),
         "batch_size": _as_number(os.environ.get("GOVCHECK_LLM_BATCH_SIZE"), raw.get("batch_size"), int, 8),
         "prompt_provider": os.environ.get(
@@ -95,6 +109,12 @@ def load_llm_config(path: str | None = None) -> dict:
             int,
             4,
         ),
+        "evidence_excerpt_chars": _as_number(
+            os.environ.get("GOVCHECK_EVIDENCE_EXCERPT_CHARS"),
+            raw.get("evidence_excerpt_chars"),
+            int,
+            600,
+        ),
         # 佐證檢索用的 embeddings 端點（與 chat 端點分開，通常是不同模型）。
         # api_key 只走環境變數 GOVCHECK_EMBEDDING_API_KEY，不從 YAML 讀。
         "embedding_base_url": (
@@ -112,5 +132,23 @@ def load_llm_config(path: str | None = None) -> dict:
             raw.get("embedding_timeout"),
             float,
             120.0,
+        ),
+        "embedding_batch_size": _as_number(
+            os.environ.get("GOVCHECK_EMBEDDING_BATCH_SIZE"),
+            raw.get("embedding_batch_size"),
+            int,
+            16,
+        ),
+        "embedding_max_input_chars": _as_number(
+            os.environ.get("GOVCHECK_EMBEDDING_MAX_INPUT_CHARS"),
+            raw.get("embedding_max_input_chars"),
+            int,
+            2000,
+        ),
+        "embedding_max_chunks": _as_number(
+            os.environ.get("GOVCHECK_EMBEDDING_MAX_CHUNKS"),
+            raw.get("embedding_max_chunks"),
+            int,
+            512,
         ),
     }

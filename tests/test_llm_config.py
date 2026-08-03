@@ -11,8 +11,11 @@ _ENV_KEYS = [
     "GOVCHECK_LLM_API_KEY", "GOVCHECK_LLM_TIMEOUT", "GOVCHECK_LLM_TEMPERATURE",
     "GOVCHECK_LLM_MAX_ITEMS", "GOVCHECK_LLM_BATCH_SIZE",
     "GOVCHECK_LLM_MAX_OUTPUT_TOKENS",
+    "GOVCHECK_LLM_CONTEXT_WINDOW_TOKENS", "GOVCHECK_LLM_CONTEXT_SAFETY_MARGIN_TOKENS",
     "GOVCHECK_EVIDENCE_EMBEDDING_ENABLED", "GOVCHECK_EVIDENCE_LEXICAL_WEIGHT",
-    "GOVCHECK_EVIDENCE_TOP_K",
+    "GOVCHECK_EVIDENCE_TOP_K", "GOVCHECK_EVIDENCE_EXCERPT_CHARS",
+    "GOVCHECK_EMBEDDING_BATCH_SIZE", "GOVCHECK_EMBEDDING_MAX_INPUT_CHARS",
+    "GOVCHECK_EMBEDDING_MAX_CHUNKS",
 ]
 
 
@@ -29,9 +32,15 @@ def test_defaults_from_yaml():
     assert cfg["temperature"] == 0.0
     assert cfg["max_items"] == 30
     assert cfg["max_output_tokens"] == 4096
+    assert cfg["context_window_tokens"] == 30_000
+    assert cfg["context_safety_margin_tokens"] == 1_024
     assert cfg["evidence_embedding_enabled"] is False
     assert cfg["evidence_lexical_weight"] == 0.7
     assert cfg["evidence_top_k"] == 4
+    assert cfg["evidence_excerpt_chars"] == 600
+    assert cfg["embedding_batch_size"] == 16
+    assert cfg["embedding_max_input_chars"] == 2000
+    assert cfg["embedding_max_chunks"] == 512
     assert cfg["batch_size"] == 8
     assert cfg["enabled"] is False  # Prompt provider 與核准模型就緒前預設關閉
     assert cfg["api_key"] is None
@@ -66,11 +75,23 @@ def test_valid_env_overrides():
     os.environ["GOVCHECK_LLM_TIMEOUT"] = "5"
     os.environ["GOVCHECK_LLM_MAX_ITEMS"] = "10"
     os.environ["GOVCHECK_LLM_ENABLED"] = "1"
+    os.environ["GOVCHECK_LLM_CONTEXT_WINDOW_TOKENS"] = "30000"
+    os.environ["GOVCHECK_LLM_CONTEXT_SAFETY_MARGIN_TOKENS"] = "1500"
+    os.environ["GOVCHECK_EVIDENCE_EXCERPT_CHARS"] = "700"
+    os.environ["GOVCHECK_EMBEDDING_BATCH_SIZE"] = "8"
+    os.environ["GOVCHECK_EMBEDDING_MAX_INPUT_CHARS"] = "1500"
+    os.environ["GOVCHECK_EMBEDDING_MAX_CHUNKS"] = "128"
     os.environ["GOVCHECK_LLM_BASE_URL"] = "http://internal:8000/v1/"  # 尾斜線應被去除
     cfg = load_llm_config()
     assert cfg["timeout"] == 5.0
     assert cfg["max_items"] == 10
     assert cfg["enabled"] is True
+    assert cfg["context_window_tokens"] == 30_000
+    assert cfg["context_safety_margin_tokens"] == 1_500
+    assert cfg["evidence_excerpt_chars"] == 700
+    assert cfg["embedding_batch_size"] == 8
+    assert cfg["embedding_max_input_chars"] == 1500
+    assert cfg["embedding_max_chunks"] == 128
     assert cfg["base_url"] == "http://internal:8000/v1"
 
 

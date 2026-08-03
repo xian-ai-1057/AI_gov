@@ -5,7 +5,14 @@ import json
 import pytest
 
 from govcheck.checks.llm import f03_assessment
-from govcheck.llm.client import ChatResult, LLMError
+from govcheck.llm.client import (
+    ChatResult,
+    ChatClient,
+    LLMContextLengthError,
+    LLMError,
+    LLMOutputTruncatedError,
+    estimate_chat_input_tokens,
+)
 from govcheck.review import engine
 from govcheck.models import (
     ConflictStatus,
@@ -44,7 +51,7 @@ def _gateway(
             "role": "user",
             "content": "{{workflow_stage}}{{items_json}}{{evidence_json}}"
                        "{{policy_version}}{{output_schema_version}}"
-                       "{{primary_assessments_json}}",
+                       "{{primary_assessments_json}}excerpt_id",
         }])
         for prompt_id, version in (
             ("govcheck.f03.fairness", "v1"),
@@ -91,6 +98,15 @@ def _response(
     reasonableness="sufficient",
     rubric_met=None,
 ) -> str:
+    unit = _artifact().source_units[0]
+    excerpt_id = f03_assessment._excerpt_id(f03_assessment.EvidenceHit(
+        document_id="doc1",
+        unit_id=unit.unit_id,
+        locator_type=unit.locator_type,
+        locator_value=unit.locator_value,
+        content=unit.content,
+        score=1.0,
+    ))
     return json.dumps({"results": [{
         "item_id": "1-1",
         "completeness": "complete",
@@ -98,10 +114,38 @@ def _response(
         "evidence_status": evidence,
         "conflict_status": "consistent",
         "confidence": confidence,
-        "citations": [{"document_id": "doc1", "unit_id": "doc1:1"}] if citation else [],
+        "citations": [{
+            "document_id": "doc1",
+            "unit_id": "doc1:1",
+            "excerpt_id": excerpt_id,
+        }] if citation else [],
         "recommendations": [],
         "rubric_met": rubric_met or [],
     }]})
+
+
+def _batch_response(item_ids: list[str], *, confidence: float = 0.9) -> str:
+    return json.dumps({"results": [{
+        "item_id": item_id,
+        "completeness": "complete",
+        "reasonableness": "sufficient",
+        "evidence_status": "not_found",
+        "conflict_status": "unknown",
+        "confidence": confidence,
+        "citations": [],
+        "recommendations": [],
+        "rubric_met": [],
+    } for item_id in item_ids]})
+
+
+def _fairness_checklist(item_ids: list[str], *, detail_chars: int = 0) -> F03Checklist:
+    return F03Checklist(items=[F03ChecklistItem(
+        item_id=item_id,
+        topic="公平性",
+        description=f"{item_id} 公平性檢核",
+        check_state="是",
+        evidence_proposal="說" * detail_chars or "已有具體說明",
+    ) for item_id in item_ids])
 
 
 def test_unified_assessment_returns_validated_citation_and_usage():
@@ -124,6 +168,31 @@ def test_supported_without_allowed_citation_is_downgraded():
         workflow_stage=WorkflowStage.PROPOSAL,
     )
     assert outcome.assessments[0].evidence_status is EvidenceStatus.PARTIAL
+
+
+def test_incomplete_semantic_retrieval_never_claims_evidence_not_found():
+    class IncompleteRetriever:
+        embedding_calls = 1
+        last_incomplete_query_indices = frozenset({0})
+
+        def retrieve_many(self, queries, artifacts, *, top_k=4):
+            del artifacts, top_k
+            return [[] for _ in queries]
+
+    outcome = f03_assessment.run_all(
+        _checklist(),
+        [_artifact()],
+        _gateway([_batch_response(["1-1"])]),
+        workflow_stage=WorkflowStage.PROPOSAL,
+        retriever=IncompleteRetriever(),
+    )
+
+    assert outcome.assessments[0].evidence_status is EvidenceStatus.UNKNOWN
+    assert outcome.assessments[0].retrieval_complete is False
+    codes = {finding.code for finding in outcome.findings}
+    assert "F03.EVIDENCE_RETRIEVAL_INCOMPLETE" in codes
+    assert "F03.EVIDENCE_NOT_SUPPORTED" not in codes
+    assert engine._decision_status(outcome.findings) is DecisionStatus.MANUAL_REVIEW
 
 
 @pytest.mark.parametrize(
@@ -161,6 +230,345 @@ def test_low_confidence_runs_single_escalation():
     assert outcome.assessments[0].confidence == 0.95
     assert outcome.usage.review_llm_primary_calls == 1
     assert outcome.usage.review_llm_escalation_calls == 1
+
+
+def test_full_rendered_prompt_budget_splits_primary_batches(monkeypatch):
+    monkeypatch.setattr(f03_assessment, "load_rubrics", lambda: {})
+    item_ids = ["1-1", "3-1", "3-2", "4-1"]
+    checklist = _fairness_checklist(item_ids, detail_chars=300)
+    gateway = _gateway([_batch_response([item_id]) for item_id in item_ids])
+    run = gateway.begin_run({"govcheck.f03.fairness", "govcheck.f03.escalation"})
+    rows = [(item, []) for item in checklist.items]
+    one = gateway.estimate_input_tokens(
+        run,
+        "govcheck.f03.fairness",
+        f03_assessment._variables(rows[:1], WorkflowStage.PROPOSAL, {}, {}),
+        schema=f03_assessment._BATCH_SCHEMA,
+    )
+    two = gateway.estimate_input_tokens(
+        run,
+        "govcheck.f03.fairness",
+        f03_assessment._variables(rows[:2], WorkflowStage.PROPOSAL, {}, {}),
+        schema=f03_assessment._BATCH_SCHEMA,
+    )
+    gateway.client.input_token_budget = (one + two) // 2
+
+    outcome = f03_assessment.run_all(
+        checklist, [], gateway, workflow_stage=WorkflowStage.PROPOSAL, max_batch_items=8
+    )
+
+    assert outcome.usage.review_llm_primary_calls == 4
+    assert [row.item_id for row in outcome.assessments] == item_ids
+    assert all(
+        estimate_chat_input_tokens(messages, f03_assessment._BATCH_SCHEMA)
+        <= gateway.client.input_token_budget
+        for messages in gateway.client.messages
+    )
+
+
+def test_escalation_budget_is_split_and_results_are_reassembled(monkeypatch):
+    monkeypatch.setattr(f03_assessment, "load_rubrics", lambda: {})
+    item_ids = ["1-1", "3-1", "3-2", "4-1"]
+    checklist = _fairness_checklist(item_ids)
+    common = (
+        "{{workflow_stage}}{{items_json}}{{evidence_json}}"
+        "{{policy_version}}{{output_schema_version}}excerpt_id"
+    )
+    templates = [
+        PromptTemplate.create("govcheck.f03.fairness", "v1", [
+            {"role": "user", "content": common},
+        ]),
+        PromptTemplate.create("govcheck.f03.escalation", "v1", [
+            {"role": "system", "content": "覆判規則" * 500},
+            {"role": "user", "content": common + "{{primary_assessments_json}}"},
+        ]),
+    ]
+    client = FakeClient([
+        _batch_response(item_ids, confidence=0.2),
+        *[_batch_response([item_id], confidence=0.9) for item_id in item_ids],
+    ])
+    gateway = PromptGateway(provider=StaticPromptProvider(templates), client=client)
+    run = gateway.begin_run({"govcheck.f03.fairness", "govcheck.f03.escalation"})
+    prepared = [(item, []) for item in checklist.items]
+    primary_assessments = [
+        f03_assessment.F03ItemAssessment(
+            item_id=item_id, profile="fairness", confidence=0.2
+        )
+        for item_id in item_ids
+    ]
+    one = gateway.estimate_input_tokens(
+        run,
+        "govcheck.f03.escalation",
+        f03_assessment._escalation_variables(
+            primary_assessments[:1], prepared, WorkflowStage.PROPOSAL, {}, {}
+        ),
+        schema=f03_assessment._BATCH_SCHEMA,
+    )
+    two = gateway.estimate_input_tokens(
+        run,
+        "govcheck.f03.escalation",
+        f03_assessment._escalation_variables(
+            primary_assessments[:2], prepared, WorkflowStage.PROPOSAL, {}, {}
+        ),
+        schema=f03_assessment._BATCH_SCHEMA,
+    )
+    client.input_token_budget = (one + two) // 2
+    assert gateway.estimate_input_tokens(
+        run,
+        "govcheck.f03.fairness",
+        f03_assessment._variables(prepared, WorkflowStage.PROPOSAL, {}, {}),
+        schema=f03_assessment._BATCH_SCHEMA,
+    ) <= client.input_token_budget
+
+    outcome = f03_assessment.run_all(
+        checklist, [], gateway, workflow_stage=WorkflowStage.PROPOSAL, max_batch_items=8
+    )
+
+    assert outcome.usage.review_llm_primary_calls == 1
+    assert outcome.usage.review_llm_escalation_calls == 4
+    assert [row.item_id for row in outcome.assessments] == item_ids
+    assert all(row.confidence == 0.9 for row in outcome.assessments)
+    assert all(
+        estimate_chat_input_tokens(messages, f03_assessment._BATCH_SCHEMA)
+        <= client.input_token_budget
+        for messages in client.messages
+    )
+
+
+def test_endpoint_context_error_bisects_primary_batch(monkeypatch):
+    monkeypatch.setattr(f03_assessment, "load_rubrics", lambda: {})
+    item_ids = ["1-1", "3-1", "3-2", "4-1"]
+
+    class _SplitOnceClient(FakeClient):
+        def __init__(self):
+            super().__init__([
+                _batch_response(item_ids[:2]),
+                _batch_response(item_ids[2:]),
+            ])
+            self.attempts = 0
+
+        def chat_result(self, messages, *, schema=None, temperature=None):
+            self.messages.append(messages)
+            self.attempts += 1
+            if self.attempts == 1:
+                raise LLMContextLengthError("synthetic context overflow")
+            return ChatResult(
+                self.outputs.pop(0), input_tokens=10, output_tokens=5, latency_ms=2
+            )
+
+    gateway = _gateway([])
+    gateway.client = _SplitOnceClient()
+
+    outcome = f03_assessment.run_all(
+        _fairness_checklist(item_ids),
+        [],
+        gateway,
+        workflow_stage=WorkflowStage.PROPOSAL,
+        max_batch_items=8,
+    )
+
+    assert gateway.client.attempts == 3
+    assert outcome.usage.review_llm_primary_calls == 2
+    assert [row.item_id for row in outcome.assessments] == item_ids
+
+
+def test_output_truncation_retry_counts_consumed_usage(monkeypatch):
+    monkeypatch.setattr(f03_assessment, "load_rubrics", lambda: {})
+    item_ids = ["1-1", "3-1", "3-2", "4-1"]
+
+    class _TruncateOnceClient(FakeClient):
+        def __init__(self):
+            super().__init__([
+                _batch_response(item_ids[:2]),
+                _batch_response(item_ids[2:]),
+            ])
+            self.attempts = 0
+
+        def chat_result(self, messages, *, schema=None, temperature=None):
+            self.messages.append(messages)
+            self.attempts += 1
+            if self.attempts == 1:
+                raise LLMOutputTruncatedError(
+                    "synthetic truncation",
+                    input_tokens=50,
+                    output_tokens=15,
+                    latency_ms=3,
+                )
+            return ChatResult(
+                self.outputs.pop(0), input_tokens=10, output_tokens=5, latency_ms=2
+            )
+
+    gateway = _gateway([])
+    gateway.client = _TruncateOnceClient()
+
+    outcome = f03_assessment.run_all(
+        _fairness_checklist(item_ids),
+        [],
+        gateway,
+        workflow_stage=WorkflowStage.PROPOSAL,
+        max_batch_items=8,
+    )
+
+    assert outcome.usage.review_llm_primary_calls == 3
+    assert outcome.usage.input_tokens == 70
+    assert outcome.usage.output_tokens == 25
+    assert outcome.usage.latency_ms == 7
+
+
+def test_single_oversized_item_fails_closed_without_http(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "govcheck.llm.client.requests.post",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    gateway = _gateway([])
+    gateway.client = ChatClient(
+        base_url="http://h/v1",
+        model="m",
+        max_output_tokens=20,
+        context_window_tokens=100,
+        context_safety_margin_tokens=10,
+    )
+
+    outcome = f03_assessment.run_all(
+        _checklist(), [], gateway, workflow_stage=WorkflowStage.PROPOSAL
+    )
+
+    assert calls == []
+    assert outcome.assessments[0].assessed is False
+    assert "F03.ASSESSMENT_UNDETERMINED" in {finding.code for finding in outcome.findings}
+
+
+def test_missing_primary_result_is_not_reescalated():
+    gateway = _gateway(['{"results": []}'])
+
+    outcome = f03_assessment.run_all(
+        _checklist(), [], gateway, workflow_stage=WorkflowStage.PROPOSAL
+    )
+
+    assert len(gateway.client.messages) == 1
+    assert outcome.assessments[0].assessed is False
+
+
+def test_batch_evidence_deduplicates_only_identical_source_windows():
+    item_ids = ["1-1", "3-1"]
+    items = _fairness_checklist(item_ids).items
+    shared = f03_assessment.EvidenceHit(
+        document_id="doc",
+        unit_id="u1",
+        locator_type="page",
+        locator_value="1",
+        content="完全相同的佐證摘錄",
+        score=1.0,
+    )
+    different_window = f03_assessment.EvidenceHit(
+        document_id="doc",
+        unit_id="u1",
+        locator_type="page",
+        locator_value="1",
+        content="同一來源但針對另一項目的原文摘錄",
+        score=1.0,
+    )
+
+    identical = f03_assessment._variables(
+        [(items[0], [shared]), (items[1], [shared])],
+        WorkflowStage.PROPOSAL,
+        {},
+        {},
+    )
+    distinct = f03_assessment._variables(
+        [(items[0], [shared]), (items[1], [different_window])],
+        WorkflowStage.PROPOSAL,
+        {},
+        {},
+    )
+
+    identical_payload = json.loads(identical["evidence_json"])
+    distinct_payload = json.loads(distinct["evidence_json"])
+    assert len(identical_payload) == 1
+    assert identical_payload[0]["item_ids"] == item_ids
+    assert identical_payload[0]["excerpt_id"]
+    assert len(distinct_payload) == 2
+    assert distinct_payload[0]["item_ids"] == ["1-1"]
+    assert distinct_payload[1]["item_ids"] == ["3-1"]
+    assert distinct_payload[0]["excerpt_id"] != distinct_payload[1]["excerpt_id"]
+
+
+def test_citations_require_exact_excerpt_id():
+    items = _fairness_checklist(["1-1", "3-1"]).items
+    first = f03_assessment.EvidenceHit(
+        document_id="doc",
+        unit_id="u1",
+        locator_type="page",
+        locator_value="1",
+        content="第一項的佐證視窗",
+        score=1.0,
+    )
+    second = f03_assessment.EvidenceHit(
+        document_id="doc",
+        unit_id="u1",
+        locator_type="page",
+        locator_value="1",
+        content="第二項的不同佐證視窗",
+        score=1.0,
+    )
+    batch = [(items[0], [first]), (items[1], [second])]
+    base = {
+        "completeness": "complete",
+        "reasonableness": "sufficient",
+        "evidence_status": "supported",
+        "conflict_status": "consistent",
+        "confidence": 0.9,
+        "recommendations": [],
+        "rubric_met": [],
+    }
+    with pytest.raises(ValueError):
+        f03_assessment._BatchVerdict.model_validate({"results": [
+            base | {
+                "item_id": item.item_id,
+                "citations": [{"document_id": "doc", "unit_id": "u1"}],
+            }
+            for item in items
+        ]})
+
+    exact = f03_assessment._BatchVerdict.model_validate({"results": [
+        base | {
+            "item_id": item.item_id,
+            "citations": [{
+                "document_id": "doc",
+                "unit_id": "u1",
+                "excerpt_id": f03_assessment._excerpt_id(hit),
+            }],
+        }
+        for item, hit in zip(items, (first, second))
+    ]})
+
+    accepted = f03_assessment._validate_results(
+        batch, exact, [_artifact()], "prompt", "v1", {}, {}
+    )
+
+    assert [row.citations[0].quote for row in accepted] == [
+        first.content,
+        second.content,
+    ]
+
+    invalid_conflict = f03_assessment._BatchVerdict.model_validate({"results": [
+        base | {
+            "item_id": items[0].item_id,
+            "conflict_status": "conflicting_sources",
+            "citations": [{
+                "document_id": "doc",
+                "unit_id": "u1",
+                "excerpt_id": "not-an-allowed-excerpt",
+            }],
+        },
+    ]})
+    downgraded = f03_assessment._validate_results(
+        batch[:1], invalid_conflict, [_artifact()], "prompt", "v1", {}, {}
+    )
+
+    assert downgraded[0].citations == []
+    assert downgraded[0].conflict_status is ConflictStatus.UNKNOWN
 
 
 def test_unreadable_document_is_not_treated_as_not_found():

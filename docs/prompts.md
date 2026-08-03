@@ -26,8 +26,8 @@
 
 ```
 prompts/
-├── govcheck.f03.*.yaml          ← 嚴格版（label=production，預設）  version: "1"
-└── lenient/govcheck.f03.*.yaml  ← 寬鬆版（label=lenient）           version: "lenient-1"
+├── govcheck.f03.*.yaml          ← 嚴格版（label=production，預設）  version: "3"
+└── lenient/govcheck.f03.*.yaml  ← 寬鬆版（label=lenient）           version: "lenient-3"
 ```
 
 `FilePromptProvider` 先找 `<dir>/<label>/<prompt_id>.yaml`，找不到才退回 `<dir>/<prompt_id>.yaml`，
@@ -51,7 +51,7 @@ prompts/
 （初版寬鬆 prompt 缺了這個定義，實測會把「依本行既有規範辦理」判成 complete/reasonable，
 已修正。改判準後務必重跑 A/B 驗證。）
 
-版本字串刻意不同（`1` vs `lenient-1`），會寫入報告的 `prompt_refs`，
+版本字串刻意不同（`3` vs `lenient-3`），會寫入報告的 `prompt_refs`，
 可回溯每份報告是哪一套判準判的。
 
 切換方式：
@@ -116,10 +116,10 @@ prompt 判的」。忘了 bump 版本時 content_hash 仍會變，可據此察�
 | 變數 | 內容 |
 |---|---|
 | `workflow_stage` | `proposal`（提案）/ `golive`（上線） |
-| `items_json` | 待審檢核項陣列：`item_id`、`description`、`proposal`、`golive`、`allowed_citations`、`regulations` |
-| `evidence_json` | 檢索到的佐證片段：`document_id`、`unit_id`、`locator_type`、`locator_value`、`content`、`untrusted_data` |
-| `policy_version` | 目前為 `f03-policy-v1` |
-| `output_schema_version` | 目前為 `2` |
+| `items_json` | 待審檢核項陣列：`item_id`、`description`、`proposal`、`golive`、`allowed_citations`（含 `excerpt_id`）、`regulations` |
+| `evidence_json` | 檢索到的佐證片段：`item_ids`、`document_id`、`unit_id`、`excerpt_id`、`locator_type`、`locator_value`、`content`、`untrusted_data` |
+| `policy_version` | 目前為 `f03-policy-v2` |
+| `output_schema_version` | 目前為 `3` |
 
 `regulations` 是該項對應的法規條文摘錄（`ref` 條號、`title`、`excerpt`），來自凍結對照表
 `data/rag/retrieval_map.json`。它是**審查基準**、可信；與 `evidence`（提案單位提交、標記
@@ -140,7 +140,8 @@ prompt 判的」。忘了 bump 版本時 content_hash 仍會變，可據此察�
   "evidence_status": "supported|partial|not_found|unreadable",
   "conflict_status": "consistent|contradicted|conflicting_sources|unknown",
   "regulation_gap": "covered|gap|undetermined", "gap_refs": ["R03 五、(二) 2"],
-  "confidence": 0.0, "citations": [{"document_id": "...", "unit_id": "..."}],
+  "confidence": 0.0, "citations": [{"document_id": "...", "unit_id": "...",
+  "excerpt_id": "..."}],
   "recommendations": ["..."]}]}
 ```
 
@@ -149,15 +150,36 @@ prompt 判的」。忘了 bump 版本時 content_hash 仍會變，可據此察�
 ### 應用層的後置防護（prompt 之外仍會擋）
 
 - citations 逐筆比對該項的 `allowed_citations`，**對不上就丟掉**（模型無法自創引用）。
+  同一 document/unit 在本批出現多個原文視窗時，必須同時回傳正確 `excerpt_id`；缺少就丟掉。
 - `evidence_status=supported` 但引用全被丟掉 → 自動降級為 `partial`；無佐證時降為
-  `not_found` 或 `unreadable`。
+  `not_found` 或 `unreadable`。若有設定 embedding、但語意檢索因 chunk 上限或端點故障未涵蓋全文，
+  應用層會再改為 backend-only 的 `unknown`，不可把有限取樣解讀成「沒有佐證」。
 - `conflict_status=contradicted` 但無有效引用 → 降級為 `unknown`。
 - 該項 `regulations` 為空 → `regulation_gap` 一律降為 `undetermined`（沒有基準就不下結論）。
 - 報告顯示的條號**只由 canonical `section_path` 推導**；`gap_refs` 僅作交集過濾，
   模型自創的條號對不上就整批忽略、退回列出全部 canonical 引用。
-- `confidence < 0.6` 或 `conflicting_sources` → 觸發一次 escalation 覆判，且該結果不進快取。
+- `confidence < 0.6` 或 `conflicting_sources` → 觸發一次 escalation 覆判階段；覆判後仍低信心／
+  衝突者不進快取，達門檻的最終結果可快取，且 key 包含 escalation prompt 的版本與雜湊。
 
 這些是防線不是替代品：prompt 仍應明確要求模型遵守同樣的規則，否則會產生大量被丟棄的引用。
+
+## Context 預算與分批
+
+每次請求的可用輸入預算為 `context_window_tokens - max_output_tokens - safety_margin`。
+`PromptGateway` 以完整 rendered messages 與 response schema 做保守估算；primary 與 escalation 都按
+此預算及 `batch_size` 分批。端點若仍回報 context 超限，該批會自動二分重試；單一項目仍超限時
+安全降級為未判讀，不會把超大請求反覆送出。
+
+佐證原文先切成有字數上限的**連續原文視窗**，再依每個檢核項的查詢排序；semantic retrieval 會直接對這些
+視窗做 embedding，並將同一個命中視窗送給判讀模型。相同原文視窗才會在 batch 內去重，且
+`item_ids` 保留它所屬的檢核項，避免同一 source unit 的不同摘錄在批次內互相誤用。這裡刻意
+不使用生成式摘要，避免摘要模型在正式判讀前改寫或漏掉衝突證據。輸出側也會依
+`max_output_tokens` 限制每批項目數；若端點回 `finish_reason=length`，同樣以較小批次重試。
+
+BM25-like 以兩次串流掃描計算全 corpus 的詞頻與分數，不會把所有 chunks/terms 同時留在記憶體；
+每題只保留最高分的有界候選池。Embedding 另有單批筆數、單筆字數與 chunk 總上限；端點若回
+context 400，該 HTTP batch 會自動二分重試。受 chunk 上限限制時，詞面仍會掃描全文；但未抽中的
+純語意命中無法被排除，因此空結果會標成 `unknown` 並要求人工覆核，不會誤報 `not_found`。
 
 ## 撰寫要點
 

@@ -34,7 +34,7 @@ class FakeClient:
 
 def _template(prompt_id: str, version: str = "7") -> PromptTemplate:
     return PromptTemplate.create(prompt_id, version, [
-        {"role": "system", "content": "synthetic test prompt"},
+        {"role": "system", "content": "synthetic test prompt excerpt_id"},
         {"role": "user", "content": (
             "{{items_json}}|{{evidence_json}}|{{workflow_stage}}|"
             "{{policy_version}}|{{output_schema_version}}"
@@ -48,7 +48,7 @@ def _variables() -> dict[str, object]:
         "items_json": "[]",
         "evidence_json": "[]",
         "policy_version": "test",
-        "output_schema_version": "2",
+        "output_schema_version": "3",
     }
 
 
@@ -73,9 +73,28 @@ def test_gateway_pins_version_renders_and_collects_usage():
     _, usage = gateway.execute(run, prompt_id, _variables(), schema={"type": "object"})
 
     assert run.refs[0].prompt_version == "7"
-    assert client.messages[0][1]["content"] == "[]|[]|proposal|test|2"
+    assert client.messages[0][1]["content"] == "[]|[]|proposal|test|3"
     assert usage.review_llm_primary_calls == 1
     assert usage.input_tokens == 11 and usage.output_tokens == 3
+
+
+def test_gateway_budget_uses_the_exact_rendered_messages_and_schema():
+    prompt_id = "govcheck.f03.fairness"
+    client = FakeClient()
+    gateway = PromptGateway(
+        provider=StaticPromptProvider([_template(prompt_id)]),
+        client=client,
+    )
+    run = gateway.begin_run({prompt_id})
+
+    rendered = gateway.render_messages(run, prompt_id, _variables())
+    estimate = gateway.estimate_input_tokens(
+        run, prompt_id, _variables(), schema={"type": "object"}
+    )
+    gateway.execute(run, prompt_id, _variables(), schema={"type": "object"})
+
+    assert client.messages[0] == rendered
+    assert estimate > len(rendered[-1]["content"])
 
 
 def test_gateway_rejects_missing_prompt_variables():
@@ -98,6 +117,23 @@ def test_readiness_rejects_template_contract_with_missing_variables():
         provider=StaticPromptProvider([template]),
         client=FakeClient(),
         catalog=PromptCatalog(),
+    )
+
+    assert gateway.readiness()[prompt_id] == "unavailable:PromptUnavailable"
+
+
+def test_readiness_rejects_schema_v3_prompt_without_excerpt_id_contract():
+    prompt_id = "govcheck.f03.fairness"
+    template = PromptTemplate.create(prompt_id, "legacy", [{
+        "role": "user",
+        "content": (
+            "{{items_json}}{{evidence_json}}{{workflow_stage}}"
+            "{{policy_version}}{{output_schema_version}}"
+        ),
+    }])
+    gateway = PromptGateway(
+        provider=StaticPromptProvider([template]),
+        client=FakeClient(),
     )
 
     assert gateway.readiness()[prompt_id] == "unavailable:PromptUnavailable"
@@ -149,7 +185,7 @@ def test_null_provider_is_explicitly_unavailable():
 def _write_prompt_file(directory, prompt_id: str, *, version: str = "1", body: str = "hi") -> None:
     (directory / f"{prompt_id}.yaml").write_text(
         "prompt_id: {}\nversion: \"{}\"\nmessages:\n"
-        "  - role: system\n    content: |\n      {}\n"
+        "  - role: system\n    content: |\n      {} excerpt_id\n"
         "  - role: user\n    content: |\n"
         "      {{{{items_json}}}}|{{{{evidence_json}}}}|{{{{workflow_stage}}}}|"
         "{{{{policy_version}}}}|{{{{output_schema_version}}}}\n".format(
@@ -169,7 +205,7 @@ def test_file_provider_pins_declared_version_and_satisfies_contract(tmp_path):
     run = gateway.begin_run({prompt_id})
 
     assert run.refs[0].prompt_version == "3"
-    assert run.refs[0].schema_version == "f03-assessment-v2"
+    assert run.refs[0].schema_version == "f03-assessment-v3"
 
 
 def test_file_provider_reloads_after_edit(tmp_path):

@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 import requests
 
-from govcheck.llm.client import ChatClient, LLMError, parse_json_object
+from govcheck.llm.client import (
+    ChatClient,
+    LLMContextLengthError,
+    LLMError,
+    LLMOutputTruncatedError,
+    estimate_chat_input_tokens,
+    parse_json_object,
+)
 from govcheck.logging_setup import load_log_config, set_request_id, setup_logging
 
 
@@ -111,6 +118,75 @@ def test_from_config_builds_client():
         "base_url": "http://h/v1", "model": "m", "api_key": None, "timeout": 5, "temperature": 0,
     })
     assert c.endpoint == "http://h/v1/chat/completions"
+
+
+def test_local_context_preflight_blocks_oversized_request_without_http(monkeypatch):
+    calls = []
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: calls.append((args, kwargs)))
+    client = ChatClient(
+        base_url="http://h/v1",
+        model="m",
+        max_output_tokens=20,
+        context_window_tokens=100,
+        context_safety_margin_tokens=10,
+    )
+
+    with pytest.raises(LLMContextLengthError, match="context 預算"):
+        client.chat([{"role": "user", "content": "超長內容" * 100}])
+
+    assert calls == []
+
+
+def test_endpoint_context_error_is_typed_and_does_not_open_circuit(monkeypatch):
+    calls = 0
+
+    def context_error(url, **kwargs):
+        nonlocal calls
+        calls += 1
+        return _Resp(400, {"error": {
+            "message": "This model's maximum context length is 100 tokens; reduce input tokens",
+            "type": "BadRequestError",
+            "param": "input_tokens",
+            "code": 400,
+        }})
+
+    monkeypatch.setattr(requests, "post", context_error)
+    client = ChatClient(
+        base_url="http://h/v1", model="m", circuit_failures=1, max_retries=0
+    )
+
+    for _ in range(2):
+        with pytest.raises(LLMContextLengthError):
+            client.chat([{"role": "user", "content": "small"}])
+
+    assert calls == 2
+
+
+def test_input_estimate_counts_multibyte_text_and_schema():
+    plain = estimate_chat_input_tokens([{"role": "user", "content": "abc"}])
+    chinese = estimate_chat_input_tokens([{"role": "user", "content": "治理治理治理"}])
+    structured = estimate_chat_input_tokens(
+        [{"role": "user", "content": "abc"}], {"type": "object"}
+    )
+
+    assert chinese > plain
+    assert structured > plain
+
+
+def test_finish_reason_length_raises_typed_truncation(monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda url, **kwargs: _Resp(200, {
+        "choices": [{"message": {"content": '{"partial":'}, "finish_reason": "length"}],
+        "usage": {"prompt_tokens": 123, "completion_tokens": 45},
+    }))
+
+    with pytest.raises(LLMOutputTruncatedError) as raised:
+        ChatClient(base_url="http://h/v1", model="m").chat([
+            {"role": "user", "content": "small"}
+        ])
+
+    assert raised.value.input_tokens == 123
+    assert raised.value.output_tokens == 45
+    assert raised.value.latency_ms >= 0
 
 
 # --- parse_json_object ---
