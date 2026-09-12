@@ -43,11 +43,23 @@ uv run pytest                                    # 跑測試（全綠才算就�
 uv run uvicorn govcheck.web.api:app --port 8501  # 啟動 → http://localhost:8501
 ```
 
+## 平行專案
+
+本專案是四個獨立 repo 之一，全部位於 `/Users/xian/Documents/00_CODE/Taishin/` 之下：
+
+| 專案 | 關係 |
+|---|---|
+| `../ts_solution` 能力目錄 | 消費本專案匯出的治理紀錄（`schema_version 1`） |
+| `../usage_attribution` 用量歸戶 | 與本專案無直接往來 |
+| `../FileProcess` 文件解析 | 本專案以 HTTP 呼叫它解析佐證；解析器 bug 只在那邊修 |
+
+專案間的介面與目標形狀見 `../AI治理平台/README.md`。
+
 佐證文件（PDF / Word / PowerPoint / Outlook .msg / zip）的解析**不在本專案內**，交由同機的
 **FileProcess 服務**處理（`/Users/xian/Documents/00_CODE/Taishin/FileProcess`，port 3322）：
 
 ```bash
-cd ../../FileProcess && .venv/bin/python main.py   # 啟動解析服務 → http://localhost:3322/health
+cd ../FileProcess && .venv/bin/python main.py    # 啟動解析服務 → http://localhost:3322/health
 ```
 
 未啟動時規則檢查照常，佐證一律標 `parser_unavailable`，語意判讀與協填會如實降級。
@@ -247,7 +259,8 @@ export GOVCHECK_OPERATOR=alice       # 稽核「操作者」欄（目前無登�
 
 ```bash
 uv run python scripts/export_governance_records.py     # → output/governance_records.json
-# 接著在 ts_solution：python3 poc/cli.py governance import ../gov_doc/output/governance_records.json
+# 接著在平行的 ts_solution repo：
+# python3 poc/cli.py governance import ../gov_doc/output/governance_records.json
 ```
 
 契約見 `src/govcheck/report/governance_export.py`（schema_version 1）。內容只有識別資訊與計數，
