@@ -83,6 +83,7 @@ govcheck/
 uv sync --extra dev                            # 安裝依賴
 uv run python scripts/extract_f02_scoring.py   # （重）產出 F02 計分 config
 uv run pytest                                  # 跑測試（須全綠才收工）
+uv run pytest -m "not local_data"             # 只跑不需 data/original 的部分（等同 CI）
 uv run ruff check src tests scripts           # lint
 uv run python tests/golden/generate_snapshot.py  # 規則側 golden 基準（改動規則輸出才需重產）
 uv run uvicorn govcheck.web.api:app --port 8501  # 啟動 Web 介面 → http://localhost:8501
