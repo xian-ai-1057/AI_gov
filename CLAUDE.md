@@ -18,6 +18,9 @@
 1. 文件是否填錯（規則）2. 風險評級是否算錯（規則）3. 敘述是否滿足需求（LLM）
 4. 專案內容是否合規（LLM + 規則）5. 產出綜合報告。
 
+**提案單位端**只有一項：**AI 協填**（`assist/`）——依提案者上傳的佐證產出「填寫建議書」
+（欄位 → 建議 → 出處 → 信心），**不代填 Excel、不憑空生成**（引用限 allow-list，對不上即降為未涵蓋）。
+
 需求 3 與 4 在**同一次模型呼叫**判完（`checks/llm/f03_assessment.py`）：兩者看同一段文字，
 拆開會讓每項判讀兩次、等待加倍、結論互相矛盾。介面只有一套（FastAPI + `web/` 靜態前端）。
 
@@ -26,7 +29,9 @@
 ## 技術棧
 
 Python 3.12、FastAPI + 靜態前端（vanilla JS）、Pydantic v2、pandas（讀表）+ openpyxl（公式/儲存格層級）、
-PyYAML、pdfplumber/python-docx（佐證）、pytest。**uv** 管理依賴。
+PyYAML、pytest。**uv** 管理依賴。**佐證文件解析不在本專案內**：`parsers/supporting.py` 只做安全預檢，
+再以 HTTP 送到同機的 FileProcess 服務（`/Users/xian/Documents/00_CODE/Taishin/FileProcess`，port 3322）；
+本專案**不保留任何解析程式快照**，解析 bug 一律修在 FileProcess。
 embedding/LLM 統一走 requests + OpenAI 相容端點（/embeddings、/chat/completions；
 內部/地端端點，本機 dev 用 ollama）。
 
@@ -40,11 +45,14 @@ embedding/LLM 統一走 requests + OpenAI 相容端點（/embeddings、/chat/com
 AI治理/
 ├── pyproject.toml / uv.lock        # uv 管理
 ├── scripts/extract_f02_scoring.py  # 建置第一步：解析官方 .xlsm 公式 → 計分 config
+├── scripts/extract_form_fields.py  # 建置：官方範本欄位目錄 → data/rag/form_fields.json（協填用，不入庫）
+├── scripts/export_governance_records.py  # 稽核 log + 覆核決定 → output/governance_records.json（給能力目錄）
 ├── src/govcheck/
 │   ├── config/                     # f02_scoring.yaml（勿手改，重跑腳本產生）/ llm / log / review / parser
 │   ├── logging_setup.py            # 地端 log：ops(govcheck.log)+稽核(audit.log) 雙管線；profile 控細節程度
 │   ├── models/                     # F01/F02/F03 Form、Finding、ReviewReport、evidence (Pydantic v2)
-│   ├── parsers/                    # f01/f02/f03 主表 + supporting（佐證文件，走 ts_parser）
+│   ├── parsers/                    # f01/f02/f03 主表 + supporting（佐證文件：預檢 → HTTP → FileProcess）
+│   ├── assist/                     # 提案者協填：欄位目錄 / 建議引擎（引用 allow-list 驗證）
 │   ├── scoring/f02_score.py        # 還原 Excel 公式：加總→加成→百分比→MAX→分級        ← 需求 2
 │   ├── regulations/                # 凍結法規對照表：mapping / models / config（runtime 只讀 JSON）
 │   ├── evidence/retrieval.py       # 佐證片段混合檢索（BM25-like + 選用 embedding）
@@ -56,13 +64,15 @@ AI治理/
 │   │   └── llm/f03_assessment.py   # 內容 + 佐證 + 法規符合性一次判完                    ← 需求 3、4
 │   ├── review/engine.py            # 編排：parse → 跑 checks → 匯總
 │   ├── report/builder.py           # ReviewReport → Markdown                            ← 需求 5
-│   └── web/api.py                  # FastAPI：POST /api/review + GET /api/readiness（介面層，零判讀邏輯）
-├── src/ts_parser/                  # 內嵌的上游佐證 parser（整合邊界）
+│   ├── report/assist_builder.py    # AssistResult → 填寫建議書 Markdown
+│   ├── report/governance_export.py # 只讀 audit.log／decisions → 交接契約（識別資訊與計數，無內文）
+│   └── web/api.py                  # FastAPI：/api/review、/api/assist/suggest、/api/readiness（介面層，零判讀邏輯）
 ├── web/                            # 唯一前端（index.html/styles.css/app.js）
-├── docs/                           # architecture / f03_review_v2 / prompts / ts_parser_source
+├── docs/                           # architecture / f03_review_v2 / prompts / evidence_retrieval
 ├── tests/                          # 計分還原 + 規則正反例（真檔生成 fixture，皆有 ground truth）
 ├── data/original/                  # 唯讀來源（PDF/xlsx 模板）；gitignore，禁寫入、禁入庫
 ├── data/rag/retrieval_map.json     # 凍結法規對照表（gitignore；缺檔→ REGULATION.MAP_UNAVAILABLE）
+├── data/rag/form_fields.json       # 表單欄位目錄（gitignore；缺檔→ ASSIST.FIELDS_UNAVAILABLE）
 ├── prompts/                        # 判讀 prompt YAML（gitignore；缺檔→ F03.PROMPT_UNAVAILABLE）
 └── _Archive/rag_build/             # 封存的法規索引建置管線（法規改版時取回重跑）
 ```
@@ -117,7 +127,8 @@ uv run uvicorn govcheck.web.api:app --port 8501  # 啟動 Web 介面 → http://
   - **唯一例外（dev-only 除錯）**：`dev` profile 時 `dump_llm_raw()` 會把 LLM request/response 全文
     存到 `logs/llm_raw/`（gitignored）供解 JSON 解析失敗除錯；終端只印截斷版。prod / quiet **完全不寫**。
     僅限本機 ollama、無真實送件資料的情境；上線環境勿設 `GOVCHECK_LOG_PROFILE=dev`。
-- ❌ 把 `data/rag/retrieval_map.json`（法規原文摘錄）或 `prompts/*.yaml`（判準衍生自治理辦法）入庫。
+- ❌ 把 `data/rag/retrieval_map.json`（法規原文摘錄）、`data/rag/form_fields.json`（範本用語）或 `prompts/*.yaml`（判準衍生自治理辦法）入庫。
+- ❌ 在本專案內重新實作或快照佐證解析器（pptx/msg/zip…）；一律呼叫 FileProcess 服務，主機必須在核准清單內。
   兩者皆已 gitignore；新環境靠另外佈署，缺檔時程式自動降級並在報告明示。
 
 ### Git / 推送守則

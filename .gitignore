@@ -33,6 +33,12 @@ data/original
 data/samples/
 data/ui_redesign/
 
+# 上線校準案例（去識別後仍衍生自真實送件包，僅本機留存，不入庫）
+data/calibration/
+
+# 使用說明書等 Office 二進位（含操作截圖，可能帶真實送件畫面；僅本機／內部共享，不入庫）
+docs/*.docx
+
 # 提交者上傳的審查資料（含敏感內容，禁止入庫）
 uploads/
 output/
@@ -53,6 +59,9 @@ logs/
 
 # 本機試打外部模型 API 的臨時腳本（會外送公有雲，絕不可入庫或當成專案程式執行）
 /gemini.py
+
+# 交付後即失效的施工計畫草稿（正式設計寫進 docs/；歷史草稿封存到 _Archive/plans/）
+/plan.md
 
 # Claude Code 本機設定（含機器專屬路徑與個人授權清單）；launch.json 團隊共用故不忽略
 .claude/settings.local.json
