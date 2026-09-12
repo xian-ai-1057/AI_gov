@@ -66,6 +66,15 @@ def _no_regulation_map(monkeypatch):
     monkeypatch.setenv("GOVCHECK_REGULATIONS_MAPPING_PATH", "/nonexistent/retrieval_map.json")
 
 
+@pytest.fixture(autouse=True)
+def _offline_fileprocess(fake_fileprocess):
+    """佐證解析走 FileProcess HTTP；本檔所有 case 一律用假端點（tests/conftest.py），不出網。
+
+    需要注入狀態碼／例外／chunks 的 case 直接再宣告 ``fake_fileprocess`` 參數即可拿到同一物件。
+    """
+    return fake_fileprocess
+
+
 def _pdf(name: str = "佐證.pdf") -> tuple:
     return ("supporting", (name, b"%PDF-1.4 fake", "application/pdf"))
 
@@ -235,8 +244,10 @@ def test_review_returns_structured_metadata():
     assert body["document_statuses"][0]["status"] == "parsed"
     assert "source_units" not in body["document_statuses"][0]
     assert set(body["usage_summary"]) >= {
-        "parser_vlm_calls", "review_llm_primary_calls", "cache_hits"
+        "parser_remote_calls", "parser_vlm_calls", "review_llm_primary_calls", "cache_hits"
     }
+    assert body["usage_summary"]["parser_remote_calls"] == 1
+    assert body["review_run_meta"]["parser_source_commit"] == "fileprocess@localhost"
 
 
 def test_review_default_stage_is_proposal():

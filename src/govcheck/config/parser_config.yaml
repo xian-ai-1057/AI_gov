@@ -1,3 +1,5 @@
+# 佐證文件解析設定：一律交給 FileProcess 服務（HTTP，localhost）解析；本專案不內嵌解析程式。
+# 環境變數 GOVCHECK_PARSER_* 會覆寫本檔（見 .env.example）。
 enabled_formats:
   - .pdf
   - .docx
@@ -6,16 +8,16 @@ enabled_formats:
   - .csv
   - .tsv
   - .md
-word_strategy: auto
-model_host:
+  - .pptx
+  - .msg
+  - .zip
+# FileProcess 服務位址；主機必須在 approved_model_hosts 內，否則不發請求（佐證不出本機）
+fileprocess_url: http://localhost:3322
 approved_model_hosts: [localhost, 127.0.0.1]
-request_timeout: 60
+# 單一文件解析請求逾時（秒）；.msg 含附件遞迴、.zip 多檔會比較久
+fileprocess_timeout: 120
 max_file_bytes: 52428800
+# 單一文件回傳的 chunk 數上限（一頁／一張工作表／一個附件段落＝一個 chunk）
 max_pages: 200
 max_zip_uncompressed_bytes: 209715200
 max_zip_ratio: 100
-temp_root:
-ocr_enabled: false
-vlm_enabled: false
-persistent_log_enabled: false
-

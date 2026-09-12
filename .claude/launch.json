@@ -12,6 +12,13 @@
       "runtimeExecutable": "uv",
       "runtimeArgs": ["run", "uvicorn", "govcheck.web.api:app", "--port", "8501"],
       "port": 8501
+    },
+    {
+      "name": "fileprocess",
+      "runtimeExecutable": "/Users/xian/Documents/00_CODE/Taishin/FileProcess/.venv/bin/python",
+      "runtimeArgs": ["main.py"],
+      "cwd": "/Users/xian/Documents/00_CODE/Taishin/FileProcess",
+      "port": 3322
     }
   ]
 }

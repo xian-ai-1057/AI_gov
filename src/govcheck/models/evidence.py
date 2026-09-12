@@ -66,7 +66,7 @@ class DocumentArtifact(BaseModel):
     document_id: str
     filename_hash: str
     media_type: str
-    parser_name: str = "ts_parser"
+    parser_name: str = "fileprocess"
     parser_source_commit: str = "snapshot-unversioned"
     parser_config_hash: str
     status: DocumentParseStatus
@@ -129,9 +129,11 @@ class F03ItemAssessment(BaseModel):
 
 
 class UsageSummary(BaseModel):
-    # parser_*_calls 計的是「需要視覺模型的解析需求次數」，含端點未啟用/未核准而
-    # fail closed、實際未外送的情形（見 parsers/supporting.py 與其測試）。
-    # 要判斷是否真的有外送，請看 DocumentArtifact.status 是否為 PARSER_UNAVAILABLE。
+    # parser_remote_calls：實際送往 FileProcess 服務（localhost HTTP）的解析請求次數；
+    # 主機未核准而 fail closed 的文件不計（見 parsers/supporting.py 與其測試）。
+    parser_remote_calls: int = 0
+    # parser_ocr_calls / parser_vlm_calls：舊 ts_parser 時代的欄位，保留以維持報告契約，
+    # 現已不再遞增（影像 OCR／VLM 不在本專案範圍）。
     parser_ocr_calls: int = 0
     parser_vlm_calls: int = 0
     evidence_embedding_calls: int = 0
