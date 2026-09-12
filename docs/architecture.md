@@ -22,6 +22,7 @@ flowchart TB
     FE -.->|"零判讀邏輯，純呈現"| API
 
     API --> PARSERS["parsers/<br/>主表 parser + TsParserAdapter"]
+    PARSERS -->|"POST /api/parse（僅核准主機）"| FP["FileProcess 服務<br/>（HTTP，localhost:3322）"]
     PARSERS --> MODELS["models/<br/>Form · DocumentArtifact · Assessment · Finding"]
 
     MODELS --> ENGINE["review/engine.py<br/>編排：parse → checks → 彙總"]
@@ -92,6 +93,11 @@ flowchart LR
 ---
 
 ## 3. 佐證檢索（evidence/）
+
+佐證文件解析不在本專案內：`parsers/supporting.py`（`TsParserAdapter`）只做本機預檢與主機核准，
+再以 HTTP 把檔案交給 **FileProcess 服務（HTTP，localhost）** 解析（`POST /api/parse`），把回應的
+chunks 對映成 `SourceUnit`；解析失敗只降級該份佐證，規則檢查照常。契約與狀態對映見
+[docs/f03_review_v2.md](f03_review_v2.md)。
 
 上圖 `evidence/` 這一個方塊自成一條子管線：佐證文件解析 → 連續原文視窗切塊 →
 BM25-like（＋選用 embedding）混合排序 → 絕對相關性門檻 → 每項 top-k → 送模型 →

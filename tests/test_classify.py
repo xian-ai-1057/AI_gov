@@ -41,6 +41,12 @@ requires_templates = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _offline_fileprocess(fake_fileprocess):
+    """review_files 會把佐證送 FileProcess（HTTP）；本檔一律用 tests/conftest.py 的假端點，不出網。"""
+    return fake_fileprocess
+
+
 def _codes(report) -> set[str]:
     return {finding.code for finding in report.findings}
 
