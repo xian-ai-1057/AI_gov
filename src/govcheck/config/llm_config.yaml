@@ -6,7 +6,7 @@
 # GOVCHECK_EVIDENCE_LEXICAL_WEIGHT / GOVCHECK_EVIDENCE_TOP_K / GOVCHECK_EVIDENCE_EXCERPT_CHARS /
 # GOVCHECK_EMBEDDING_BASE_URL / GOVCHECK_EMBEDDING_MODEL / GOVCHECK_EMBEDDING_TIMEOUT /
 # GOVCHECK_EMBEDDING_BATCH_SIZE / GOVCHECK_EMBEDDING_MAX_INPUT_CHARS /
-# GOVCHECK_EMBEDDING_MAX_CHUNKS
+# GOVCHECK_EMBEDDING_MAX_CHUNKS / GOVCHECK_ASSIST_MAX_FIELDS / GOVCHECK_ASSIST_TOP_K
 
 enabled: false                       # 預設關閉；正式 Prompt 與核准模型都就緒後再開啟
 base_url: http://localhost:11434/v1  # 本機 ollama（OpenAI 相容）；內部端點請以環境變數覆寫
@@ -32,6 +32,8 @@ embedding_timeout: 120               # embeddings 請求逾時（秒）
 embedding_batch_size: 16             # 避免把所有 query/source units 合成一個無界請求
 embedding_max_input_chars: 2000      # embedding 端點單筆最後防線；佐證 source 已先切成連續小段
 embedding_max_chunks: 512            # 每次 review 向量化上限；截斷時空結果改列 unknown，不宣稱 not_found
+assist_max_fields: 80                # 提案者協填：單次最多送模型的欄位數（F01+F02+F03 全選約 72）
+assist_top_k: 4                      # 提案者協填：每個欄位最多檢索的佐證片段數（另加文件開頭池）
 
 # 法規對照表（凍結的靜態資產；建置管線已封存於 _Archive/rag_build/）。
 # 缺此區段時 load_regulations_config() 全用硬碼預設，行為一致。

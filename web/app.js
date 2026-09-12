@@ -924,7 +924,10 @@
           <div><div class="title">AI 治理審查小幫手</div>
             <div class="sub">批次上傳自動分類 · 規則檢查與語意判讀</div></div>
         </div>
-        <div class="pill"><span class="dot"></span>地端執行 · 資料不外送</div>
+        <div class="pills">
+          <a class="pill" href="/assist">AI 協填（提案單位）</a>
+          <div class="pill"><span class="dot"></span>地端執行 · 資料不外送</div>
+        </div>
       </div>
       <div class="gv-steps">${steps}</div>
     </div>`;

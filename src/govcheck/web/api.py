@@ -1,11 +1,12 @@
 """FastAPI 後端：批次分類、送件包審查、就緒查詢與靜態前端掛載。
 
-對應前端三步驟：
+對應前端三步驟（審查員端）：
   1) 一次上傳整批送件包
   2) POST /api/classify 預覽並確認自動分類
   3) POST /api/review 審查（temp 用後即刪 → 結構化報告）
 
 `/api/review` 也保留 f01/f02/f03/supporting 分欄參數，供既有呼叫端使用。
+提案單位端另有 `POST /api/assist/suggest`（佐證 → 填寫建議書）與 `/assist` 頁面。
 """
 
 from __future__ import annotations
@@ -50,6 +51,23 @@ from govcheck.review.config import load_review_config
 from govcheck.review.engine import review_routed, review_submission
 from govcheck.web import decisions as decision_store
 
+# ── 提案單位端 AI 協填 / FileProcess 就緒查詢 ─────────────────────────
+# 這些模組由其他工作流交付；缺席時只讓對應端點降級（503 / unavailable），app 仍可啟動。
+try:
+    from govcheck.assist import suggest_prefill
+    from govcheck.report.assist_builder import to_markdown as assist_to_markdown
+except ImportError:  # pragma: no cover - 模組缺席時 /api/assist/suggest 回 503
+    suggest_prefill = None
+    assist_to_markdown = None
+try:
+    from govcheck.assist.fields import load_form_fields
+except ImportError:  # pragma: no cover
+    load_form_fields = None
+try:
+    from govcheck.parsers.supporting import fileprocess_readiness
+except ImportError:  # pragma: no cover
+    fileprocess_readiness = None
+
 log = get_logger("api")
 
 # 前端靜態檔位於 repo 根的 web/（src/govcheck/web/api.py → parents[3] = repo root）
@@ -66,6 +84,10 @@ IGNORE = FileKind.IGNORED.value
 _ASSIGNABLE = (FileKind.F01, FileKind.F02, FileKind.F03, FileKind.SUPPORTING)
 KIND_OPTIONS = [{"value": kind.value, "label": KIND_LABEL[kind]} for kind in _ASSIGNABLE]
 KIND_OPTIONS.append({"value": IGNORE, "label": "忽略此檔"})
+
+# 提案單位端協填：可選的表單與 Prompt ID（readiness 只查子集，缺 assist prompt 不拖累 F03）。
+ASSIST_FORMS = ("f01", "f02", "f03")
+ASSIST_PROMPT_ID = "govcheck.assist.prefill"
 
 # 串流用戶中途離開時，worker 仍須持有 TemporaryDirectory 直到審查收尾。
 # asyncio event loop 只對 Task 保留 weak reference，故在此保留少量進行中的 task。
@@ -690,26 +712,189 @@ async def get_review_decisions(review_id: str) -> JSONResponse:
     return JSONResponse(saved or {"review_id": review_id, "decisions": {}})
 
 
-@app.get("/api/readiness")
-async def readiness() -> JSONResponse:
-    """LLM 判讀是否就緒（端點、模型、Prompt 三者齊備才算）。"""
-    cfg = load_llm_config()
-    prompts = build_prompt_gateway(ChatClient.from_config(cfg), cfg).readiness()
-    prompt_ready = bool(prompts) and all(
+# ── 提案單位端：AI 協填（填寫建議書）─────────────────────────────────
+
+
+def _parse_assist_forms(forms: str) -> list[str]:
+    """`forms` 逗號清單 → 依固定順序去重；空清單或未知表單一律 400。"""
+    wanted = [token.strip().casefold() for token in (forms or "").split(",")]
+    wanted = [token for token in wanted if token]
+    if not wanted:
+        raise HTTPException(status_code=400, detail="請至少選擇一份表單（f01 / f02 / f03）。")
+    unknown = [token for token in wanted if token not in ASSIST_FORMS]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"未知表單：{', '.join(unknown)}")
+    return [form for form in ASSIST_FORMS if form in wanted]
+
+
+def _assist_citation_dict(citation) -> dict:
+    """建議出處：沿用報告頁 locator 投影（file 只回 document_id），另附引文與片段識別。"""
+    locator = _citation_locator(citation) or {}
+    return {
+        **locator,
+        "unit_id": citation.unit_id,
+        "excerpt_id": citation.excerpt_id,
+        "quote": citation.quote or "",
+    }
+
+
+def _assist_result_dict(result) -> dict:
+    """AssistResult → 前端 payload；引用改投影成 locator dict，其餘欄位直接 dump。"""
+    suggestions = []
+    for suggestion in result.suggestions:
+        row = suggestion.model_dump(mode="json", exclude={"citations"})
+        row["citations"] = [_assist_citation_dict(c) for c in suggestion.citations]
+        suggestions.append(row)
+    return {
+        "assist_id": result.assist_id,
+        "forms": list(result.forms),
+        "mode": result.mode,
+        "suggestions": suggestions,
+        "documents": [
+            doc.model_dump(mode="json", exclude={"source_units"})
+            for doc in result.document_statuses
+        ],
+        "notices": [_finding_dict(i, f) for i, f in enumerate(result.notices)],
+        "usage": result.usage.model_dump(mode="json"),
+        "prompt_refs": [ref.model_dump(mode="json") for ref in result.prompt_refs],
+        "markdown": assist_to_markdown(result),
+    }
+
+
+@app.post("/api/assist/suggest")
+async def assist_suggest(
+    files: list[UploadFile] | None = None,
+    forms: str = Form(default="f01,f02,f03"),
+    enable_llm: bool | None = Form(default=None),
+) -> JSONResponse:
+    """依佐證文件產出「填寫建議書」（不代填 Excel）。
+
+    `files` 為 repeated 佐證上傳；`forms` 為逗號分隔的 f01/f02/f03 子集。
+    引擎本身不 raise 且已在內部寫稽核（只有計數）；這裡只包裝非預期例外為 400。
+    """
+    uploads = [upload for upload in (files or []) if upload.filename]
+    if not uploads:
+        raise HTTPException(
+            status_code=400, detail="請上傳至少一份佐證文件（簽呈、簡報、規格書或信件）。"
+        )
+    wanted = _parse_assist_forms(forms)
+    _validate_uploads(uploads)
+    if suggest_prefill is None or assist_to_markdown is None:
+        raise HTTPException(status_code=503, detail="AI 協填模組未安裝。")
+    use_llm = bool(load_llm_config()["enabled"]) if enable_llm is None else bool(enable_llm)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths = [
+            await _persist(upload, Path(tmpdir), f"sup{idx}")
+            for idx, upload in enumerate(uploads)
+        ]
+        try:
+            result = await asyncio.to_thread(
+                suggest_prefill, paths, forms=wanted, enable_llm=use_llm
+            )
+        except Exception as exc:  # noqa: BLE001 - 介面層需友善呈現解析／建議錯誤
+            log.error("assist failed: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=400, detail=f"解析或建議失敗：{type(exc).__name__}"
+            ) from exc
+    return JSONResponse(_assist_result_dict(result))
+
+
+# ── 就緒查詢 ─────────────────────────────────────────────────────────
+
+
+def _prompt_readiness(gateway, prompt_ids) -> dict[str, str]:
+    """只查一組 Prompt 的就緒狀態；舊版 gateway 不收子集參數時退回全量查詢。"""
+    try:
+        return gateway.readiness(prompt_ids)
+    except TypeError:
+        return gateway.readiness()
+
+
+def _feature_prompt_ids(gateway, feature: str) -> tuple[str, ...] | None:
+    """catalog.required_prompt_ids(feature)；舊版 catalog 沒有 feature 參數時回 None。"""
+    try:
+        return tuple(gateway.catalog.required_prompt_ids(feature))
+    except (TypeError, AttributeError):
+        return None
+
+
+def _prompts_ok(prompts: dict[str, str]) -> bool:
+    return bool(prompts) and all(
         not value.startswith("unavailable:") for value in prompts.values()
     )
+
+
+_PARSER_NOT_READY = {"backend": "fileprocess", "url_host_approved": False, "reachable": False}
+
+
+def _parser_readiness() -> dict:
+    """FileProcess 服務就緒（GET /health，短逾時）；轉接層缺席或例外時一律回未就緒。"""
+    if fileprocess_readiness is None:
+        return dict(_PARSER_NOT_READY)
+    try:
+        return dict(fileprocess_readiness())
+    except Exception as exc:  # noqa: BLE001 - readiness 只回報狀態，不中斷
+        log.warning("parser readiness failed: %s", type(exc).__name__)
+        return dict(_PARSER_NOT_READY)
+
+
+def _fields_available() -> bool:
+    if load_form_fields is None:
+        return False
+    try:
+        return load_form_fields() is not None
+    except Exception as exc:  # noqa: BLE001 - readiness 只回報狀態，不中斷
+        log.warning("form fields readiness failed: %s", type(exc).__name__)
+        return False
+
+
+@app.get("/api/readiness")
+async def readiness() -> JSONResponse:
+    """LLM 判讀是否就緒（端點、模型、Prompt 三者齊備才算）。
+
+    `ready` 維持 F03 判讀語意；`parser` 回 FileProcess 服務狀態；
+    `assist` 回提案單位端協填的 Prompt／欄位目錄／整體就緒。
+    """
+    cfg = load_llm_config()
+    gateway = build_prompt_gateway(ChatClient.from_config(cfg), cfg)
+    f03_ids = _feature_prompt_ids(gateway, "f03")
+    prompts = _prompt_readiness(gateway, f03_ids) if f03_ids else gateway.readiness()
+    prompt_ready = _prompts_ok(prompts)
     model_configured = bool(cfg.get("base_url") and cfg.get("model"))
+    llm_enabled = bool(cfg.get("enabled"))
+
+    assist_prompt = _prompt_readiness(gateway, (ASSIST_PROMPT_ID,)).get(
+        ASSIST_PROMPT_ID, "unavailable:NotRegistered"
+    )
+    fields_available = await asyncio.to_thread(_fields_available)
+    parser = await asyncio.to_thread(_parser_readiness)
     return JSONResponse({
-        "ready": bool(cfg.get("enabled") and prompt_ready and model_configured),
-        "llm_enabled": bool(cfg.get("enabled")),
+        "ready": bool(llm_enabled and prompt_ready and model_configured),
+        "llm_enabled": llm_enabled,
         "model_configured": model_configured,
         "prompts": prompts,
+        "parser": parser,
+        "assist": {
+            "prompt": assist_prompt,
+            "fields_available": fields_available,
+            "ready": bool(
+                llm_enabled and model_configured and fields_available
+                and not assist_prompt.startswith("unavailable:")
+            ),
+        },
     })
 
 
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(WEB_DIR / "index.html")
+
+
+@app.get("/assist")
+async def assist_page() -> FileResponse:
+    """提案單位端：AI 協填（填寫建議書）頁面。"""
+    return FileResponse(WEB_DIR / "assist.html")
 
 
 # 靜態前端（CSS/JS/字型）。掛在最後，避免吃掉 /api 路由。

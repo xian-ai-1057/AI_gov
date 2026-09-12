@@ -121,5 +121,9 @@ def _coverage_lines(report: ReviewReport) -> list[str]:
     return lines
 
 
-def _table_cell(value: object) -> str:
+def table_cell(value: object) -> str:
+    """Markdown 表格儲存格逸出（管線符與換行）；審查報告與協填建議書共用。"""
     return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+_table_cell = table_cell

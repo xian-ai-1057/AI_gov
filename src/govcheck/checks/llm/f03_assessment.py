@@ -19,11 +19,11 @@ import unicodedata
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Literal, TypeVar
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from govcheck.evidence import EvidenceHit, EvidenceRetriever
+from govcheck.evidence import EvidenceHit, EvidenceRetriever, excerpt_id
 from govcheck.llm.client import (
     LLMContextLengthError,
     LLMError,
@@ -52,6 +52,7 @@ from govcheck.prompts import (
     PromptGateway,
     PromptUnavailable,
     load_rubrics,
+    pack_batches,
     profile_for_item,
 )
 from govcheck.regulations.mapping import format_section_ref
@@ -65,7 +66,6 @@ _CACHE_MAX_ITEMS = 512
 _ESTIMATED_OUTPUT_TOKENS_PER_ITEM = 512
 _ASSESSMENT_CACHE: OrderedDict[str, F03ItemAssessment] = OrderedDict()
 _CACHE_LOCK = threading.Lock()
-_T = TypeVar("_T")
 
 
 class _CitationVerdict(BaseModel):
@@ -583,30 +583,8 @@ def _prepare_many(
     return list(zip(items, hits)), incomplete_item_ids
 
 
-def _pack(
-    rows: list[_T],
-    *,
-    max_items: int,
-    fits: Callable[[list[_T]], bool],
-) -> list[list[_T]]:
-    """Greedily pack rows using the exact rendered prompt budget.
-
-    A single row that does not fit is still returned as its own batch. The ChatClient preflight will
-    fail it closed without contacting the endpoint, while other rows can continue independently.
-    """
-    batches: list[list[_T]] = []
-    current: list[_T] = []
-    item_limit = max(1, max_items)
-    for row in rows:
-        candidate = [*current, row]
-        if current and (len(candidate) > item_limit or not fits(candidate)):
-            batches.append(current)
-            current = [row]
-        else:
-            current = candidate
-    if current:
-        batches.append(current)
-    return batches
+# 分批打包已上提為 prompts.gateway.pack_batches；保留舊名供既有呼叫端與測試使用。
+_pack = pack_batches
 
 
 def _variables(
@@ -809,12 +787,8 @@ def _evidence_payload(hit: EvidenceHit, *, item_ids: list[str]) -> dict:
     }
 
 
-def _excerpt_id(hit: EvidenceHit) -> str:
-    """Return a compact stable identity for one exact source window."""
-    identity = json.dumps(
-        [hit.document_id, hit.unit_id, hit.content], ensure_ascii=False, separators=(",", ":")
-    )
-    return hashlib.sha256(identity.encode()).hexdigest()[:16]
+# excerpt 識別已上提為 evidence.retrieval.excerpt_id；保留舊名供既有呼叫端與測試使用。
+_excerpt_id = excerpt_id
 
 
 def _rubric_lines(lines: list[str], met: list[bool]) -> list[RubricLine]:

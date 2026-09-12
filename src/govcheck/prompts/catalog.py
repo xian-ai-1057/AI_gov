@@ -13,6 +13,9 @@ class PromptContract:
     profiles: frozenset[str]
     minimum_app_version: str = "0.2.0"
     required_content_markers: frozenset[str] = frozenset()
+    # 所屬功能：F03 語意判讀（f03）或提案者協填（assist）。readiness 依功能分流——
+    # 協填 prompt 缺檔不得把 F03 審查拉成 not ready，反之亦然。
+    feature: str = "f03"
 
 
 _ITEM_PROFILES = {
@@ -112,6 +115,20 @@ class PromptCatalog:
             profiles=frozenset({"escalation"}),
             required_content_markers=frozenset({"excerpt_id"}),
         )
+        # 提案者協填：欄位 → 建議 → 出處。引用同樣只准來自 allow-list（excerpt_id），
+        # 佐證片段一律標 untrusted_data；prompt 必須兩者都提到，缺一即 fail closed。
+        self._contracts["govcheck.assist.prefill"] = PromptContract(
+            prompt_id="govcheck.assist.prefill",
+            required_variables=frozenset({
+                "fields_json",
+                "evidence_json",
+                "output_schema_version",
+            }),
+            schema_version="assist-prefill-v1",
+            profiles=frozenset({"prefill"}),
+            required_content_markers=frozenset({"excerpt_id", "untrusted_data"}),
+            feature="assist",
+        )
 
     def get(self, prompt_id: str) -> PromptContract:
         try:
@@ -119,5 +136,16 @@ class PromptCatalog:
         except KeyError as exc:
             raise KeyError(f"Prompt ID 未登錄：{prompt_id}") from exc
 
-    def required_prompt_ids(self) -> tuple[str, ...]:
-        return tuple(sorted(self._contracts))
+    def required_prompt_ids(self, feature: str | None = None) -> tuple[str, ...]:
+        """登錄的 prompt_id（排序）；指定 feature 只回該功能的子集。"""
+        return tuple(sorted(
+            prompt_id
+            for prompt_id, contract in self._contracts.items()
+            if feature is None or contract.feature == feature
+        ))
+
+    def f03_prompt_ids(self) -> tuple[str, ...]:
+        return self.required_prompt_ids(feature="f03")
+
+    def assist_prompt_ids(self) -> tuple[str, ...]:
+        return self.required_prompt_ids(feature="assist")

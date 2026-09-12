@@ -6,7 +6,12 @@ from govcheck.prompts.catalog import (
     profile_for_item,
     short_name_for_item,
 )
-from govcheck.prompts.gateway import PromptGateway, PromptRun, build_prompt_gateway
+from govcheck.prompts.gateway import (
+    PromptGateway,
+    PromptRun,
+    build_prompt_gateway,
+    pack_batches,
+)
 from govcheck.prompts.rubrics import load_rubrics, rubric_path
 from govcheck.prompts.providers import (
     FilePromptProvider,
@@ -32,6 +37,7 @@ __all__ = [
     "StaticPromptProvider",
     "build_prompt_gateway",
     "load_rubrics",
+    "pack_batches",
     "profile_for_item",
     "rubric_path",
     "short_name_for_item",

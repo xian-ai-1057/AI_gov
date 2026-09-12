@@ -259,9 +259,38 @@ def test_build_gateway_wires_file_provider(tmp_path, monkeypatch):
 
 
 def test_catalog_contains_all_required_prompt_ids():
-    ids = set(PromptCatalog().required_prompt_ids())
+    """F03 七個 + 協填一個；readiness 依 feature 分流，協填 prompt 缺檔不影響 F03。"""
+    catalog = PromptCatalog()
+    ids = set(catalog.required_prompt_ids())
     assert "govcheck.f03.escalation" in ids
-    assert len(ids) == 7
+    assert "govcheck.assist.prefill" in ids
+    assert len(ids) == 8
+    f03_ids = set(catalog.f03_prompt_ids())
+    assert len(f03_ids) == 7
+    assert "govcheck.assist.prefill" not in f03_ids
+    assert catalog.required_prompt_ids(feature="assist") == ("govcheck.assist.prefill",)
+    assert catalog.get("govcheck.assist.prefill").feature == "assist"
+    assert catalog.get("govcheck.f03.fairness").feature == "f03"
+
+
+def test_readiness_accepts_prompt_id_subset():
+    """只檢查指定子集；預設仍檢查全部（既有 /api/readiness 行為不變）。"""
+    template = PromptTemplate.create("govcheck.f03.fairness", "v1", [{
+        "role": "user",
+        "content": "{{workflow_stage}}{{items_json}}{{evidence_json}}"
+                   "{{policy_version}}{{output_schema_version}}excerpt_id",
+    }])
+    gateway = PromptGateway(
+        provider=StaticPromptProvider([template]),
+        client=FakeClient(),
+        catalog=PromptCatalog(),
+    )
+
+    subset = gateway.readiness(["govcheck.f03.fairness"])
+    assert subset == {"govcheck.f03.fairness": "v1"}
+    everything = gateway.readiness()
+    assert len(everything) == 8
+    assert everything["govcheck.assist.prefill"].startswith("unavailable:")
 
 
 def test_relative_prompt_dir_survives_other_working_directory(tmp_path, monkeypatch):

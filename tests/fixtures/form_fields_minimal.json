@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "_source": "tests/fixtures（合成欄位，非官方範本用語）",
+  "fields": [
+    {
+      "form": "f01",
+      "field_id": "test_a",
+      "label": "測試欄位A",
+      "description": "提出本案的單位名稱",
+      "cell": "A4",
+      "kind": "text",
+      "required": true,
+      "query_terms": ["甲方單位"]
+    },
+    {
+      "form": "f01",
+      "field_id": "test_b",
+      "label": "測試欄位B",
+      "description": "系統代碼",
+      "cell": "B4",
+      "kind": "text",
+      "required": false,
+      "query_terms": ["代碼"]
+    },
+    {
+      "form": "f02",
+      "field_id": "Q-01",
+      "label": "測試題目一",
+      "description": "",
+      "cell": "C3",
+      "kind": "yes_no",
+      "required": true,
+      "query_terms": ["客戶權益"]
+    },
+    {
+      "form": "f02",
+      "field_id": "G-01-01",
+      "label": "測試選項一",
+      "description": "測試單選題組",
+      "cell": "C5",
+      "kind": "yes_no",
+      "group": "G-01",
+      "group_kind": "single_choice",
+      "required": true,
+      "query_terms": ["人工覆核"]
+    },
+    {
+      "form": "f02",
+      "field_id": "G-01-02",
+      "label": "測試選項二",
+      "description": "測試單選題組",
+      "cell": "C6",
+      "kind": "yes_no",
+      "group": "G-01",
+      "group_kind": "single_choice",
+      "required": true,
+      "query_terms": ["自動決策"]
+    },
+    {
+      "form": "f03",
+      "field_id": "1-1",
+      "label": "測試檢核項1",
+      "description": "說明本案如何評估",
+      "cell": "I5",
+      "kind": "text",
+      "required": true,
+      "query_terms": ["評估"]
+    }
+  ]
+}

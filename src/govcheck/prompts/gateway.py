@@ -6,7 +6,9 @@ import os
 import re
 import hashlib
 import threading
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from typing import TypeVar
 
 from govcheck import __version__
 from govcheck.llm.client import (
@@ -28,10 +30,39 @@ from govcheck.prompts.providers import (
 )
 
 
+_T = TypeVar("_T")
+
+
 @dataclass(frozen=True)
 class PromptRun:
     templates: dict[str, PromptTemplate]
     refs: tuple[PromptRunRef, ...]
+
+
+def pack_batches(
+    rows: list[_T],
+    *,
+    max_items: int,
+    fits: Callable[[list[_T]], bool],
+) -> list[list[_T]]:
+    """Greedily pack rows using the exact rendered prompt budget.
+
+    A single row that does not fit is still returned as its own batch. The ChatClient preflight will
+    fail it closed without contacting the endpoint, while other rows can continue independently.
+    """
+    batches: list[list[_T]] = []
+    current: list[_T] = []
+    item_limit = max(1, max_items)
+    for row in rows:
+        candidate = [*current, row]
+        if current and (len(candidate) > item_limit or not fits(candidate)):
+            batches.append(current)
+            current = [row]
+        else:
+            current = candidate
+    if current:
+        batches.append(current)
+    return batches
 
 
 class PromptGateway:
@@ -164,9 +195,13 @@ class PromptGateway:
             run, prompt_id, variables, schema=schema
         ) <= self.input_token_budget
 
-    def readiness(self) -> dict[str, str]:
+    def readiness(self, prompt_ids: Iterable[str] | None = None) -> dict[str, str]:
+        """逐一解析 prompt；預設檢查目錄內全部，呼叫端可傳子集（例如只看 F03 或只看協填）。"""
         result = {}
-        for prompt_id in self.catalog.required_prompt_ids():
+        targets = (
+            self.catalog.required_prompt_ids() if prompt_ids is None else tuple(prompt_ids)
+        )
+        for prompt_id in targets:
             try:
                 run = self.begin_run({prompt_id})
                 result[prompt_id] = run.templates[prompt_id].version

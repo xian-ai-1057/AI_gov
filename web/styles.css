@@ -794,3 +794,43 @@ button { font-family: inherit; cursor: pointer; }
   .gv-layer.run .d, .gv-layer.running .d, .gv-overlay .spin { animation: none; }
   .caret, .gv-finding .fcaret, .gv-ref-teaser .fcaret { transition: none; }
 }
+
+/* ── 提案單位端 AI 協填（/assist）：只用既有 token；審查員端 app.js 不受影響 ── */
+.gv-header .pills { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.gv-header a.pill { text-decoration: none; }
+.gv-header a.pill:hover { filter: brightness(.95); }
+.gv-assist-forms { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 18px 0 0; }
+.gv-assist-forms .k { color: var(--muted); font-size: 13px; font-weight: 600; margin-right: 4px; }
+.gv-assist-forms label {
+  display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+  font-size: 13.5px; font-weight: 600; cursor: pointer;
+}
+.gv-assist-forms label.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.gv-assist-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 22px 0 12px; }
+.gv-mode-badge {
+  display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px;
+  border-radius: 999px; border: 1px solid; font-size: 12px; font-weight: 700;
+}
+.gv-mode-badge.llm { color: var(--ok); background: var(--ok-bg); border-color: var(--ok-bg); }
+.gv-mode-badge.retrieval_only { color: var(--warn-fg); background: var(--warn-bg); border-color: var(--warn-border); }
+.gv-mode-badge.unavailable { color: var(--err-fg); background: var(--err-bg); border-color: var(--err-border); }
+.gv-assist-table { overflow-x: auto; }
+.gv-assist-table .md-table { margin: 0; font-size: 13px; min-width: 640px; }
+.gv-assist-table .md-table th { white-space: nowrap; }
+.gv-assist-row .cell { display: block; color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; margin-top: 2px; }
+.gv-assist-row .sugg { white-space: pre-wrap; overflow-wrap: anywhere; }
+.gv-assist-row .none { color: var(--muted); font-style: italic; }
+.gv-assist-row .conf { display: inline-block; min-width: 42px; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+.gv-assist-row .conf.hi { color: var(--ok); font-weight: 700; }
+.gv-assist-row.adopted td { background: var(--ok-bg); color: var(--muted); }
+.gv-assist-row.adopted .sugg { text-decoration: line-through; }
+.gv-assist-row .gv-chip { cursor: pointer; background: var(--surface); color: var(--accent); font-size: 12px; padding: 4px 10px; }
+.gv-assist-row .gv-chip.open { border-color: var(--accent); background: var(--accent-soft); }
+.gv-assist-row .adopt { width: 18px; height: 18px; cursor: pointer; accent-color: var(--ok); }
+.gv-assist-cite td { background: var(--drop-bg); }
+.gv-assist-cite .quote + .quote { margin-top: 8px; }
+.gv-assist-cite .loc { display: block; margin-top: 4px; }
+.gv-assist-cite .gv-cite-note { font-size: 11.5px; color: var(--muted); margin-top: 8px; }
+.gv-assist-empty { padding: 24px 16px; color: var(--muted); text-align: center; font-size: 13.5px; }
+.gv-assist-notices .gv-findings { margin-top: 8px; }

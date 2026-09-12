@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import heapq
+import json
 import math
 import re
 import unicodedata
@@ -29,6 +31,18 @@ class EvidenceHit:
     content: str
     score: float
     quote: str = ""
+
+
+def excerpt_id(hit: EvidenceHit) -> str:
+    """Return a compact stable identity for one exact source window.
+
+    模型只能引用 allow-list 內的 excerpt_id；同一 source unit 的不同原文視窗因此可以區分，
+    F03 判讀與協填共用同一套識別，報告裡的 citation 才能互相對照。
+    """
+    identity = json.dumps(
+        [hit.document_id, hit.unit_id, hit.content], ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(identity.encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
