@@ -28,8 +28,8 @@
 
 Python 3.12、FastAPI + 靜態前端（vanilla JS）、Pydantic v2、pandas（讀表）+ openpyxl（公式/儲存格層級）、
 PyYAML、pytest。**uv** 管理依賴。**佐證文件解析不在本專案內**：`parsers/supporting.py` 只做安全預檢，
-再以 HTTP 送到同機的 FileProcess 服務（`/Users/xian/Documents/00_CODE/Taishin/FileProcess`，port 3322）；
-本專案**不保留任何解析程式快照**，解析 bug 一律修在 FileProcess。
+再以 HTTP 送到同機的 file_process 服務（`/Users/xian/Documents/00_CODE/Taishin/file_process`，port 3322）；
+本專案**不保留任何解析程式快照**，解析 bug 一律修在 file_process。
 embedding/LLM 統一走 requests + OpenAI 相容端點（/embeddings、/chat/completions；
 內部/地端端點，本機 dev 用 ollama）。
 
@@ -48,7 +48,7 @@ govcheck/
 │   ├── config/                     # f02_scoring.yaml（勿手改，重跑腳本產生）/ llm / log / review / parser
 │   ├── logging_setup.py            # 地端 log：ops(govcheck.log)+稽核(audit.log) 雙管線；profile 控細節程度
 │   ├── models/                     # F01/F02/F03 Form、Finding、ReviewReport、evidence (Pydantic v2)
-│   ├── parsers/                    # f01/f02/f03 主表 + supporting（佐證文件：預檢 → HTTP → FileProcess）
+│   ├── parsers/                    # f01/f02/f03 主表 + supporting（佐證文件：預檢 → HTTP → file_process）
 │   ├── scoring/f02_score.py        # 還原 Excel 公式：加總→加成→百分比→MAX→分級        ← 需求 2
 │   ├── regulations/                # 凍結法規對照表：mapping / models / config（runtime 只讀 JSON）
 │   ├── evidence/retrieval.py       # 佐證片段混合檢索（BM25-like + 選用 embedding）
@@ -123,7 +123,7 @@ uv run uvicorn govcheck.web.api:app --port 8501  # 啟動 Web 介面 → http://
     （`logging_setup.py`）。早期 `dev` profile 會把 LLM request/response 全文寫進 `logs/llm_raw/`，
     該行為已移除，**不要再加回來**。解析 JSON 失敗請靠例外型別與截斷版訊息除錯。
 - ❌ 把 `data/rag/retrieval_map.json`（法規原文摘錄）或 `prompts/*.yaml`（判準衍生自治理辦法）入庫。
-- ❌ 在本專案內重新實作或快照佐證解析器（pptx/msg/zip…）；一律呼叫 FileProcess 服務，主機必須在核准清單內。
+- ❌ 在本專案內重新實作或快照佐證解析器（pptx/msg/zip…）；一律呼叫 file_process 服務，主機必須在核准清單內。
   兩者皆已 gitignore；新環境靠另外佈署，缺檔時程式自動降級並在報告明示。
 
 ### Git / 推送守則

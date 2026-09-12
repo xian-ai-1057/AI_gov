@@ -27,7 +27,7 @@ F03 上線檢核表** + 佐證文件），跑規則檢查與語意判讀 → 產
  F01 .xlsx            缺件→F01必填→F02規則           錯誤/提醒/紀錄
  F02 .xlsm            →F03佐證缺漏→F03語意判讀        + 固有風險分級
  F03 .xlsx            →F02法規查表→跨表一致           + 檢核項狀態總覽表
-佐證 PDF/Word/PPT/MSG   安全預檢→FileProcess 服務→來源定位 + 下載 Markdown
+佐證 PDF/Word/PPT/MSG   安全預檢→file_process 服務→來源定位 + 下載 Markdown
 ```
 
 ---
@@ -41,8 +41,20 @@ uv run pytest                                    # 跑測試（全綠才算就�
 uv run uvicorn govcheck.web.api:app --port 8501  # 啟動 → http://localhost:8501
 ```
 
+## 平行專案
+
+本專案是數個獨立 repo 之一，全部位於 `/Users/xian/Documents/00_CODE/Taishin/` 之下：
+
+| 專案 | 關係 |
+|---|---|
+| `../ts_solution` 能力目錄 | 消費本專案匯出的治理紀錄（`schema_version 1`） |
+| `../file_process` 文件解析 | 本專案以 HTTP 呼叫它解析佐證；解析器 bug 只在那邊修 |
+| `../usage_attribution` 用量歸戶 | 與本專案無直接往來 |
+
+專案間的介面與目標形狀見 `../ts_solution/docs/platform-interfaces.md`。
+
 佐證文件（PDF / Word / PowerPoint / Outlook .msg / zip）的解析**不在本專案內**，交由同機的
-**FileProcess 服務**處理（`/Users/xian/Documents/00_CODE/Taishin/FileProcess`，port 3322）：
+**file_process 服務**處理（`/Users/xian/Documents/00_CODE/Taishin/file_process`，port 3322）：
 
 ```bash
 cd ../file_process && .venv/bin/python main.py     # 啟動解析服務 → http://localhost:3322/health
@@ -62,7 +74,7 @@ cd ../file_process && .venv/bin/python main.py     # 啟動解析服務 → http
 |---|---|---|
 | 法規對照表 | `data/rag/retrieval_map.json` | 報告出現 `REGULATION.MAP_UNAVAILABLE`；不引用任何條文、不判法規符合性 |
 | 判讀 Prompt | `prompts/*.yaml`（+ `prompts/lenient/`） | 報告出現 `F03.PROMPT_UNAVAILABLE`；F03 語意判讀整段標為未完成 |
-| 佐證解析服務 | FileProcess（外部專案，HTTP localhost:3322） | 佐證全部 `parser_unavailable`；規則檢查不受影響 |
+| 佐證解析服務 | file_process（外部專案，HTTP localhost:3322） | 佐證全部 `parser_unavailable`；規則檢查不受影響 |
 
 法規對照表是**凍結產物**：由官方 R01–R07 PDF 與 F03 模板離線建置一次，runtime 只讀不寫。
 建置管線（PDF 切塊 → embedding → Milvus → 產出對照表）已封存於 `_Archive/rag_build/`，
@@ -82,7 +94,7 @@ cd ../file_process && .venv/bin/python main.py     # 啟動解析服務 → http
 | F01 系統資訊表 | `.xlsx` | 附件一範本 |
 | F02 風險評鑑 | `.xlsm` | 附件二範本（含計分公式的巨集活頁簿） |
 | F03 上線檢核表 | `.xlsx` | 附件三範本 |
-| 佐證文件 | `.pdf` / `.docx` / `.pptx` / `.msg` / `.zip` 等 | 簽呈、簡報、審閱信件、模型卡、測試報告等（由 FileProcess 服務解析） |
+| 佐證文件 | `.pdf` / `.docx` / `.pptx` / `.msg` / `.zip` 等 | 簽呈、簡報、審閱信件、模型卡、測試報告等（由 file_process 服務解析） |
 
 選好使用角色（提案者／審查者）與流程階段（提案／上線）後按「**開始審查**」。
 提案階段不會因尚未填寫上線驗收欄位而誤報。
@@ -168,7 +180,7 @@ GOVCHECK_PROMPT_LABEL=production       # production 讀 prompts/；其他 label 
 可用 `GET /api/readiness` 驗證七個 Prompt 的就緒狀態。
 
 佐證文件只走 `TsParserAdapter`，它不含任何解析程式，只做安全預檢（格式白名單、大小、簽章、
-zip-bomb）後以 HTTP 送到 **FileProcess 服務**（`GOVCHECK_PARSER_FILEPROCESS_URL`，預設
+zip-bomb）後以 HTTP 送到 **file_process 服務**（`GOVCHECK_PARSER_FILEPROCESS_URL`，預設
 `http://localhost:3322`）。服務主機必須在 `approved_model_hosts`（localhost）內，否則**不發請求**、
 直接回 `parser_unavailable`；只送以內容雜湊命名的檔案，不外傳原始檔名。設定見
 `src/govcheck/config/parser_config.yaml`。
@@ -226,7 +238,7 @@ export GOVCHECK_OPERATOR=alice       # 稽核「操作者」欄（目前無登�
 
 ```bash
 uv run python scripts/export_governance_records.py     # → output/governance_records.json
-# 接著在 ts_solution：python3 poc/cli.py governance import ../gov_doc/output/governance_records.json
+# 接著在 ts_solution：python3 poc/cli.py governance import ../govcheck/output/governance_records.json
 ```
 
 契約見 `src/govcheck/report/governance_export.py`（schema_version 1）。內容只有識別資訊與計數，
@@ -272,5 +284,5 @@ API 端點共七個：`POST /api/classify`（預覽自動分類）、`POST /api/
 - ✅ 缺件 + F01 必填 + F01/F02/F03 跨表一致
 - ✅ F03 語意判讀（內容 / 佐證 / 法規符合性合一）+ 佐證文件解析與來源定位
 - ✅ 檢核項狀態總覽報告 + Markdown 匯出
-- ✅ 佐證解析改走 FileProcess 服務（支援 .pptx / .msg / .zip，gov_doc 不再內嵌解析程式）
+- ✅ 佐證解析改走 file_process 服務（支援 .pptx / .msg / .zip，govcheck 不再內嵌解析程式）
 - ⏳ 上線校準：去識別案例雙人標註、shadow mode 品質／成本門檻驗收
