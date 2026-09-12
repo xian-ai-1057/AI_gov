@@ -53,7 +53,7 @@ uv run uvicorn govcheck.web.api:app --port 8501  # 啟動 → http://localhost:8
 | `../usage_attribution` 用量歸戶 | 與本專案無直接往來 |
 | `../FileProcess` 文件解析 | 本專案以 HTTP 呼叫它解析佐證；解析器 bug 只在那邊修 |
 
-專案間的介面與目標形狀見 `../AI治理平台/README.md`。
+專案間的介面與目標形狀見 `../ts_solution/docs/platform-interfaces.md`。
 
 佐證文件（PDF / Word / PowerPoint / Outlook .msg / zip）的解析**不在本專案內**，交由同機的
 **FileProcess 服務**處理（`/Users/xian/Documents/00_CODE/Taishin/FileProcess`，port 3322）：
