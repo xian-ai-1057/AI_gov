@@ -136,3 +136,17 @@ def fake_fileprocess(monkeypatch) -> FakeFileProcess:
     monkeypatch.setattr(requests, "post", fake.post)
     monkeypatch.setattr(requests, "get", fake.get)
     return fake
+
+
+def pytest_collection_modifyitems(items):
+    """需要 data/original 官方範本的測試自動掛上 ``local_data`` marker。
+
+    守則要求這類測試用 marker 標示並在缺檔時乾淨 skip。marker 由 skipif 的 reason
+    推導而不是手動掛，否則新增一個用 fixture_builder 的測試時就會忘記——
+    pyproject 宣告了這個 marker 卻一直沒有任何測試使用，正是手動掛的下場。
+    """
+    for item in items:
+        for mark in item.iter_markers(name="skipif"):
+            if "data/original" in str(mark.kwargs.get("reason", "")):
+                item.add_marker(pytest.mark.local_data)
+                break

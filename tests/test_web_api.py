@@ -31,20 +31,13 @@ from govcheck.parsers.f02_parser import ASSESS_SHEET
 from govcheck.review.config import load_review_config
 from govcheck.web.api import app
 from tests.fixture_builder import (
-    OFFICIAL,
-    OFFICIAL_F01,
-    OFFICIAL_F03,
+    requires_templates,
     build_f01_fixture,
     build_f02_fixture,
     build_f03_fixture,
 )
 
 client = TestClient(app)
-
-requires_templates = pytest.mark.skipif(
-    not (OFFICIAL.exists() and OFFICIAL_F01.exists() and OFFICIAL_F03.exists()),
-    reason="官方範本不存在（data/original 未連結）",
-)
 
 # 報告 payload 的頂層契約：前端會直接讀這些鍵，少任一個 UI 就顯示 undefined。
 REPORT_KEYS = {

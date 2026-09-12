@@ -7,7 +7,9 @@ fixture 由官方 .xlsm 程式化生成（fixture_builder），跑完整 engine�
 import pytest
 
 from govcheck.review.engine import review_f02
-from tests.fixture_builder import build_f02_fixture
+from tests.fixture_builder import requires_templates, build_f02_fixture
+
+pytestmark = requires_templates
 
 # 合規的低風險基線：每單選恰一 Y、複選有 Y、所有題已填 → 不應有任何 error
 BASELINE = {

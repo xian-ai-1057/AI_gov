@@ -22,7 +22,9 @@ from govcheck.regulations.models import (
     RetrievedSection,
 )
 from govcheck.review import engine
-from tests.fixture_builder import build_f02_fixture
+from tests.fixture_builder import requires_templates, build_f02_fixture
+
+pytestmark = requires_templates
 
 # BASELINE 答案集（與 tests/golden/generate_snapshot.py 一致；避免跨測試模組耦合）。
 _BASELINE_ANSWERS: dict[str, str] = {

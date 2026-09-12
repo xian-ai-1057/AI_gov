@@ -6,7 +6,9 @@ fixture 由官方 .xlsx 程式化生成，跑 parse_f01 → f01_rules.run_all，
 
 from govcheck.checks.rule import f01_rules
 from govcheck.parsers.f01_parser import parse_f01
-from tests.fixture_builder import F01_DEFAULT_ROW, build_f01_fixture
+from tests.fixture_builder import requires_templates, F01_DEFAULT_ROW, build_f01_fixture
+
+pytestmark = requires_templates
 
 
 def codes(path) -> set[str]:
