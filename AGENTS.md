@@ -4,17 +4,15 @@
 
 Application code lives under `src/govcheck/`. The review pipeline is organized as `parsers/` → `models/` → `checks/` → `review/engine.py` → `report/`. Keep deterministic checks in `checks/rule/` and LLM-assisted checks in `checks/llm/`. Configuration is stored in `src/govcheck/config/`; `f02_scoring.yaml` is generated and should not be edited manually.
 
-`app.py` is the Streamlit entry point, while `src/govcheck/web/api.py` serves the FastAPI API and static assets in `web/`. Build utilities belong in `scripts/`, architecture notes in `docs/`, and feature contracts in `specs/`. Tests mirror behavior in `tests/`; golden snapshots are under `tests/golden/`. Treat `data/original/` as read-only, local-only source material.
+`src/govcheck/web/api.py` serves the FastAPI API and the static assets in `web/`; there is no separate UI entry point. Build utilities belong in `scripts/`, and architecture notes and feature contracts in `docs/`. Tests mirror behavior in `tests/`; golden snapshots are under `tests/golden/`. Treat `data/original/` as read-only, local-only source material.
 
 ## Build, Test, and Development Commands
 
 - `uv sync --extra dev`: install Python 3.12 dependencies and developer tools.
 - `uv run pytest`: run the complete test suite.
 - `uv run pytest tests/test_f02_score.py`: run one focused test module.
-- `uv run ruff check src tests scripts app.py`: lint Python code.
+- `uv run ruff check src tests scripts`: lint Python code.
 - `uv run uvicorn govcheck.web.api:app --port 8501`: start the FastAPI/static web UI.
-- `uv run streamlit run app.py`: start the Streamlit UI.
-- `uv run python scripts/build_regulation_index.py --dry-run`: inspect RAG chunks without writing an index.
 
 ## Coding Style & Naming Conventions
 
@@ -26,7 +24,7 @@ Use pytest and provide ground-truth positive and negative cases. Mock all LLM an
 
 ## Commit & Pull Request Guidelines
 
-History favors concise, imperative subjects, often Conventional Commit-style, such as `fix(report): ...` or `docs: ...`. Keep each commit scoped to one concern. Pull requests should explain the user-visible impact, list validation commands, link the relevant issue/spec, and include screenshots for changes under `web/` or `app.py`.
+History favors concise, imperative subjects, often Conventional Commit-style, such as `fix(report): ...` or `docs: ...`. Keep each commit scoped to one concern. Pull requests should explain the user-visible impact, list validation commands, link the relevant issue/spec, and include screenshots for changes under `web/`.
 
 ## Security & Configuration
 

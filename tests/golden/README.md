@@ -1,19 +1,21 @@
-# tests/golden/ — Phase 2 基準 Golden Snapshot
+# tests/golden/ — 規則層基準 Golden Snapshot
 
 ## 目的
 
-在 Phase 3b 修改 engine（`review/engine.py`）之前，先用**未修改的現行 engine** 對 synthetic
-送件包執行審查，把結果固化為 `phase2_baseline.json`。
+用 synthetic 送件包跑**關閉 LLM** 的 engine，把規則層輸出固化為 `rules_baseline.json`。
+之後任何不打算改變規則層結論的改動（新增語意判讀能力、調整報告呈現、抽換佐證解析後端），
+都必須讓 engine 的輸出與此快照逐位元組相同。
 
-Phase 3b 新增 `_run_rag_checks` 整合後，`rag.enabled=false`（預設值）時 engine 的輸出
-必須與此快照逐字節相同（AC-11 回歸保護）。
+快照只涵蓋規則層：`item_assessments` 與 `checklist_roster` 在序列化時 `exclude=True`，
+所以新增呈現欄位不會擾動它。反過來說，**任何新增的規則檢查都會改變 `findings`**，
+那時才需要重產快照。
 
 ## 檔案說明
 
 | 檔案 | 說明 |
 |---|---|
 | `generate_snapshot.py` | 快照產生腳本；可重跑覆蓋 |
-| `phase2_baseline.json` | Phase 2 基準快照（schema_version=phase2_baseline_v1） |
+| `rules_baseline.json` | 規則層基準快照 |
 | `README.md` | 本說明文件 |
 
 ## 快照內容
@@ -57,9 +59,9 @@ uv run python tests/golden/generate_snapshot.py
 - Finding 代碼、嚴重度、引導性說明訊息
 - 合成的示範資料（「智能客服小幫手」、「李大華」）
 
-## AC-11 回歸測試說明
+## 回歸測試說明
 
-Phase 3b 完成後，回歸測試需驗證：
+回歸測試驗證：
 
 ```python
 # 偽碼示意
@@ -71,4 +73,5 @@ with tempfile.TemporaryDirectory() as td:
     assert report.model_dump(mode="json") == baseline
 ```
 
-只要 `rag.enabled=false`（預設），`_run_rag_checks` 回 `[]`，engine 輸出不變，斷言成立。
+快照不含 `parser_name`，synthetic 送件包也沒有佐證檔，因此佐證解析後端的更換動不到它 ——
+若它意外變動，代表有非預期的行為改變，應先查清楚再決定要不要重產。

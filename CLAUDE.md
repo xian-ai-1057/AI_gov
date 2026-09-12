@@ -124,9 +124,9 @@ uv run uvicorn govcheck.web.api:app --port 8501  # 啟動 Web 介面 → http://
 - ❌ 跳過測試直接收工。
 - ❌ Log 記錄**原始檔內容/解析後儲存格值/F03 佐證全文/LLM prompt 回應全文/api_key/Authorization**；
   只准記識別資訊與數量（系統名/單位/Finding 代碼/計數/耗時/例外型別）。
-  - **唯一例外（dev-only 除錯）**：`dev` profile 時 `dump_llm_raw()` 會把 LLM request/response 全文
-    存到 `logs/llm_raw/`（gitignored）供解 JSON 解析失敗除錯；終端只印截斷版。prod / quiet **完全不寫**。
-    僅限本機 ollama、無真實送件資料的情境；上線環境勿設 `GOVCHECK_LOG_PROFILE=dev`。
+  - **沒有例外**：`dump_llm_raw()` 已停用，任何 profile 都回 `None`、不落檔
+    （`logging_setup.py`）。早期 `dev` profile 會把 LLM request/response 全文寫進 `logs/llm_raw/`，
+    該行為已移除，**不要再加回來**。解析 JSON 失敗請靠例外型別與截斷版訊息除錯。
 - ❌ 把 `data/rag/retrieval_map.json`（法規原文摘錄）、`data/rag/form_fields.json`（範本用語）或 `prompts/*.yaml`（判準衍生自治理辦法）入庫。
 - ❌ 在本專案內重新實作或快照佐證解析器（pptx/msg/zip…）；一律呼叫 FileProcess 服務，主機必須在核准清單內。
   兩者皆已 gitignore；新環境靠另外佈署，缺檔時程式自動降級並在報告明示。
