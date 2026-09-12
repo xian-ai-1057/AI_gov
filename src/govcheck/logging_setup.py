@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -233,6 +234,9 @@ def audit(event: str, **fields) -> None:
         )
     record = {
         "event": event,
+        # 稽核軌跡要能排時間序、也要能被能力目錄當「最新一次審查」取用；
+        # audit.log 的 formatter 只有 %(message)s，時間戳必須寫進 JSON 本體。
+        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
         "request_id": get_request_id(),
         "operator": load_log_config()["operator"],
         **safe_fields,

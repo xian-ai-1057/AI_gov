@@ -13,11 +13,19 @@ import warnings
 from pathlib import Path
 
 import openpyxl
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 OFFICIAL = ROOT / "data" / "original" / "附件二：AI-R02-F02 AI風險評鑑.xlsm"
 OFFICIAL_F01 = ROOT / "data" / "original" / "附件一：AI-R02-F01 AI系統資訊表.xlsx"
 OFFICIAL_F03 = ROOT / "data" / "original" / "附件三：AI-R02-F03 AI系統提案規劃暨上線檢核表.xlsx"
+
+# 需要官方範本的測試共用此守衛（原本散在 test_web_api / test_classify 各自定義一份）。
+# 三份範本在 data/original/ 底下，gitignored；乾淨 checkout（CI）一律缺席，必須 skip 而非 fail。
+requires_templates = pytest.mark.skipif(
+    not (OFFICIAL.exists() and OFFICIAL_F01.exists() and OFFICIAL_F03.exists()),
+    reason="官方範本不存在（data/original 未連結）",
+)
 
 ASSESS_SHEET = "AI系統固有風險分級評估表"
 RESIDUAL_SHEET = "AI系統剩餘風險評鑑表"

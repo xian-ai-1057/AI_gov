@@ -35,6 +35,7 @@ from govcheck.llm.client import ChatClient
 from govcheck.llm.config import load_llm_config
 from govcheck.logging_setup import get_logger, new_request_id, set_request_id, setup_logging
 from govcheck.models import ReviewReport, Severity, WorkflowStage
+from govcheck.parsers.supporting import fileprocess_readiness
 from govcheck.prompts import build_prompt_gateway
 from govcheck.report.builder import to_markdown
 from govcheck.report.defects import (
@@ -690,20 +691,42 @@ async def get_review_decisions(review_id: str) -> JSONResponse:
     return JSONResponse(saved or {"review_id": review_id, "decisions": {}})
 
 
+_PARSER_NOT_READY = {"backend": "fileprocess", "url_host_approved": False, "reachable": False}
+
+
+def _parser_readiness() -> dict:
+    """FileProcess 服務就緒（GET /health，短逾時）；任何例外一律回未就緒。
+
+    佐證解析改走外部服務後，忘了啟動 3322 不會讓審查失敗，只會讓每份佐證變成
+    ``parser_unavailable`` —— 報告安靜地變弱。這個欄位是唯一看得出來的地方。
+    """
+    try:
+        return dict(fileprocess_readiness())
+    except Exception as exc:  # noqa: BLE001 - readiness 只回報狀態，不中斷
+        log.warning("parser readiness failed: %s", type(exc).__name__)
+        return dict(_PARSER_NOT_READY)
+
+
 @app.get("/api/readiness")
 async def readiness() -> JSONResponse:
-    """LLM 判讀是否就緒（端點、模型、Prompt 三者齊備才算）。"""
+    """LLM 判讀是否就緒（端點、模型、Prompt 三者齊備才算）。
+
+    ``ready`` 只反映 F03 語意判讀；``parser`` 另外回報 FileProcess 佐證解析服務狀態，
+    兩者互不影響（解析服務沒開仍可跑規則檢查與語意判讀，只是沒有佐證可引用）。
+    """
     cfg = load_llm_config()
     prompts = build_prompt_gateway(ChatClient.from_config(cfg), cfg).readiness()
     prompt_ready = bool(prompts) and all(
         not value.startswith("unavailable:") for value in prompts.values()
     )
     model_configured = bool(cfg.get("base_url") and cfg.get("model"))
+    parser = await asyncio.to_thread(_parser_readiness)
     return JSONResponse({
         "ready": bool(cfg.get("enabled") and prompt_ready and model_configured),
         "llm_enabled": bool(cfg.get("enabled")),
         "model_configured": model_configured,
         "prompts": prompts,
+        "parser": parser,
     })
 
 

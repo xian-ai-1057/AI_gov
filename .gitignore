@@ -61,7 +61,10 @@ logs/
 # 本機試打外部模型 API 的臨時腳本（會外送公有雲，絕不可入庫或當成專案程式執行）
 /gemini.py
 
-# Claude Code 本機設定（含機器專屬路徑與個人授權清單）；launch.json 團隊共用故不忽略
+# Claude Code 本機設定（含機器專屬路徑與個人授權清單）
+# launch.json 也不入庫：fileprocess 項目需要各人自己的 file_process venv 絕對路徑，
+# mockup-preview 則指向已 gitignore 的 data/ui_redesign，兩者都無法團隊共用。
 .claude/settings.local.json
+.claude/launch.json
 .claude/worktrees/
 .gstack/

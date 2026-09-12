@@ -27,7 +27,7 @@ F03 上線檢核表** + 佐證文件），跑規則檢查與語意判讀 → 產
  F01 .xlsx            缺件→F01必填→F02規則           錯誤/提醒/紀錄
  F02 .xlsm            →F03佐證缺漏→F03語意判讀        + 固有風險分級
  F03 .xlsx            →F02法規查表→跨表一致           + 檢核項狀態總覽表
-佐證 PDF/Word           安全預檢→ts_parser→來源定位     + 下載 Markdown
+佐證 PDF/Word/PPT/MSG   安全預檢→file_process 服務→來源定位 + 下載 Markdown
 ```
 
 ---
@@ -41,6 +41,28 @@ uv run pytest                                    # 跑測試（全綠才算就�
 uv run uvicorn govcheck.web.api:app --port 8501  # 啟動 → http://localhost:8501
 ```
 
+## 平行專案
+
+本專案是數個獨立 repo 之一，全部位於 `/Users/xian/Documents/00_CODE/Taishin/` 之下：
+
+| 專案 | 關係 |
+|---|---|
+| `../ts_solution` 能力目錄 | 消費本專案匯出的治理紀錄（`schema_version 1`） |
+| `../file_process` 文件解析 | 本專案以 HTTP 呼叫它解析佐證；解析器 bug 只在那邊修 |
+| `../usage_attribution` 用量歸戶 | 與本專案無直接往來 |
+
+專案間的介面與目標形狀見 `../ts_solution/docs/platform-interfaces.md`。
+
+佐證文件（PDF / Word / PowerPoint / Outlook .msg / zip）的解析**不在本專案內**，交由同機的
+**file_process 服務**處理（`/Users/xian/Documents/00_CODE/Taishin/file_process`，port 3322）：
+
+```bash
+cd ../file_process && .venv/bin/python main.py     # 啟動解析服務 → http://localhost:3322/health
+```
+
+未啟動時規則檢查照常，佐證一律標 `parser_unavailable`，語意判讀會如實降級。
+`GET /api/readiness` 的 `parser` 區塊會回報服務是否可達。
+
 ---
 
 ## 本機資產（不入庫，新環境必須另外佈署）
@@ -52,6 +74,7 @@ uv run uvicorn govcheck.web.api:app --port 8501  # 啟動 → http://localhost:8
 |---|---|---|
 | 法規對照表 | `data/rag/retrieval_map.json` | 報告出現 `REGULATION.MAP_UNAVAILABLE`；不引用任何條文、不判法規符合性 |
 | 判讀 Prompt | `prompts/*.yaml`（+ `prompts/lenient/`） | 報告出現 `F03.PROMPT_UNAVAILABLE`；F03 語意判讀整段標為未完成 |
+| 佐證解析服務 | file_process（外部專案，HTTP localhost:3322） | 佐證全部 `parser_unavailable`；規則檢查不受影響 |
 
 法規對照表是**凍結產物**：由官方 R01–R07 PDF 與 F03 模板離線建置一次，runtime 只讀不寫。
 建置管線（PDF 切塊 → embedding → Milvus → 產出對照表）已封存於 `_Archive/rag_build/`，
@@ -71,9 +94,9 @@ uv run uvicorn govcheck.web.api:app --port 8501  # 啟動 → http://localhost:8
 | F01 系統資訊表 | `.xlsx` | 附件一範本 |
 | F02 風險評鑑 | `.xlsm` | 附件二範本（含計分公式的巨集活頁簿） |
 | F03 上線檢核表 | `.xlsx` | 附件三範本 |
-| 佐證文件 | `.pdf` / `.docx` 等 | 模型卡、測試報告等 |
+| 佐證文件 | `.pdf` / `.docx` / `.pptx` / `.msg` / `.zip` 等 | 簽呈、簡報、審閱信件、模型卡、測試報告等（由 file_process 服務解析） |
 
-選好使用角色（提案者／審查者）與流程階段（提案／驗收／正式營運）後按「**開始審查**」。
+選好使用角色（提案者／審查者）與流程階段（提案／上線）後按「**開始審查**」。
 提案階段不會因尚未填寫上線驗收欄位而誤報。
 
 ### ② 審查報告
@@ -156,8 +179,11 @@ GOVCHECK_PROMPT_LABEL=production       # production 讀 prompts/；其他 label 
 沒有相同固定版本快取時，評估標示為未完成並轉人工覆核，不會回退到硬編碼或過期 Prompt。
 可用 `GET /api/readiness` 驗證七個 Prompt 的就緒狀態。
 
-佐證文件只走 `TsParserAdapter`；設定見 `src/govcheck/config/parser_config.yaml`。OCR/VLM 預設關閉，
-且 `MODEL_HOST` 必須在核准清單內，否則回傳 `parser_unavailable`。
+佐證文件只走 `TsParserAdapter`，它不含任何解析程式，只做安全預檢（格式白名單、大小、簽章、
+zip-bomb）後以 HTTP 送到 **file_process 服務**（`GOVCHECK_PARSER_FILEPROCESS_URL`，預設
+`http://localhost:3322`）。服務主機必須在 `approved_model_hosts`（localhost）內，否則**不發請求**、
+直接回 `parser_unavailable`；只送以內容雜湊命名的檔案，不外傳原始檔名。設定見
+`src/govcheck/config/parser_config.yaml`。
 佐證檢索預設為 BM25-like 關鍵字排序；設 `GOVCHECK_EVIDENCE_EMBEDDING_ENABLED=true` 可加上
 embedding 分數融合（端點見 `GOVCHECK_EMBEDDING_BASE_URL` / `GOVCHECK_EMBEDDING_MODEL`）。
 Chat 判讀會依 `GOVCHECK_LLM_CONTEXT_WINDOW_TOKENS` 的完整預算自動分批；embedding 輸入也會依
@@ -168,6 +194,8 @@ embedding 的 chunk 上限或端點故障使語意檢索未涵蓋全文，空結
 
 檢索架構圖、逐步流程，以及**完整佐證／部分佐證／無佐證**的定義與觸發條件，見
 [docs/evidence_retrieval.md](docs/evidence_retrieval.md)。
+
+---
 
 ---
 
@@ -201,6 +229,21 @@ export GOVCHECK_OPERATOR=alice       # 稽核「操作者」欄（目前無登�
 **隱私**：所有 profile 都**不記**系統名、送件單位、真實檔名、原始文件、儲存格、Prompt 變數、
 模型回應、API key 或 Authorization header。
 
+### 匯出治理紀錄給共用能力目錄
+
+`review_done` 稽核記錄帶 `ts`、`review_id`、`subject`、`filing_unit`、`workflow_stage`、
+`decision_status`、`risk_grade`／`risk_score`、`error`／`warn`，`decisions_saved` 帶覆核計數。
+把兩者整理成一份可交接的 JSON，供 `ts_solution` 的能力目錄把專案的治理文件、審查、核准與
+使用紀錄連在一起：
+
+```bash
+uv run python scripts/export_governance_records.py     # → output/governance_records.json
+# 接著在 ts_solution：python3 poc/cli.py governance import ../govcheck/output/governance_records.json
+```
+
+契約見 `src/govcheck/report/governance_export.py`（schema_version 1）。內容只有識別資訊與計數，
+**沒有**報告全文、佐證原文、檢核項原文或覆核備註；`output/` 已 gitignore，檔案留在地端。
+
 ---
 
 ## 架構
@@ -221,16 +264,17 @@ src/govcheck/
 │   ├── rule/     缺件 / F01 / F02 / 跨表 / F03 佐證缺漏 / F02 觸發題條文查表   ← 需求 1、4
 │   └── llm/      f03_assessment：內容 + 佐證 + 法規符合性一次判完              ← 需求 3、4
 ├── review/       engine：編排 parse → checks → 匯總
-├── report/       ReviewReport → Markdown                                      ← 需求 5
-└── web/          FastAPI（/api/review、/api/readiness）+ 靜態前端
+├── report/       ReviewReport → Markdown；defects 缺失視圖；governance_export 匯出治理紀錄   ← 需求 5
+└── web/          FastAPI（分類 / 審查 / 串流 / 覆核決定 / 就緒查詢）+ 靜態前端
 
-src/ts_parser/                    # 上游 parser 原始碼整合邊界
-web/                              # 單一前端（index.html / app.js / styles.css）
+web/                              # 唯一前端（index.html / app.js / styles.css）
 _Archive/rag_build/               # 封存：法規索引建置管線（法規改版時取回重跑）
 ```
 
-API 只有兩個端點：`POST /api/review`（上傳送件包 → 報告 JSON + Markdown）與
-`GET /api/readiness`（Prompt / 模型就緒查詢）。
+API 端點共七個：`POST /api/classify`（預覽自動分類）、`POST /api/review`（上傳送件包 →
+報告 JSON + Markdown）、`POST /api/review/stream`（同上，SSE 分層回傳）、
+`POST`／`GET /api/review/{review_id}/decisions`（覆核決定，整批覆寫）、
+`GET /api/readiness`（Prompt / 模型 / 解析服務就緒查詢）與 `GET /`（靜態前端）。
 
 ---
 
@@ -240,4 +284,5 @@ API 只有兩個端點：`POST /api/review`（上傳送件包 → 報告 JSON + 
 - ✅ 缺件 + F01 必填 + F01/F02/F03 跨表一致
 - ✅ F03 語意判讀（內容 / 佐證 / 法規符合性合一）+ 佐證文件解析與來源定位
 - ✅ 檢核項狀態總覽報告 + Markdown 匯出
+- ✅ 佐證解析改走 file_process 服務（支援 .pptx / .msg / .zip，govcheck 不再內嵌解析程式）
 - ⏳ 上線校準：去識別案例雙人標註、shadow mode 品質／成本門檻驗收

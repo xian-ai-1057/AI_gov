@@ -22,6 +22,7 @@ flowchart TB
     FE -.->|"零判讀邏輯，純呈現"| API
 
     API --> PARSERS["parsers/<br/>主表 parser + TsParserAdapter"]
+    PARSERS -->|"POST /api/parse（僅核准主機）"| FP["FileProcess 服務<br/>（HTTP，localhost:3322）"]
     PARSERS --> MODELS["models/<br/>Form · DocumentArtifact · Assessment · Finding"]
 
     MODELS --> ENGINE["review/engine.py<br/>編排：parse → checks → 彙總"]
@@ -93,6 +94,11 @@ flowchart LR
 
 ## 3. 佐證檢索（evidence/）
 
+佐證文件解析不在本專案內：`parsers/supporting.py`（`TsParserAdapter`）只做本機預檢與主機核准，
+再以 HTTP 把檔案交給 **FileProcess 服務（HTTP，localhost）** 解析（`POST /api/parse`），把回應的
+chunks 對映成 `SourceUnit`；解析失敗只降級該份佐證，規則檢查照常。契約與狀態對映見
+[docs/f03_review_v2.md](f03_review_v2.md)。
+
 上圖 `evidence/` 這一個方塊自成一條子管線：佐證文件解析 → 連續原文視窗切塊 →
 BM25-like（＋選用 embedding）混合排序 → 絕對相關性門檻 → 每項 top-k → 送模型 →
 引用驗證與狀態降級。架構圖、逐步流程，以及**完整佐證／部分佐證／無佐證**的定義與觸發條件
@@ -132,30 +138,32 @@ flowchart LR
 
 ---
 
-## 5. Web 介面：兩步驟狀態機（前端）
+## 5. Web 介面：四步驟狀態機（前端）
 
 `web/app.js` 是純 vanilla JS 狀態機，`#app` 依 `state.step` 全量重繪，事件一律走
-`data-action` 委派（見 `web/app.js` 開頭的 `state` 物件）。
+`data-action` 委派（見 `web/app.js` 開頭的 `state` 物件與 `STEP_LABELS`）。
 
 ```mermaid
 stateDiagram-v2
     [*] --> 上傳送件包
-    上傳送件包 --> 審查中: 選角色/階段後 POST /api/review
-    審查中 --> 審查報告: 回應套用
-    審查中 --> 上傳送件包: 失敗顯示錯誤
-    審查報告 --> 上傳送件包: 審查新的送件包
+    上傳送件包 --> 確認分類: POST /api/classify（逐檔給 kind 與 flag，可人工改）
+    確認分類 --> 上傳送件包: 重選檔案
+    確認分類 --> 審查報告: POST /api/review/stream（分層回傳）
+    審查報告 --> 覆核與退件: 逐項給覆核決定
+    覆核與退件 --> 上傳送件包: 審查新的送件包
 
     state 審查報告 {
-        [*] --> Hero摘要
-        Hero摘要 --> 其他待處理: 有非項次error/warn才顯示
-        其他待處理 --> 檢核項狀態總覽表
+        [*] --> 缺陷清單
+        缺陷清單 --> 檢核項狀態總覽表: 切換檢視
         檢核項狀態總覽表 --> 彙整參考: 預設收合
-        彙整參考 --> [*]: 內含「全部」分頁\n（平鋪列表 fallback）
+        彙整參考 --> [*]
     }
 ```
 
-> 「審查中」為簡化表示；實作上 `state.step` 仍停在 1，由 `state.reviewing=true` 觸發
-> 全螢幕覆蓋層，收到報告才跳到 `state.step=2`。
+> 分層回傳：`/api/review/stream` 依序送出 `layer` 框（L1 規則檢查／L2 法規與佐證檢索／
+> L3 敘述充分性）與 `partial`／`final` 報告框，已顯示的列不重排；串流不可用時退回
+> 一次性的 `POST /api/review`。覆核決定另走 `POST /api/review/{review_id}/decisions`，
+> 整批覆寫而非合併 —— 合併語意會讓「把某項改回待確認」變成不可表達。
 
 **報告頁重點**：以 `item_assessments` 作正式資料來源，依**檢核項次**形成狀態總覽，欄位為
 `項次 | 管理議題 | 提案內容 | 上線內容 | 佐證支持 | 法規符合 | 摘要`。

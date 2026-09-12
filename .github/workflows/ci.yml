@@ -1,0 +1,44 @@
+# 重建專案時沒補回來的 CI（舊版有，封存在 _archive/.github/workflows/ci.yml）。
+# 測試數一直只記在 commit message 裡（27→61→359→411→251→437→457），沒有機器驗證。
+#
+# CI runner 上不會有 data/original/、prompts/、data/rag/retrieval_map.json——
+# 全部 gitignored。這些測試必須乾淨 skip 而不是 fail（見 tests/fixture_builder.py
+# 的 requires_templates 與 conftest 的 local_data marker）。
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 禁止入庫的資產不得出現在 repo
+        # 守則的 Git/推送守則寫在文件裡，靠人記得。這裡讓它變成機器檢查：
+        # 原始治理文件、金鑰、送件資料與含識別資訊的稽核 log 一旦被追蹤就擋下。
+        run: |
+          leaked=$(git ls-files | grep -E '^(data/original/|data/samples/|data/rag/|prompts/|uploads/|output/|logs/)|^\.env$|\.docx$' || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::以下檔案不該入庫（見 CLAUDE.md Git/推送守則）："
+            echo "$leaked"
+            exit 1
+          fi
+          echo "OK：沒有禁止入庫的資產被追蹤。"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 安裝依賴
+        run: uv sync --extra dev
+
+      - name: Lint
+        run: uv run ruff check src tests scripts
+
+      - name: 測試
+        # 缺少官方範本的測試會 skip；-ra 讓 skip 原因出現在 summary，
+        # 免得「跳過」被誤讀成「通過」。
+        run: uv run pytest -q -ra

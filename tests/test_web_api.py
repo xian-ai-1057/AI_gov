@@ -15,6 +15,7 @@ import json
 
 import openpyxl
 import pytest
+import requests
 from fastapi.testclient import TestClient
 
 import govcheck.web.api as api_module
@@ -30,20 +31,13 @@ from govcheck.parsers.f02_parser import ASSESS_SHEET
 from govcheck.review.config import load_review_config
 from govcheck.web.api import app
 from tests.fixture_builder import (
-    OFFICIAL,
-    OFFICIAL_F01,
-    OFFICIAL_F03,
+    requires_templates,
     build_f01_fixture,
     build_f02_fixture,
     build_f03_fixture,
 )
 
 client = TestClient(app)
-
-requires_templates = pytest.mark.skipif(
-    not (OFFICIAL.exists() and OFFICIAL_F01.exists() and OFFICIAL_F03.exists()),
-    reason="官方範本不存在（data/original 未連結）",
-)
 
 # 報告 payload 的頂層契約：前端會直接讀這些鍵，少任一個 UI 就顯示 undefined。
 REPORT_KEYS = {
@@ -64,6 +58,15 @@ F03_SHEET = _REVIEW_CFG["f03"]["sheet"]
 @pytest.fixture(autouse=True)
 def _no_regulation_map(monkeypatch):
     monkeypatch.setenv("GOVCHECK_REGULATIONS_MAPPING_PATH", "/nonexistent/retrieval_map.json")
+
+
+@pytest.fixture(autouse=True)
+def _offline_fileprocess(fake_fileprocess):
+    """佐證解析走 FileProcess HTTP；本檔所有 case 一律用假端點（tests/conftest.py），不出網。
+
+    需要注入狀態碼／例外／chunks 的 case 直接再宣告 ``fake_fileprocess`` 參數即可拿到同一物件。
+    """
+    return fake_fileprocess
 
 
 def _pdf(name: str = "佐證.pdf") -> tuple:
@@ -235,8 +238,10 @@ def test_review_returns_structured_metadata():
     assert body["document_statuses"][0]["status"] == "parsed"
     assert "source_units" not in body["document_statuses"][0]
     assert set(body["usage_summary"]) >= {
-        "parser_vlm_calls", "review_llm_primary_calls", "cache_hits"
+        "parser_remote_calls", "parser_vlm_calls", "review_llm_primary_calls", "cache_hits"
     }
+    assert body["usage_summary"]["parser_remote_calls"] == 1
+    assert body["review_run_meta"]["parser_source_commit"] == "fileprocess@localhost"
 
 
 def test_review_default_stage_is_proposal():
@@ -612,10 +617,44 @@ def test_decisions_api_rejects_invalid_value(tmp_path, monkeypatch):
     assert "未知的覆核決定" in res.json()["detail"]
 
 
-def test_readiness_is_false_when_provider_disabled():
+def test_readiness_is_false_when_provider_disabled(fake_fileprocess):
     body = client.get("/api/readiness").json()
     assert body["ready"] is False
     assert set(body["prompts"]) >= {"govcheck.f03.fairness", "govcheck.f03.escalation"}
+
+
+def test_readiness_reports_parser_service_reachable(fake_fileprocess):
+    """佐證解析改走外部服務後，/api/readiness 必須看得出 3322 有沒有起來。"""
+    body = client.get("/api/readiness").json()
+    assert body["parser"] == {
+        "backend": "fileprocess",
+        "url_host_approved": True,
+        "reachable": True,
+    }
+    # 真的去打了 /health，而不是回報寫死的樂觀值
+    assert fake_fileprocess.health_calls and all(
+        url.endswith("/health") for url in fake_fileprocess.health_calls
+    )
+
+
+def test_readiness_reports_parser_unreachable_without_failing(fake_fileprocess):
+    """解析服務沒開不該讓 readiness 端點失敗——只讓 parser.reachable 變 False。"""
+    fake_fileprocess.health_exc = requests.ConnectionError("refused")
+    res = client.get("/api/readiness")
+    assert res.status_code == 200
+    assert res.json()["parser"]["reachable"] is False
+
+
+def test_readiness_degrades_when_parser_probe_raises(monkeypatch, fake_fileprocess):
+    """轉接層本身爆掉（非預期例外）時一律回未就緒，不得讓 readiness 500。"""
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(api_module, "fileprocess_readiness", _boom)
+    res = client.get("/api/readiness")
+    assert res.status_code == 200
+    assert res.json()["parser"] == api_module._PARSER_NOT_READY
 
 
 # ── 靜態前端 ────────────────────────────────────────────────────────

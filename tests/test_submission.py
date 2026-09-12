@@ -8,12 +8,16 @@ import pytest
 
 from govcheck.review.engine import review_f02, review_submission
 from tests.fixture_builder import (
+    requires_templates,
     F01_DEFAULT_ROW,
     build_f01_fixture,
     build_f02_fixture,
     build_f03_fixture,
 )
+
 from tests.test_f02_rules import BASELINE  # 重用合規低風險答案集
+
+pytestmark = requires_templates
 
 
 @pytest.fixture(autouse=True)

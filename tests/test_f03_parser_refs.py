@@ -16,7 +16,9 @@ from pathlib import Path
 from govcheck.models.f03 import F03ChecklistItem
 from govcheck.parsers.f03_parser import parse_f03_checklist
 
-from tests.fixture_builder import build_f03_fixture
+from tests.fixture_builder import requires_templates, build_f03_fixture
+
+pytestmark = requires_templates
 
 
 def test_l_col_read_written_value(tmp_path: Path) -> None:

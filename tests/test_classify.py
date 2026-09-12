@@ -23,9 +23,7 @@ from govcheck.parsers.f02_parser import ASSESS_SHEET
 from govcheck.review.config import load_review_config
 from govcheck.review.engine import review_files, review_routed
 from tests.fixture_builder import (
-    OFFICIAL,
-    OFFICIAL_F01,
-    OFFICIAL_F03,
+    requires_templates,
     build_f01_fixture,
     build_f02_fixture,
     build_f03_fixture,
@@ -35,10 +33,11 @@ _CFG = load_review_config()
 F01_SHEET = _CFG["f01"]["main_sheet"]
 F03_SHEET = _CFG["f03"]["sheet"]
 
-requires_templates = pytest.mark.skipif(
-    not (OFFICIAL.exists() and OFFICIAL_F01.exists() and OFFICIAL_F03.exists()),
-    reason="官方範本不存在（data/original 未連結）",
-)
+
+@pytest.fixture(autouse=True)
+def _offline_fileprocess(fake_fileprocess):
+    """review_files 會把佐證送 FileProcess（HTTP）；本檔一律用 tests/conftest.py 的假端點，不出網。"""
+    return fake_fileprocess
 
 
 def _codes(report) -> set[str]:
