@@ -243,6 +243,11 @@ def review_submission(
         subject=report.subject,
         filing_unit=sub.f02_filing_unit,
         form_type=report.form_type,
+        # 流程階段與固有風險分級是「這筆審查在治理流程哪一步、風險多高」的最小識別資訊，
+        # 能力目錄把專案的送件／審查／核准串起來時靠它們，缺了只能回頭翻報告。
+        workflow_stage=workflow_stage.value,
+        risk_grade=report.risk_grade,
+        risk_score=report.risk_score,
         error=report.error_count,
         warn=report.warn_count,
         decision_status=report.decision_status.value,
