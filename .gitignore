@@ -33,6 +33,13 @@ data/original
 data/samples/
 data/ui_redesign/
 
+# 操作說明書與上線校準案例（截圖／內容含檢核項原文與送件單位，僅本機留存，不入庫）
+docs/*.docx
+data/calibration/
+
+# Claude Code plan mode 產出的計畫檔（機器專屬）
+/plan.md
+
 # 提交者上傳的審查資料（含敏感內容，禁止入庫）
 uploads/
 output/
