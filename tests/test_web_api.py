@@ -15,6 +15,7 @@ import json
 
 import openpyxl
 import pytest
+import requests
 from fastapi.testclient import TestClient
 
 import govcheck.web.api as api_module
@@ -623,10 +624,44 @@ def test_decisions_api_rejects_invalid_value(tmp_path, monkeypatch):
     assert "未知的覆核決定" in res.json()["detail"]
 
 
-def test_readiness_is_false_when_provider_disabled():
+def test_readiness_is_false_when_provider_disabled(fake_fileprocess):
     body = client.get("/api/readiness").json()
     assert body["ready"] is False
     assert set(body["prompts"]) >= {"govcheck.f03.fairness", "govcheck.f03.escalation"}
+
+
+def test_readiness_reports_parser_service_reachable(fake_fileprocess):
+    """佐證解析改走外部服務後，/api/readiness 必須看得出 3322 有沒有起來。"""
+    body = client.get("/api/readiness").json()
+    assert body["parser"] == {
+        "backend": "fileprocess",
+        "url_host_approved": True,
+        "reachable": True,
+    }
+    # 真的去打了 /health，而不是回報寫死的樂觀值
+    assert fake_fileprocess.health_calls and all(
+        url.endswith("/health") for url in fake_fileprocess.health_calls
+    )
+
+
+def test_readiness_reports_parser_unreachable_without_failing(fake_fileprocess):
+    """解析服務沒開不該讓 readiness 端點失敗——只讓 parser.reachable 變 False。"""
+    fake_fileprocess.health_exc = requests.ConnectionError("refused")
+    res = client.get("/api/readiness")
+    assert res.status_code == 200
+    assert res.json()["parser"]["reachable"] is False
+
+
+def test_readiness_degrades_when_parser_probe_raises(monkeypatch, fake_fileprocess):
+    """轉接層本身爆掉（非預期例外）時一律回未就緒，不得讓 readiness 500。"""
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(api_module, "fileprocess_readiness", _boom)
+    res = client.get("/api/readiness")
+    assert res.status_code == 200
+    assert res.json()["parser"] == api_module._PARSER_NOT_READY
 
 
 # ── 靜態前端 ────────────────────────────────────────────────────────
